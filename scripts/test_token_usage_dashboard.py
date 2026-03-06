@@ -85,6 +85,8 @@ class TestTokenDashboard(TestCase):
         self.assertIn("id=\"spikesBody\"", html)
         self.assertIn("focusSpikeDate", html)
         self.assertIn("focusDate", html)
+        self.assertIn("getInitialDateFromHash", html)
+        self.assertIn("history.replaceState", html)
         self.assertIn("selectedSpikeDate", html)
 
     def test_prepare_chart_series_groups_other(self):

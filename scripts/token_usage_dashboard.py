@@ -580,7 +580,17 @@ def build_dashboard_html(
       }} else {{
         selectedSpikeDate = null;
       }}
+      try {{
+        history.replaceState(null, '', `#date=${{encodeURIComponent(d)}}`);
+      }} catch (e) {{}}
       draw();
+    }}
+
+    function getInitialDateFromHash() {{
+      const m = window.location.hash.match(/^#date=(.+)$/);
+      if (!m) return null;
+      const d = decodeURIComponent(m[1]);
+      return labels.includes(d) ? d : null;
     }}
 
     canvas.addEventListener('mousemove', (ev) => {{
@@ -616,8 +626,8 @@ def build_dashboard_html(
     }});
 
     if (labels.length) {{
-      selectedSpikeDate = labels[labels.length - 1];
-      renderSelectedDay(labels[labels.length - 1]);
+      const initial = getInitialDateFromHash() || labels[labels.length - 1];
+      focusDate(initial);
     }}
 
     window.addEventListener('resize', resize);

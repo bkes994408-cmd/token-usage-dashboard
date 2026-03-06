@@ -377,6 +377,7 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:10px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates</div>
   <div class=\"grid\">
     <div class=\"card\"><div class=\"label\">Date range rows</div><div class=\"value\">{len(rows)}</div></div>
     <div class=\"card\"><div class=\"label\">Latest day</div><div class=\"value\">{latest_day}</div></div>
@@ -430,6 +431,7 @@ def build_dashboard_html(
     const selectedDayBody = document.getElementById('selectedDayBody');
     const spikesBody = document.getElementById('spikesBody');
     let selectedSpikeDate = null;
+    let selectedDate = null;
 
     function renderSelectedDay(date) {{
       const rows = dayBreakdownByDate[date] || [];
@@ -574,6 +576,7 @@ def build_dashboard_html(
 
     function focusDate(d) {{
       if (!labels.includes(d)) return;
+      selectedDate = d;
       renderSelectedDay(d);
       if (spikeByDate[d]) {{
         selectedSpikeDate = d;
@@ -591,6 +594,16 @@ def build_dashboard_html(
       if (!m) return null;
       const d = decodeURIComponent(m[1]);
       return labels.includes(d) ? d : null;
+    }}
+
+    function stepDate(offset) {{
+      if (!labels.length) return;
+      const current = selectedDate && labels.includes(selectedDate)
+        ? selectedDate
+        : (getInitialDateFromHash() || labels[labels.length - 1]);
+      const idx = labels.indexOf(current);
+      const next = Math.max(0, Math.min(labels.length - 1, idx + offset));
+      focusDate(labels[next]);
     }}
 
     canvas.addEventListener('mousemove', (ev) => {{
@@ -629,6 +642,18 @@ def build_dashboard_html(
       const initial = getInitialDateFromHash() || labels[labels.length - 1];
       focusDate(initial);
     }}
+
+    window.addEventListener('keydown', (ev) => {{
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.key === 'ArrowLeft' || ev.key === 'j') {{
+        ev.preventDefault();
+        stepDate(-1);
+      }}
+      if (ev.key === 'ArrowRight' || ev.key === 'k') {{
+        ev.preventDefault();
+        stepDate(1);
+      }}
+    }});
 
     window.addEventListener('resize', resize);
     resize();

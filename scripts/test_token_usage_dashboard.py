@@ -86,7 +86,9 @@ class TestTokenDashboard(TestCase):
         self.assertIn("focusSpikeDate", html)
         self.assertIn("focusDate", html)
         self.assertIn("getInitialDateFromHash", html)
+        self.assertIn("stepDate", html)
         self.assertIn("history.replaceState", html)
+        self.assertIn("window.addEventListener('keydown'", html)
         self.assertIn("selectedSpikeDate", html)
 
     def test_prepare_chart_series_groups_other(self):

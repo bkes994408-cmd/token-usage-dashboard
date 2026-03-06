@@ -88,6 +88,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("focusDate", html)
         self.assertIn("getInitialDateFromHash", html)
         self.assertIn("stepDate", html)
+        self.assertIn("jumpSpike", html)
         self.assertIn("history.replaceState", html)
         self.assertIn("window.addEventListener('keydown'", html)
         self.assertIn("selectedSpikeDate", html)

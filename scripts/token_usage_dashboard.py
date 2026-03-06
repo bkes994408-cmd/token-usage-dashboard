@@ -380,7 +380,7 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:10px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates</div>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:10px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike</div>
   <div class=\"grid\">
     <div class=\"card\"><div class=\"label\">Date range rows</div><div class=\"value\">{len(rows)}</div></div>
     <div class=\"card\"><div class=\"label\">Latest day</div><div class=\"value\">{latest_day}</div></div>
@@ -625,6 +625,20 @@ def build_dashboard_html(
       focusDate(labels[next]);
     }}
 
+    function jumpSpike(offset) {{
+      const spikeDates = labels.filter(d => !!spikeByDate[d]);
+      if (!spikeDates.length) return;
+      const current = selectedDate && labels.includes(selectedDate)
+        ? selectedDate
+        : (getInitialDateFromHash() || labels[labels.length - 1]);
+      let idx = spikeDates.indexOf(current);
+      if (idx < 0) {{
+        idx = offset >= 0 ? -1 : spikeDates.length;
+      }}
+      const next = Math.max(0, Math.min(spikeDates.length - 1, idx + offset));
+      focusSpikeDate(spikeDates[next], true);
+    }}
+
     canvas.addEventListener('mousemove', (ev) => {{
       if (!labels.length) return;
       const i = nearestIndex(ev.clientX);
@@ -671,6 +685,14 @@ def build_dashboard_html(
       if (ev.key === 'ArrowRight' || ev.key === 'k') {{
         ev.preventDefault();
         stepDate(1);
+      }}
+      if (ev.key === 'n') {{
+        ev.preventDefault();
+        jumpSpike(1);
+      }}
+      if (ev.key === 'p') {{
+        ev.preventDefault();
+        jumpSpike(-1);
       }}
     }});
 

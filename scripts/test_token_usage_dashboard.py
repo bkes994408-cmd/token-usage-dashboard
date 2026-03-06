@@ -81,6 +81,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("scrollIntoView", html)
         self.assertIn("const dayBreakdownByDate", html)
         self.assertIn("Selected Day Model Breakdown", html)
+        self.assertIn("DoD Δ", html)
         self.assertIn("renderSelectedDay", html)
         self.assertIn("id=\"spikesBody\"", html)
         self.assertIn("focusSpikeDate", html)

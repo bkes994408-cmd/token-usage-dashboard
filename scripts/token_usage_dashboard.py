@@ -329,6 +329,7 @@ def build_dashboard_html(
             }
 
     day_breakdown_by_date: Dict[str, List[Dict[str, float | str]]] = {}
+    day_total_by_date: Dict[str, float] = {}
     for row in rows:
         d = row.get("date")
         if not isinstance(d, str):
@@ -347,12 +348,14 @@ def build_dashboard_html(
                 model_map[name] += float(cost)
         ranked = sorted(model_map.items(), key=lambda x: x[1], reverse=True)
         day_breakdown_by_date[d] = [{"model": n, "costUSD": c} for n, c in ranked]
+        day_total_by_date[d] = sum(model_map.values())
 
     json_labels = json.dumps(labels)
     json_series = json.dumps(series)
     json_day_totals = json.dumps(day_totals)
     json_spike_by_date = json.dumps(spike_by_date)
     json_day_breakdown_by_date = json.dumps(day_breakdown_by_date)
+    json_day_total_by_date = json.dumps(day_total_by_date)
 
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -411,8 +414,8 @@ def build_dashboard_html(
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
   <table>
-    <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th></tr></thead>
-    <tbody id="selectedDayBody"><tr><td colspan="4">Click a spike marker to focus a day</td></tr></tbody>
+    <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th><th>DoD Δ</th><th>DoD Δ%</th></tr></thead>
+    <tbody id="selectedDayBody"><tr><td colspan="6">Click a spike marker to focus a day</td></tr></tbody>
   </table>
 
   <script>
@@ -421,6 +424,7 @@ def build_dashboard_html(
     const dayTotals = {json_day_totals};
     const spikeByDate = {json_spike_by_date};
     const dayBreakdownByDate = {json_day_breakdown_by_date};
+    const dayTotalByDate = {json_day_total_by_date};
 
     const colors = ["#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#ea580c", "#0891b2", "#4f46e5", "#65a30d", "#be123c"];
     const canvas = document.getElementById('costChart');
@@ -435,15 +439,30 @@ def build_dashboard_html(
 
     function renderSelectedDay(date) {{
       const rows = dayBreakdownByDate[date] || [];
-      selectedDayTitle.textContent = `Selected Day Model Breakdown · ${{date}}`;
+      const idx = labels.indexOf(date);
+      const prevDate = idx > 0 ? labels[idx - 1] : null;
+      const prevRows = prevDate ? (dayBreakdownByDate[prevDate] || []) : [];
+      const prevMap = Object.fromEntries(prevRows.map(r => [r.model, r.costUSD || 0]));
+      const currTotal = dayTotalByDate[date] || rows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
+      const prevTotal = prevDate ? (dayTotalByDate[prevDate] || 0) : 0;
+      const totalDelta = currTotal - prevTotal;
+      const totalDeltaPct = prevTotal > 0 ? ((totalDelta / prevTotal) * 100) : null;
+      const totalDeltaText = `${{totalDelta >= 0 ? '+' : ''}}$${{totalDelta.toFixed(2)}}`;
+      const totalDeltaPctText = totalDeltaPct === null ? 'N/A' : `${{totalDeltaPct >= 0 ? '+' : ''}}${{totalDeltaPct.toFixed(1)}}%`;
+      selectedDayTitle.textContent = `Selected Day Model Breakdown · ${{date}} · DoD ${{totalDeltaText}} (${{totalDeltaPctText}})`;
       if (!rows.length) {{
-        selectedDayBody.innerHTML = '<tr><td colspan="4">No model breakdown on this day</td></tr>';
+        selectedDayBody.innerHTML = '<tr><td colspan="6">No model breakdown on this day</td></tr>';
         return;
       }}
       const total = rows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
       selectedDayBody.innerHTML = rows.map((r, i) => {{
         const share = total > 0 ? (((r.costUSD || 0) / total) * 100).toFixed(1) : '0.0';
-        return `<tr><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td></tr>`;
+        const prev = prevMap[r.model] || 0;
+        const dod = (r.costUSD || 0) - prev;
+        const dodPct = prev > 0 ? (dod / prev) * 100 : null;
+        const dodText = `${{dod >= 0 ? '+' : ''}}$${{dod.toFixed(2)}}`;
+        const dodPctText = dodPct === null ? 'N/A' : `${{dodPct >= 0 ? '+' : ''}}${{dodPct.toFixed(1)}}%`;
+        return `<tr><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td>${{dodText}}</td><td>${{dodPctText}}</td></tr>`;
       }}).join('');
     }}
 

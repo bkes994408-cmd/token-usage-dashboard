@@ -79,6 +79,9 @@ class TestTokenDashboard(TestCase):
         self.assertIn("Daily Cost Spikes", html)
         self.assertIn("spike-row-2026-03-09", html)
         self.assertIn("scrollIntoView", html)
+        self.assertIn("const dayBreakdownByDate", html)
+        self.assertIn("Selected Day Model Breakdown", html)
+        self.assertIn("renderSelectedDay", html)
 
     def test_prepare_chart_series_groups_other(self):
         rows = [

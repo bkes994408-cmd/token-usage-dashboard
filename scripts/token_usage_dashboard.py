@@ -328,10 +328,31 @@ def build_dashboard_html(
                 "ratio": float(s.get("ratio", 0.0)),
             }
 
+    day_breakdown_by_date: Dict[str, List[Dict[str, float | str]]] = {}
+    for row in rows:
+        d = row.get("date")
+        if not isinstance(d, str):
+            continue
+        breakdowns = row.get("modelBreakdowns")
+        if not isinstance(breakdowns, list):
+            day_breakdown_by_date[d] = []
+            continue
+        model_map: Dict[str, float] = defaultdict(float)
+        for b in breakdowns:
+            if not isinstance(b, dict):
+                continue
+            name = b.get("modelName")
+            cost = b.get("cost")
+            if isinstance(name, str) and isinstance(cost, (int, float)):
+                model_map[name] += float(cost)
+        ranked = sorted(model_map.items(), key=lambda x: x[1], reverse=True)
+        day_breakdown_by_date[d] = [{"model": n, "costUSD": c} for n, c in ranked]
+
     json_labels = json.dumps(labels)
     json_series = json.dumps(series)
     json_day_totals = json.dumps(day_totals)
     json_spike_by_date = json.dumps(spike_by_date)
+    json_day_breakdown_by_date = json.dumps(day_breakdown_by_date)
 
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -387,17 +408,40 @@ def build_dashboard_html(
     <tbody>{spikes_rows}</tbody>
   </table>
 
+  <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
+  <table>
+    <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th></tr></thead>
+    <tbody id="selectedDayBody"><tr><td colspan="4">Click a spike marker to focus a day</td></tr></tbody>
+  </table>
+
   <script>
     const labels = {json_labels};
     const series = {json_series};
     const dayTotals = {json_day_totals};
     const spikeByDate = {json_spike_by_date};
+    const dayBreakdownByDate = {json_day_breakdown_by_date};
 
     const colors = ["#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#ea580c", "#0891b2", "#4f46e5", "#65a30d", "#be123c"];
     const canvas = document.getElementById('costChart');
     const ctx = canvas.getContext('2d');
     const tip = document.getElementById('tooltip');
     const wrap = document.getElementById('chartWrap');
+    const selectedDayTitle = document.getElementById('selectedDayTitle');
+    const selectedDayBody = document.getElementById('selectedDayBody');
+
+    function renderSelectedDay(date) {{
+      const rows = dayBreakdownByDate[date] || [];
+      selectedDayTitle.textContent = `Selected Day Model Breakdown · ${{date}}`;
+      if (!rows.length) {{
+        selectedDayBody.innerHTML = '<tr><td colspan="4">No model breakdown on this day</td></tr>';
+        return;
+      }}
+      const total = rows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
+      selectedDayBody.innerHTML = rows.map((r, i) => {{
+        const share = total > 0 ? (((r.costUSD || 0) / total) * 100).toFixed(1) : '0.0';
+        return `<tr><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td></tr>`;
+      }}).join('');
+    }}
 
     function resize() {{
       const dpr = window.devicePixelRatio || 1;
@@ -527,12 +571,17 @@ def build_dashboard_html(
       const i = nearestIndex(ev.clientX);
       const d = labels[i];
       if (!spikeByDate[d]) return;
+      renderSelectedDay(d);
       const row = document.getElementById(`spike-row-${d}`);
       if (!row) return;
       row.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
       row.classList.add('spike-focus');
       setTimeout(() => row.classList.remove('spike-focus'), 1200);
     }});
+
+    if (labels.length) {{
+      renderSelectedDay(labels[labels.length - 1]);
+    }}
 
     window.addEventListener('resize', resize);
     resize();

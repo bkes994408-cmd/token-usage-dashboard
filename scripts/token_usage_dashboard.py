@@ -572,6 +572,17 @@ def build_dashboard_html(
       setTimeout(() => row.classList.remove('spike-focus'), 1200);
     }}
 
+    function focusDate(d) {{
+      if (!labels.includes(d)) return;
+      renderSelectedDay(d);
+      if (spikeByDate[d]) {{
+        selectedSpikeDate = d;
+      }} else {{
+        selectedSpikeDate = null;
+      }}
+      draw();
+    }}
+
     canvas.addEventListener('mousemove', (ev) => {{
       if (!labels.length) return;
       const i = nearestIndex(ev.clientX);
@@ -593,8 +604,8 @@ def build_dashboard_html(
       if (!labels.length) return;
       const i = nearestIndex(ev.clientX);
       const d = labels[i];
-      if (!spikeByDate[d]) return;
-      focusSpikeDate(d, true);
+      focusDate(d);
+      if (spikeByDate[d]) focusSpikeDate(d, true);
     }});
 
     spikesBody?.addEventListener('click', (ev) => {{

@@ -405,7 +405,7 @@ def build_dashboard_html(
   <h3>Daily Cost Spikes</h3>
   <table>
     <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>7d Baseline</th><th>Ratio</th></tr></thead>
-    <tbody>{spikes_rows}</tbody>
+    <tbody id="spikesBody">{spikes_rows}</tbody>
   </table>
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
@@ -428,6 +428,8 @@ def build_dashboard_html(
     const wrap = document.getElementById('chartWrap');
     const selectedDayTitle = document.getElementById('selectedDayTitle');
     const selectedDayBody = document.getElementById('selectedDayBody');
+    const spikesBody = document.getElementById('spikesBody');
+    let selectedSpikeDate = null;
 
     function renderSelectedDay(date) {{
       const rows = dayBreakdownByDate[date] || [];
@@ -501,9 +503,10 @@ def build_dashboard_html(
         if (!spike) return;
         const x = pad.l + (iw * i / Math.max(1, labels.length - 1));
         const y = pad.t + ih - ((dayTotals[i] || 0) / maxY) * ih;
+        const isSelected = selectedSpikeDate === d;
 
         ctx.strokeStyle = '#dc2626';
-        ctx.lineWidth = 1;
+        ctx.lineWidth = isSelected ? 2 : 1;
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
         ctx.moveTo(x, pad.t);
@@ -513,8 +516,16 @@ def build_dashboard_html(
 
         ctx.fillStyle = '#dc2626';
         ctx.beginPath();
-        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.arc(x, y, isSelected ? 6 : 4, 0, Math.PI * 2);
         ctx.fill();
+
+        if (isSelected) {{
+          ctx.strokeStyle = '#991b1b';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(x, y, 8, 0, Math.PI * 2);
+          ctx.stroke();
+        }}
       }});
 
       ctx.fillStyle = '#6b7280';
@@ -549,6 +560,18 @@ def build_dashboard_html(
       return Math.round(((x - padL) / Math.max(1, iw)) * Math.max(1, labels.length - 1));
     }}
 
+    function focusSpikeDate(d, scrollRow = false) {{
+      if (!spikeByDate[d]) return;
+      selectedSpikeDate = d;
+      renderSelectedDay(d);
+      draw();
+      const row = document.getElementById(`spike-row-${d}`);
+      if (!row) return;
+      if (scrollRow) row.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+      row.classList.add('spike-focus');
+      setTimeout(() => row.classList.remove('spike-focus'), 1200);
+    }}
+
     canvas.addEventListener('mousemove', (ev) => {{
       if (!labels.length) return;
       const i = nearestIndex(ev.clientX);
@@ -571,15 +594,18 @@ def build_dashboard_html(
       const i = nearestIndex(ev.clientX);
       const d = labels[i];
       if (!spikeByDate[d]) return;
-      renderSelectedDay(d);
-      const row = document.getElementById(`spike-row-${d}`);
-      if (!row) return;
-      row.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-      row.classList.add('spike-focus');
-      setTimeout(() => row.classList.remove('spike-focus'), 1200);
+      focusSpikeDate(d, true);
+    }});
+
+    spikesBody?.addEventListener('click', (ev) => {{
+      const tr = ev.target?.closest?.("tr[id^='spike-row-']");
+      if (!tr) return;
+      const d = tr.id.replace('spike-row-', '');
+      focusSpikeDate(d, false);
     }});
 
     if (labels.length) {{
+      selectedSpikeDate = labels[labels.length - 1];
       renderSelectedDay(labels[labels.length - 1]);
     }}
 

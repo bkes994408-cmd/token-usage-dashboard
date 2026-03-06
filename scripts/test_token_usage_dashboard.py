@@ -82,6 +82,9 @@ class TestTokenDashboard(TestCase):
         self.assertIn("const dayBreakdownByDate", html)
         self.assertIn("Selected Day Model Breakdown", html)
         self.assertIn("renderSelectedDay", html)
+        self.assertIn("id=\"spikesBody\"", html)
+        self.assertIn("focusSpikeDate", html)
+        self.assertIn("selectedSpikeDate", html)
 
     def test_prepare_chart_series_groups_other(self):
         rows = [

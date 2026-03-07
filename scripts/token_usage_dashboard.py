@@ -384,10 +384,14 @@ def build_dashboard_html(
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
   <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · s toggle spike-only · r reset to latest · ? help</div>
-  <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin-bottom:10px;">
-    <input type="checkbox" id="spikeOnlyToggle" />
-    Spike-only navigation (shareable via URL hash)
-  </label>
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
+      <input type="checkbox" id="spikeOnlyToggle" />
+      Spike-only navigation (shareable via URL hash)
+    </label>
+    <button id="copyLinkBtn" type="button" style="font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:8px;padding:4px 8px;cursor:pointer;">Copy deep-link</button>
+    <span id="copyLinkHint" style="font-size:12px;color:#6b7280;"></span>
+  </div>
   <div class=\"grid\">
     <div class=\"card\"><div class=\"label\">Date range rows</div><div class=\"value\">{len(rows)}</div></div>
     <div class=\"card\"><div class=\"label\">Latest day</div><div class=\"value\">{latest_day}</div></div>
@@ -452,6 +456,8 @@ def build_dashboard_html(
     const selectedDayBody = document.getElementById('selectedDayBody');
     const spikesBody = document.getElementById('spikesBody');
     const spikeOnlyToggle = document.getElementById('spikeOnlyToggle');
+    const copyLinkBtn = document.getElementById('copyLinkBtn');
+    const copyLinkHint = document.getElementById('copyLinkHint');
     const kbdHelp = document.getElementById('kbdHelp');
     let selectedSpikeDate = null;
     let selectedDate = null;
@@ -718,6 +724,10 @@ def build_dashboard_html(
       updateHash();
     }});
 
+    copyLinkBtn?.addEventListener('click', () => {{
+      copyDeepLink();
+    }});
+
     function toggleSpikeOnlyMode() {{
       spikeOnlyMode = !spikeOnlyMode;
       if (spikeOnlyToggle) spikeOnlyToggle.checked = spikeOnlyMode;
@@ -732,6 +742,29 @@ def build_dashboard_html(
       if (!kbdHelp) return;
       const next = force === null ? !kbdHelp.classList.contains('visible') : !!force;
       kbdHelp.classList.toggle('visible', next);
+    }}
+
+    function currentDeepLink() {{
+      const base = `${{window.location.origin}}${{window.location.pathname}}`;
+      const hash = window.location.hash || '';
+      return `${{base}}${{hash}}`;
+    }}
+
+    async function copyDeepLink() {{
+      const link = currentDeepLink();
+      try {{
+        if (navigator.clipboard?.writeText) {{
+          await navigator.clipboard.writeText(link);
+          if (copyLinkHint) copyLinkHint.textContent = 'Copied';
+        }} else {{
+          window.prompt('Copy this link:', link);
+          if (copyLinkHint) copyLinkHint.textContent = 'Shown in prompt';
+        }}
+      }} catch (e) {{
+        window.prompt('Copy this link:', link);
+        if (copyLinkHint) copyLinkHint.textContent = 'Shown in prompt';
+      }}
+      setTimeout(() => {{ if (copyLinkHint) copyLinkHint.textContent = ''; }}, 1200);
     }}
 
     function resetToLatestDay() {{

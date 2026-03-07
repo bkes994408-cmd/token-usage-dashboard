@@ -387,7 +387,7 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · Home/End first/last day · s toggle spike-only · r reset to latest · c copy link · ? help</div>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · Home/End first/last day · s toggle spike-only · d sort DoD · x changes-only · r reset to latest · c copy link · ? help</div>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
     <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
       <input type="checkbox" id="spikeOnlyToggle" />
@@ -448,6 +448,8 @@ def build_dashboard_html(
     <div><code>n/p</code>: next/prev spike</div>
     <div><code>Home/End</code>: first/last day</div>
     <div><code>s</code>: toggle spike-only mode</div>
+    <div><code>d</code>: toggle DoD sort</div>
+    <div><code>x</code>: toggle changes-only filter</div>
     <div><code>r</code>: reset to latest day</div>
     <div><code>c</code>: copy deep-link</div>
     <div><code>?</code>: toggle this help</div>
@@ -790,6 +792,20 @@ def build_dashboard_html(
       }}
     }}
 
+    function toggleDodSortMode() {{
+      sortByDodMode = !sortByDodMode;
+      if (sortByDodToggle) sortByDodToggle.checked = sortByDodMode;
+      if (selectedDate) renderSelectedDay(selectedDate);
+      updateHash();
+    }}
+
+    function toggleChangesOnlyMode() {{
+      showOnlyChangesMode = !showOnlyChangesMode;
+      if (showOnlyChangesToggle) showOnlyChangesToggle.checked = showOnlyChangesMode;
+      if (selectedDate) renderSelectedDay(selectedDate);
+      updateHash();
+    }}
+
     function toggleKeyboardHelp(force = null) {{
       if (!kbdHelp) return;
       const next = force === null ? !kbdHelp.classList.contains('visible') : !!force;
@@ -823,8 +839,10 @@ def build_dashboard_html(
       if (!labels.length) return;
       spikeOnlyMode = false;
       sortByDodMode = false;
+      showOnlyChangesMode = false;
       if (spikeOnlyToggle) spikeOnlyToggle.checked = false;
       if (sortByDodToggle) sortByDodToggle.checked = false;
+      if (showOnlyChangesToggle) showOnlyChangesToggle.checked = false;
       focusDate(labels[labels.length - 1]);
     }}
 
@@ -860,6 +878,14 @@ def build_dashboard_html(
       if (ev.key === 's') {{
         ev.preventDefault();
         toggleSpikeOnlyMode();
+      }}
+      if (ev.key === 'd') {{
+        ev.preventDefault();
+        toggleDodSortMode();
+      }}
+      if (ev.key === 'x') {{
+        ev.preventDefault();
+        toggleChangesOnlyMode();
       }}
       if (ev.key === 'r') {{
         ev.preventDefault();

@@ -99,6 +99,8 @@ class TestTokenDashboard(TestCase):
         self.assertIn("sortByDodMode", html)
         self.assertIn("sortDod", html)
         self.assertIn("ev.key === 'c'", html)
+        self.assertIn("ev.key === 'Home'", html)
+        self.assertIn("ev.key === 'End'", html)
         self.assertIn("dod-pos", html)
         self.assertIn("dod-neg", html)
         self.assertIn("model-top", html)

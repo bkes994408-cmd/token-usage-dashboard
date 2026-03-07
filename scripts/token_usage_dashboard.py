@@ -387,7 +387,7 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · s toggle spike-only · r reset to latest · c copy link · ? help</div>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · Home/End first/last day · s toggle spike-only · r reset to latest · c copy link · ? help</div>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
     <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
       <input type="checkbox" id="spikeOnlyToggle" />
@@ -442,6 +442,7 @@ def build_dashboard_html(
     <div><strong>Keyboard shortcuts</strong></div>
     <div><code>←/→</code> or <code>j/k</code>: step day</div>
     <div><code>n/p</code>: next/prev spike</div>
+    <div><code>Home/End</code>: first/last day</div>
     <div><code>s</code>: toggle spike-only mode</div>
     <div><code>r</code>: reset to latest day</div>
     <div><code>c</code>: copy deep-link</div>
@@ -829,6 +830,14 @@ def build_dashboard_html(
       if (ev.key === 'p') {{
         ev.preventDefault();
         jumpSpike(-1);
+      }}
+      if (ev.key === 'Home') {{
+        ev.preventDefault();
+        if (labels.length) focusDate(labels[0]);
+      }}
+      if (ev.key === 'End') {{
+        ev.preventDefault();
+        if (labels.length) focusDate(labels[labels.length - 1]);
       }}
       if (ev.key === 's') {{
         ev.preventDefault();

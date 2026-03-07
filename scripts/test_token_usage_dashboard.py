@@ -94,6 +94,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("resetToLatestDay", html)
         self.assertIn("copyDeepLink", html)
         self.assertIn("id=\"copyLinkBtn\"", html)
+        self.assertIn("id=\"selectedDayMeta\"", html)
         self.assertIn("ev.key === 'c'", html)
         self.assertIn("dod-pos", html)
         self.assertIn("dod-neg", html)

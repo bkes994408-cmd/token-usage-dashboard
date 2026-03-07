@@ -427,6 +427,7 @@ def build_dashboard_html(
   </table>
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
+  <div id="selectedDayMeta" style="font-size:12px;color:#4b5563;margin:-4px 0 8px;"></div>
   <table>
     <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th><th>DoD Δ</th><th>DoD Δ%</th></tr></thead>
     <tbody id="selectedDayBody"><tr><td colspan="6">Click a spike marker to focus a day</td></tr></tbody>
@@ -457,6 +458,7 @@ def build_dashboard_html(
     const tip = document.getElementById('tooltip');
     const wrap = document.getElementById('chartWrap');
     const selectedDayTitle = document.getElementById('selectedDayTitle');
+    const selectedDayMeta = document.getElementById('selectedDayMeta');
     const selectedDayBody = document.getElementById('selectedDayBody');
     const spikesBody = document.getElementById('spikesBody');
     const spikeOnlyToggle = document.getElementById('spikeOnlyToggle');
@@ -480,6 +482,7 @@ def build_dashboard_html(
       const totalDeltaText = `${{totalDelta >= 0 ? '+' : ''}}$${{totalDelta.toFixed(2)}}`;
       const totalDeltaPctText = totalDeltaPct === null ? 'N/A' : `${{totalDeltaPct >= 0 ? '+' : ''}}${{totalDeltaPct.toFixed(1)}}%`;
       selectedDayTitle.textContent = `Selected Day Model Breakdown · ${{date}} · DoD ${{totalDeltaText}} (${{totalDeltaPctText}})`;
+      if (selectedDayMeta) selectedDayMeta.textContent = `Day total: $${{currTotal.toFixed(2)}} · Previous day total: $${{prevTotal.toFixed(2)}}`;
       if (!rows.length) {{
         selectedDayBody.innerHTML = '<tr><td colspan="6">No model breakdown on this day</td></tr>';
         return;

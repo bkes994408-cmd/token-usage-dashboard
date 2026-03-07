@@ -376,11 +376,14 @@ def build_dashboard_html(
     th, td {{ border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; font-size: 13px; }}
     th {{ color: #374151; background: #f9fafb; }}
     tr.spike-focus {{ background: #fef2f2; }}
+    .kbd-help {{ position: fixed; right: 18px; bottom: 18px; background: #111827; color: #f9fafb; border-radius: 10px; padding: 10px 12px; font-size: 12px; line-height: 1.6; max-width: 280px; box-shadow: 0 8px 24px rgba(0,0,0,.25); display: none; z-index: 20; }}
+    .kbd-help.visible {{ display: block; }}
+    .kbd-help code {{ background: #374151; color: #fff; padding: 1px 5px; border-radius: 6px; }}
   </style>
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · s toggle spike-only</div>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · s toggle spike-only · ? help</div>
   <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin-bottom:10px;">
     <input type="checkbox" id="spikeOnlyToggle" />
     Spike-only navigation (shareable via URL hash)
@@ -422,6 +425,14 @@ def build_dashboard_html(
     <tbody id="selectedDayBody"><tr><td colspan="6">Click a spike marker to focus a day</td></tr></tbody>
   </table>
 
+  <div id="kbdHelp" class="kbd-help">
+    <div><strong>Keyboard shortcuts</strong></div>
+    <div><code>←/→</code> or <code>j/k</code>: step day</div>
+    <div><code>n/p</code>: next/prev spike</div>
+    <div><code>s</code>: toggle spike-only mode</div>
+    <div><code>?</code>: toggle this help</div>
+  </div>
+
   <script>
     const labels = {json_labels};
     const series = {json_series};
@@ -439,6 +450,7 @@ def build_dashboard_html(
     const selectedDayBody = document.getElementById('selectedDayBody');
     const spikesBody = document.getElementById('spikesBody');
     const spikeOnlyToggle = document.getElementById('spikeOnlyToggle');
+    const kbdHelp = document.getElementById('kbdHelp');
     let selectedSpikeDate = null;
     let selectedDate = null;
     let spikeOnlyMode = false;
@@ -714,6 +726,11 @@ def build_dashboard_html(
       }}
     }}
 
+    function toggleKeyboardHelp() {{
+      if (!kbdHelp) return;
+      kbdHelp.classList.toggle('visible');
+    }}
+
     window.addEventListener('keydown', (ev) => {{
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === 'ArrowLeft' || ev.key === 'j') {{
@@ -735,6 +752,10 @@ def build_dashboard_html(
       if (ev.key === 's') {{
         ev.preventDefault();
         toggleSpikeOnlyMode();
+      }}
+      if (ev.key === '?' || (ev.key === '/' && ev.shiftKey)) {{
+        ev.preventDefault();
+        toggleKeyboardHelp();
       }}
     }});
 

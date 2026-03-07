@@ -90,6 +90,8 @@ class TestTokenDashboard(TestCase):
         self.assertIn("jumpSpike", html)
         self.assertIn("spikeOnlyToggle", html)
         self.assertIn("toggleSpikeOnlyMode", html)
+        self.assertIn("toggleKeyboardHelp", html)
+        self.assertIn("id=\"kbdHelp\"", html)
         self.assertIn("getInitialStateFromHash", html)
         self.assertIn("history.replaceState", html)
         self.assertIn("window.addEventListener('keydown'", html)

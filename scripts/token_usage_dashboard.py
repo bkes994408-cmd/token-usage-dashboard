@@ -380,7 +380,7 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike</div>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · s toggle spike-only</div>
   <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin-bottom:10px;">
     <input type="checkbox" id="spikeOnlyToggle" />
     Spike-only navigation (shareable via URL hash)
@@ -704,6 +704,16 @@ def build_dashboard_html(
       updateHash();
     }});
 
+    function toggleSpikeOnlyMode() {{
+      spikeOnlyMode = !spikeOnlyMode;
+      if (spikeOnlyToggle) spikeOnlyToggle.checked = spikeOnlyMode;
+      if (spikeOnlyMode && selectedDate && !spikeByDate[selectedDate]) {{
+        jumpSpike(1);
+      }} else {{
+        updateHash();
+      }}
+    }}
+
     window.addEventListener('keydown', (ev) => {{
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === 'ArrowLeft' || ev.key === 'j') {{
@@ -721,6 +731,10 @@ def build_dashboard_html(
       if (ev.key === 'p') {{
         ev.preventDefault();
         jumpSpike(-1);
+      }}
+      if (ev.key === 's') {{
+        ev.preventDefault();
+        toggleSpikeOnlyMode();
       }}
     }});
 

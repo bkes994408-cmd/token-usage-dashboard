@@ -97,6 +97,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("id=\"selectedDayMeta\"", html)
         self.assertIn("id=\"sortByDodToggle\"", html)
         self.assertIn("sortByDodMode", html)
+        self.assertIn("sortDod", html)
         self.assertIn("ev.key === 'c'", html)
         self.assertIn("dod-pos", html)
         self.assertIn("dod-neg", html)

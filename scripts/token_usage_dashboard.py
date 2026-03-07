@@ -644,6 +644,7 @@ def build_dashboard_html(
         const params = new URLSearchParams();
         if (selectedDate) params.set('date', selectedDate);
         if (spikeOnlyMode) params.set('spikeOnly', '1');
+        if (sortByDodMode) params.set('sortDod', '1');
         const hash = params.toString();
         history.replaceState(null, '', hash ? `#${{hash}}` : '#');
       }} catch (e) {{}}
@@ -664,13 +665,15 @@ def build_dashboard_html(
 
     function getInitialStateFromHash() {{
       const raw = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
-      if (!raw) return {{ date: null, spikeOnly: false }};
+      if (!raw) return {{ date: null, spikeOnly: false, sortDod: false }};
       const p = new URLSearchParams(raw);
       const date = p.get('date');
       const spikeOnly = p.get('spikeOnly') === '1';
+      const sortDod = p.get('sortDod') === '1';
       return {{
         date: date && labels.includes(date) ? date : null,
         spikeOnly,
+        sortDod,
       }};
     }}
 
@@ -734,7 +737,9 @@ def build_dashboard_html(
 
     const initialState = getInitialStateFromHash();
     spikeOnlyMode = !!initialState.spikeOnly;
+    sortByDodMode = !!initialState.sortDod;
     if (spikeOnlyToggle) spikeOnlyToggle.checked = spikeOnlyMode;
+    if (sortByDodToggle) sortByDodToggle.checked = sortByDodMode;
 
     if (labels.length) {{
       const initial = initialState.date || labels[labels.length - 1];
@@ -749,6 +754,7 @@ def build_dashboard_html(
     sortByDodToggle?.addEventListener('change', () => {{
       sortByDodMode = !!sortByDodToggle.checked;
       if (selectedDate) renderSelectedDay(selectedDate);
+      updateHash();
     }});
 
     copyLinkBtn?.addEventListener('click', () => {{

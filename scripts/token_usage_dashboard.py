@@ -429,6 +429,10 @@ def build_dashboard_html(
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
   <div id="selectedDayMeta" style="font-size:12px;color:#4b5563;margin:-4px 0 8px;"></div>
+  <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin:0 0 8px;">
+    <input type="checkbox" id="sortByDodToggle" />
+    Sort selected day by DoD Δ (desc)
+  </label>
   <table>
     <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th><th>DoD Δ</th><th>DoD Δ%</th></tr></thead>
     <tbody id="selectedDayBody"><tr><td colspan="6">Click a spike marker to focus a day</td></tr></tbody>
@@ -460,6 +464,7 @@ def build_dashboard_html(
     const wrap = document.getElementById('chartWrap');
     const selectedDayTitle = document.getElementById('selectedDayTitle');
     const selectedDayMeta = document.getElementById('selectedDayMeta');
+    const sortByDodToggle = document.getElementById('sortByDodToggle');
     const selectedDayBody = document.getElementById('selectedDayBody');
     const spikesBody = document.getElementById('spikesBody');
     const spikeOnlyToggle = document.getElementById('spikeOnlyToggle');
@@ -469,14 +474,20 @@ def build_dashboard_html(
     let selectedSpikeDate = null;
     let selectedDate = null;
     let spikeOnlyMode = false;
+    let sortByDodMode = false;
 
     function renderSelectedDay(date) {{
-      const rows = dayBreakdownByDate[date] || [];
+      const baseRows = dayBreakdownByDate[date] || [];
       const idx = labels.indexOf(date);
       const prevDate = idx > 0 ? labels[idx - 1] : null;
       const prevRows = prevDate ? (dayBreakdownByDate[prevDate] || []) : [];
       const prevMap = Object.fromEntries(prevRows.map(r => [r.model, r.costUSD || 0]));
-      const currTotal = dayTotalByDate[date] || rows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
+      const rows = baseRows.map(r => ({{
+        ...r,
+        dod: (r.costUSD || 0) - (prevMap[r.model] || 0),
+      }}));
+      if (sortByDodMode) rows.sort((a, b) => (b.dod || 0) - (a.dod || 0));
+      const currTotal = dayTotalByDate[date] || baseRows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
       const prevTotal = prevDate ? (dayTotalByDate[prevDate] || 0) : 0;
       const totalDelta = currTotal - prevTotal;
       const totalDeltaPct = prevTotal > 0 ? ((totalDelta / prevTotal) * 100) : null;
@@ -492,7 +503,7 @@ def build_dashboard_html(
       selectedDayBody.innerHTML = rows.map((r, i) => {{
         const share = total > 0 ? (((r.costUSD || 0) / total) * 100).toFixed(1) : '0.0';
         const prev = prevMap[r.model] || 0;
-        const dod = (r.costUSD || 0) - prev;
+        const dod = r.dod || 0;
         const dodPct = prev > 0 ? (dod / prev) * 100 : null;
         const dodText = `${{dod >= 0 ? '+' : ''}}$${{dod.toFixed(2)}}`;
         const dodPctText = dodPct === null ? 'N/A' : `${{dodPct >= 0 ? '+' : ''}}${{dodPct.toFixed(1)}}%`;
@@ -733,6 +744,11 @@ def build_dashboard_html(
     spikeOnlyToggle?.addEventListener('change', () => {{
       spikeOnlyMode = !!spikeOnlyToggle.checked;
       updateHash();
+    }});
+
+    sortByDodToggle?.addEventListener('change', () => {{
+      sortByDodMode = !!sortByDodToggle.checked;
+      if (selectedDate) renderSelectedDay(selectedDate);
     }});
 
     copyLinkBtn?.addEventListener('click', () => {{

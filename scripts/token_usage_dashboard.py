@@ -393,6 +393,10 @@ def build_dashboard_html(
       <input type="checkbox" id="spikeOnlyToggle" />
       Spike-only navigation (shareable via URL hash)
     </label>
+    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
+      <input type="checkbox" id="showOnlyChangesToggle" />
+      Selected day: show only DoD changes
+    </label>
     <button id="copyLinkBtn" type="button" style="font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:8px;padding:4px 8px;cursor:pointer;">Copy deep-link</button>
     <span id="copyLinkHint" style="font-size:12px;color:#6b7280;"></span>
   </div>
@@ -469,6 +473,7 @@ def build_dashboard_html(
     const selectedDayBody = document.getElementById('selectedDayBody');
     const spikesBody = document.getElementById('spikesBody');
     const spikeOnlyToggle = document.getElementById('spikeOnlyToggle');
+    const showOnlyChangesToggle = document.getElementById('showOnlyChangesToggle');
     const copyLinkBtn = document.getElementById('copyLinkBtn');
     const copyLinkHint = document.getElementById('copyLinkHint');
     const kbdHelp = document.getElementById('kbdHelp');
@@ -476,6 +481,7 @@ def build_dashboard_html(
     let selectedDate = null;
     let spikeOnlyMode = false;
     let sortByDodMode = false;
+    let showOnlyChangesMode = false;
 
     function renderSelectedDay(date) {{
       const baseRows = dayBreakdownByDate[date] || [];
@@ -483,10 +489,11 @@ def build_dashboard_html(
       const prevDate = idx > 0 ? labels[idx - 1] : null;
       const prevRows = prevDate ? (dayBreakdownByDate[prevDate] || []) : [];
       const prevMap = Object.fromEntries(prevRows.map(r => [r.model, r.costUSD || 0]));
-      const rows = baseRows.map(r => ({{
+      let rows = baseRows.map(r => ({{
         ...r,
         dod: (r.costUSD || 0) - (prevMap[r.model] || 0),
       }}));
+      if (showOnlyChangesMode) rows = rows.filter(r => Math.abs(r.dod || 0) > 1e-9);
       if (sortByDodMode) rows.sort((a, b) => (b.dod || 0) - (a.dod || 0));
       const currTotal = dayTotalByDate[date] || baseRows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
       const prevTotal = prevDate ? (dayTotalByDate[prevDate] || 0) : 0;
@@ -497,7 +504,7 @@ def build_dashboard_html(
       selectedDayTitle.textContent = `Selected Day Model Breakdown · ${{date}} · DoD ${{totalDeltaText}} (${{totalDeltaPctText}})`;
       if (selectedDayMeta) selectedDayMeta.textContent = `Day total: $${{currTotal.toFixed(2)}} · Previous day total: $${{prevTotal.toFixed(2)}}`;
       if (!rows.length) {{
-        selectedDayBody.innerHTML = '<tr><td colspan="6">No model breakdown on this day</td></tr>';
+        selectedDayBody.innerHTML = '<tr><td colspan="6">No model breakdown rows for current filter</td></tr>';
         return;
       }}
       const total = rows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
@@ -646,6 +653,7 @@ def build_dashboard_html(
         if (selectedDate) params.set('date', selectedDate);
         if (spikeOnlyMode) params.set('spikeOnly', '1');
         if (sortByDodMode) params.set('sortDod', '1');
+        if (showOnlyChangesMode) params.set('changesOnly', '1');
         const hash = params.toString();
         history.replaceState(null, '', hash ? `#${{hash}}` : '#');
       }} catch (e) {{}}
@@ -666,15 +674,17 @@ def build_dashboard_html(
 
     function getInitialStateFromHash() {{
       const raw = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
-      if (!raw) return {{ date: null, spikeOnly: false, sortDod: false }};
+      if (!raw) return {{ date: null, spikeOnly: false, sortDod: false, changesOnly: false }};
       const p = new URLSearchParams(raw);
       const date = p.get('date');
       const spikeOnly = p.get('spikeOnly') === '1';
       const sortDod = p.get('sortDod') === '1';
+      const changesOnly = p.get('changesOnly') === '1';
       return {{
         date: date && labels.includes(date) ? date : null,
         spikeOnly,
         sortDod,
+        changesOnly,
       }};
     }}
 
@@ -739,8 +749,10 @@ def build_dashboard_html(
     const initialState = getInitialStateFromHash();
     spikeOnlyMode = !!initialState.spikeOnly;
     sortByDodMode = !!initialState.sortDod;
+    showOnlyChangesMode = !!initialState.changesOnly;
     if (spikeOnlyToggle) spikeOnlyToggle.checked = spikeOnlyMode;
     if (sortByDodToggle) sortByDodToggle.checked = sortByDodMode;
+    if (showOnlyChangesToggle) showOnlyChangesToggle.checked = showOnlyChangesMode;
 
     if (labels.length) {{
       const initial = initialState.date || labels[labels.length - 1];
@@ -754,6 +766,12 @@ def build_dashboard_html(
 
     sortByDodToggle?.addEventListener('change', () => {{
       sortByDodMode = !!sortByDodToggle.checked;
+      if (selectedDate) renderSelectedDay(selectedDate);
+      updateHash();
+    }});
+
+    showOnlyChangesToggle?.addEventListener('change', () => {{
+      showOnlyChangesMode = !!showOnlyChangesToggle.checked;
       if (selectedDate) renderSelectedDay(selectedDate);
       updateHash();
     }});

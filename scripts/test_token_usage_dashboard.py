@@ -107,6 +107,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("getInitialStateFromHash", html)
         self.assertIn("history.replaceState", html)
         self.assertIn("window.addEventListener('keydown'", html)
+        self.assertIn("isEditable", html)
         self.assertIn("selectedSpikeDate", html)
 
     def test_prepare_chart_series_groups_other(self):

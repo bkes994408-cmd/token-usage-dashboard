@@ -803,11 +803,16 @@ def build_dashboard_html(
     function resetToLatestDay() {{
       if (!labels.length) return;
       spikeOnlyMode = false;
+      sortByDodMode = false;
       if (spikeOnlyToggle) spikeOnlyToggle.checked = false;
+      if (sortByDodToggle) sortByDodToggle.checked = false;
       focusDate(labels[labels.length - 1]);
     }}
 
     window.addEventListener('keydown', (ev) => {{
+      const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toUpperCase() : '';
+      const isEditable = tag === 'INPUT' || tag === 'TEXTAREA' || (ev.target && ev.target.isContentEditable);
+      if (isEditable) return;
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === 'ArrowLeft' || ev.key === 'j') {{
         ev.preventDefault();

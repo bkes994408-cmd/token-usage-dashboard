@@ -432,6 +432,7 @@ def build_dashboard_html(
     <div><code>s</code>: toggle spike-only mode</div>
     <div><code>r</code>: reset to latest day</div>
     <div><code>?</code>: toggle this help</div>
+    <div><code>Esc</code>: close help</div>
   </div>
 
   <script>
@@ -727,9 +728,10 @@ def build_dashboard_html(
       }}
     }}
 
-    function toggleKeyboardHelp() {{
+    function toggleKeyboardHelp(force = null) {{
       if (!kbdHelp) return;
-      kbdHelp.classList.toggle('visible');
+      const next = force === null ? !kbdHelp.classList.contains('visible') : !!force;
+      kbdHelp.classList.toggle('visible', next);
     }}
 
     function resetToLatestDay() {{
@@ -768,6 +770,9 @@ def build_dashboard_html(
       if (ev.key === '?' || (ev.key === '/' && ev.shiftKey)) {{
         ev.preventDefault();
         toggleKeyboardHelp();
+      }}
+      if (ev.key === 'Escape') {{
+        toggleKeyboardHelp(false);
       }}
     }});
 

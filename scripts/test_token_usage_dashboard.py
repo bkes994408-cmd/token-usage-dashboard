@@ -95,6 +95,8 @@ class TestTokenDashboard(TestCase):
         self.assertIn("copyDeepLink", html)
         self.assertIn("id=\"copyLinkBtn\"", html)
         self.assertIn("ev.key === 'c'", html)
+        self.assertIn("dod-pos", html)
+        self.assertIn("dod-neg", html)
         self.assertIn("Escape", html)
         self.assertIn("id=\"kbdHelp\"", html)
         self.assertIn("getInitialStateFromHash", html)

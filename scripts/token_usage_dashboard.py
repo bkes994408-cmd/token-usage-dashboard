@@ -375,6 +375,9 @@ def build_dashboard_html(
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; font-size: 13px; }}
     th {{ color: #374151; background: #f9fafb; }}
+    .dod-pos {{ color: #166534; font-weight: 600; }}
+    .dod-neg {{ color: #991b1b; font-weight: 600; }}
+    .dod-neutral {{ color: #6b7280; }}
     tr.spike-focus {{ background: #fef2f2; }}
     .kbd-help {{ position: fixed; right: 18px; bottom: 18px; background: #111827; color: #f9fafb; border-radius: 10px; padding: 10px 12px; font-size: 12px; line-height: 1.6; max-width: 280px; box-shadow: 0 8px 24px rgba(0,0,0,.25); display: none; z-index: 20; }}
     .kbd-help.visible {{ display: block; }}
@@ -489,7 +492,9 @@ def build_dashboard_html(
         const dodPct = prev > 0 ? (dod / prev) * 100 : null;
         const dodText = `${{dod >= 0 ? '+' : ''}}$${{dod.toFixed(2)}}`;
         const dodPctText = dodPct === null ? 'N/A' : `${{dodPct >= 0 ? '+' : ''}}${{dodPct.toFixed(1)}}%`;
-        return `<tr><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td>${{dodText}}</td><td>${{dodPctText}}</td></tr>`;
+        const dodClass = dod > 0 ? 'dod-pos' : (dod < 0 ? 'dod-neg' : 'dod-neutral');
+        const dodPctClass = dodPct === null ? 'dod-neutral' : (dodPct > 0 ? 'dod-pos' : (dodPct < 0 ? 'dod-neg' : 'dod-neutral'));
+        return `<tr><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
       }}).join('');
     }}
 

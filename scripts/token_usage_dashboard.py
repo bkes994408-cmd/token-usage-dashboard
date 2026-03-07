@@ -380,7 +380,11 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:10px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike</div>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike</div>
+  <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin-bottom:10px;">
+    <input type="checkbox" id="spikeOnlyToggle" />
+    Spike-only navigation (shareable via URL hash)
+  </label>
   <div class=\"grid\">
     <div class=\"card\"><div class=\"label\">Date range rows</div><div class=\"value\">{len(rows)}</div></div>
     <div class=\"card\"><div class=\"label\">Latest day</div><div class=\"value\">{latest_day}</div></div>
@@ -434,8 +438,10 @@ def build_dashboard_html(
     const selectedDayTitle = document.getElementById('selectedDayTitle');
     const selectedDayBody = document.getElementById('selectedDayBody');
     const spikesBody = document.getElementById('spikesBody');
+    const spikeOnlyToggle = document.getElementById('spikeOnlyToggle');
     let selectedSpikeDate = null;
     let selectedDate = null;
+    let spikeOnlyMode = false;
 
     function renderSelectedDay(date) {{
       const rows = dayBreakdownByDate[date] || [];
@@ -583,14 +589,22 @@ def build_dashboard_html(
 
     function focusSpikeDate(d, scrollRow = false) {{
       if (!spikeByDate[d]) return;
-      selectedSpikeDate = d;
-      renderSelectedDay(d);
-      draw();
-      const row = document.getElementById(`spike-row-${d}`);
+      focusDate(d);
+      const row = document.getElementById(`spike-row-${{d}}`);
       if (!row) return;
       if (scrollRow) row.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
       row.classList.add('spike-focus');
       setTimeout(() => row.classList.remove('spike-focus'), 1200);
+    }}
+
+    function updateHash() {{
+      try {{
+        const params = new URLSearchParams();
+        if (selectedDate) params.set('date', selectedDate);
+        if (spikeOnlyMode) params.set('spikeOnly', '1');
+        const hash = params.toString();
+        history.replaceState(null, '', hash ? `#${{hash}}` : '#');
+      }} catch (e) {{}}
     }}
 
     function focusDate(d) {{
@@ -602,27 +616,32 @@ def build_dashboard_html(
       }} else {{
         selectedSpikeDate = null;
       }}
-      try {{
-        history.replaceState(null, '', `#date=${{encodeURIComponent(d)}}`);
-      }} catch (e) {{}}
+      updateHash();
       draw();
     }}
 
-    function getInitialDateFromHash() {{
-      const m = window.location.hash.match(/^#date=(.+)$/);
-      if (!m) return null;
-      const d = decodeURIComponent(m[1]);
-      return labels.includes(d) ? d : null;
+    function getInitialStateFromHash() {{
+      const raw = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+      if (!raw) return {{ date: null, spikeOnly: false }};
+      const p = new URLSearchParams(raw);
+      const date = p.get('date');
+      const spikeOnly = p.get('spikeOnly') === '1';
+      return {{
+        date: date && labels.includes(date) ? date : null,
+        spikeOnly,
+      }};
     }}
 
     function stepDate(offset) {{
       if (!labels.length) return;
-      const current = selectedDate && labels.includes(selectedDate)
+      const baseDates = spikeOnlyMode ? labels.filter(d => !!spikeByDate[d]) : labels;
+      if (!baseDates.length) return;
+      const current = selectedDate && baseDates.includes(selectedDate)
         ? selectedDate
-        : (getInitialDateFromHash() || labels[labels.length - 1]);
-      const idx = labels.indexOf(current);
-      const next = Math.max(0, Math.min(labels.length - 1, idx + offset));
-      focusDate(labels[next]);
+        : baseDates[baseDates.length - 1];
+      const idx = baseDates.indexOf(current);
+      const next = Math.max(0, Math.min(baseDates.length - 1, idx + offset));
+      focusDate(baseDates[next]);
     }}
 
     function jumpSpike(offset) {{
@@ -630,7 +649,7 @@ def build_dashboard_html(
       if (!spikeDates.length) return;
       const current = selectedDate && labels.includes(selectedDate)
         ? selectedDate
-        : (getInitialDateFromHash() || labels[labels.length - 1]);
+        : labels[labels.length - 1];
       let idx = spikeDates.indexOf(current);
       if (idx < 0) {{
         idx = offset >= 0 ? -1 : spikeDates.length;
@@ -671,10 +690,19 @@ def build_dashboard_html(
       focusSpikeDate(d, false);
     }});
 
+    const initialState = getInitialStateFromHash();
+    spikeOnlyMode = !!initialState.spikeOnly;
+    if (spikeOnlyToggle) spikeOnlyToggle.checked = spikeOnlyMode;
+
     if (labels.length) {{
-      const initial = getInitialDateFromHash() || labels[labels.length - 1];
+      const initial = initialState.date || labels[labels.length - 1];
       focusDate(initial);
     }}
+
+    spikeOnlyToggle?.addEventListener('change', () => {{
+      spikeOnlyMode = !!spikeOnlyToggle.checked;
+      updateHash();
+    }});
 
     window.addEventListener('keydown', (ev) => {{
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;

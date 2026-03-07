@@ -98,6 +98,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("ev.key === 'c'", html)
         self.assertIn("dod-pos", html)
         self.assertIn("dod-neg", html)
+        self.assertIn("model-top", html)
         self.assertIn("Escape", html)
         self.assertIn("id=\"kbdHelp\"", html)
         self.assertIn("getInitialStateFromHash", html)

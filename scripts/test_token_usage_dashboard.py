@@ -91,6 +91,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("spikeOnlyToggle", html)
         self.assertIn("toggleSpikeOnlyMode", html)
         self.assertIn("toggleKeyboardHelp", html)
+        self.assertIn("resetToLatestDay", html)
         self.assertIn("id=\"kbdHelp\"", html)
         self.assertIn("getInitialStateFromHash", html)
         self.assertIn("history.replaceState", html)

@@ -383,7 +383,7 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · s toggle spike-only · ? help</div>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · s toggle spike-only · r reset to latest · ? help</div>
   <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin-bottom:10px;">
     <input type="checkbox" id="spikeOnlyToggle" />
     Spike-only navigation (shareable via URL hash)
@@ -430,6 +430,7 @@ def build_dashboard_html(
     <div><code>←/→</code> or <code>j/k</code>: step day</div>
     <div><code>n/p</code>: next/prev spike</div>
     <div><code>s</code>: toggle spike-only mode</div>
+    <div><code>r</code>: reset to latest day</div>
     <div><code>?</code>: toggle this help</div>
   </div>
 
@@ -731,6 +732,13 @@ def build_dashboard_html(
       kbdHelp.classList.toggle('visible');
     }}
 
+    function resetToLatestDay() {{
+      if (!labels.length) return;
+      spikeOnlyMode = false;
+      if (spikeOnlyToggle) spikeOnlyToggle.checked = false;
+      focusDate(labels[labels.length - 1]);
+    }}
+
     window.addEventListener('keydown', (ev) => {{
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === 'ArrowLeft' || ev.key === 'j') {{
@@ -752,6 +760,10 @@ def build_dashboard_html(
       if (ev.key === 's') {{
         ev.preventDefault();
         toggleSpikeOnlyMode();
+      }}
+      if (ev.key === 'r') {{
+        ev.preventDefault();
+        resetToLatestDay();
       }}
       if (ev.key === '?' || (ev.key === '/' && ev.shiftKey)) {{
         ev.preventDefault();

@@ -129,6 +129,15 @@ class TestTokenDashboard(TestCase):
         self.assertIn("window.addEventListener('keydown'", html)
         self.assertIn("isEditable", html)
         self.assertIn("selectedSpikeDate", html)
+        self.assertIn("Selected Range Summary", html)
+        self.assertIn("const selectedRangeBody", html)
+        self.assertIn("rangeStart", html)
+        self.assertIn("rangeEnd", html)
+        self.assertIn("setRangeByIndexes", html)
+        self.assertIn("clearSelectedRange", html)
+        self.assertIn("Drag on chart to choose a date range", html)
+        self.assertIn("canvas.addEventListener('mousedown'", html)
+        self.assertIn("canvas.addEventListener('dblclick'", html)
 
     def test_prepare_chart_series_groups_other(self):
         rows = [

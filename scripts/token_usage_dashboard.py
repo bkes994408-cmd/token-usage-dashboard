@@ -573,7 +573,7 @@ def build_dashboard_html(
     .value {{ font-size: 24px; font-weight: 700; margin-top: 4px; }}
     .chart-wrap {{ border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; margin: 12px 0 18px; position: relative; }}
     canvas {{ width: 100%; height: 360px; }}
-    #tooltip {{ position: absolute; pointer-events: none; background: #111827; color: #fff; padding: 8px 10px; border-radius: 8px; font-size: 12px; opacity: 0; transform: translate(-50%, -110%); white-space: pre; }}
+    #tooltip {{ position: absolute; pointer-events: none; background: #111827; color: #fff; padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.4; opacity: 0; transform: translate(-50%, -110%); white-space: normal; max-width: 320px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; font-size: 13px; }}
     th {{ color: #374151; background: #f9fafb; }}
@@ -1091,16 +1091,42 @@ def build_dashboard_html(
       focusSpikeDate(spikeDates[next], true);
     }}
 
+    function escapeHtml(text) {{
+      return String(text)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }}
+
     canvas.addEventListener('mousemove', (ev) => {{
       if (!labels.length) return;
       const i = nearestIndex(ev.clientX);
-      const names = Object.keys(series);
-      const rows = names.map(n => `${{n}}: $${{(series[n][i] || 0).toFixed(2)}}`).join('\n');
-      const spike = spikeByDate[labels[i]];
-      const spikeLine = spike
-        ? `\n⚠ Spike: $${{(spike.costUSD || 0).toFixed(2)}} / baseline $${{(spike.baselineUSD || 0).toFixed(2)}} (${{(spike.ratio || 0).toFixed(2)}}x)`
+      const date = labels[i];
+      const dailyRows = (dayBreakdownByDate[date] || []).slice(0, 10);
+      const overflowCount = Math.max(0, (dayBreakdownByDate[date] || []).length - dailyRows.length);
+      const spike = spikeByDate[date];
+
+      const modelRowsHtml = dailyRows.length
+        ? dailyRows.map((r) => `<div>${{escapeHtml(r.model)}}: <strong>$${{(r.costUSD || 0).toFixed(2)}}</strong></div>`).join('')
+        : '<div style="color:#d1d5db;">No model cost rows</div>';
+      const overflowHtml = overflowCount > 0
+        ? `<div style="color:#d1d5db;">+${{overflowCount}} more models…</div>`
         : '';
-      tip.textContent = `${{labels[i]}}\nTotal: $${{(dayTotals[i] || 0).toFixed(2)}}${{spikeLine}}\n${{rows}}`;
+      const spikeHtml = spike
+        ? `<div style="margin-top:6px;color:#fca5a5;">⚠ Spike: $${{(spike.costUSD || 0).toFixed(2)}} / baseline $${{(spike.baselineUSD || 0).toFixed(2)}} (${{(spike.ratio || 0).toFixed(2)}}x)</div>`
+        : '';
+
+      tip.innerHTML = `
+        <div style="font-weight:700;">${{date}}</div>
+        <div style="margin:2px 0 6px;">Total: <strong>$${{(dayTotals[i] || 0).toFixed(2)}}</strong></div>
+        <div style="color:#d1d5db;margin-bottom:4px;">Daily model costs</div>
+        ${{modelRowsHtml}}
+        ${{overflowHtml}}
+        ${{spikeHtml}}
+      `;
+
       const wr = wrap.getBoundingClientRect();
       tip.style.left = `${{ev.clientX - wr.left}}px`;
       tip.style.top = `${{ev.clientY - wr.top}}px`;

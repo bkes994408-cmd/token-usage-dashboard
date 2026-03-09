@@ -16,6 +16,34 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+DEFAULT_ROLE_POLICIES: Dict[str, Dict[str, Any]] = {
+    "admin": {
+        "canViewTotals": True,
+        "canViewModelBreakdown": True,
+        "canViewModelNames": True,
+        "canViewSpikes": True,
+        "canViewMovers": True,
+        "canUseCustomReportBuilder": True,
+    },
+    "analyst": {
+        "canViewTotals": True,
+        "canViewModelBreakdown": True,
+        "canViewModelNames": True,
+        "canViewSpikes": True,
+        "canViewMovers": True,
+        "canUseCustomReportBuilder": True,
+    },
+    "viewer": {
+        "canViewTotals": True,
+        "canViewModelBreakdown": False,
+        "canViewModelNames": False,
+        "canViewSpikes": False,
+        "canViewMovers": False,
+        "canUseCustomReportBuilder": False,
+    },
+}
+
+
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
@@ -148,6 +176,8 @@ def model_totals(rows: Iterable[Dict[str, Any]]) -> Dict[str, float]:
 
 
 def day_total_cost(row: Dict[str, Any]) -> float:
+    if isinstance(row.get("totalCost"), (int, float)):
+        return float(row["totalCost"])
     breakdowns = row.get("modelBreakdowns")
     if not isinstance(breakdowns, list):
         return 0.0
@@ -156,6 +186,70 @@ def day_total_cost(row: Dict[str, Any]) -> float:
         if isinstance(b, dict) and isinstance(b.get("cost"), (int, float)):
             total += float(b["cost"])
     return total
+
+
+def _load_rbac_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("RBAC config must be a JSON object.")
+    return parsed
+
+
+def resolve_access_policy(role: Optional[str], user: Optional[str], rbac_config_path: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+    cfg = _load_rbac_config(rbac_config_path)
+    users = cfg.get("users") if isinstance(cfg.get("users"), dict) else {}
+    roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+
+    selected_role = role or ""
+    if not selected_role and user and isinstance(users.get(user), str):
+        selected_role = users[user]
+    if not selected_role:
+        selected_role = str(cfg.get("defaultRole") or "admin")
+
+    base_policy = DEFAULT_ROLE_POLICIES.get(selected_role, DEFAULT_ROLE_POLICIES["viewer"]).copy()
+    override = roles.get(selected_role)
+    if isinstance(override, dict):
+        base_policy.update(override)
+    return selected_role, base_policy
+
+
+def apply_access_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    can_view_breakdown = bool(policy.get("canViewModelBreakdown", True))
+    can_view_model_names = bool(policy.get("canViewModelNames", True))
+    allowed_models = policy.get("allowedModels")
+    allowed_set = {str(x) for x in allowed_models} if isinstance(allowed_models, list) else set()
+    max_days = policy.get("maxDays")
+
+    transformed: List[Dict[str, Any]] = []
+    for row in rows:
+        breakdowns = row.get("modelBreakdowns") if isinstance(row.get("modelBreakdowns"), list) else []
+        kept: List[Dict[str, Any]] = []
+        total = 0.0
+        for b in breakdowns:
+            if not isinstance(b, dict):
+                continue
+            name = b.get("modelName")
+            cost = b.get("cost")
+            if not isinstance(name, str) or not isinstance(cost, (int, float)):
+                continue
+            if allowed_set and name not in allowed_set:
+                continue
+            c = float(cost)
+            total += c
+            if can_view_breakdown:
+                kept.append({"modelName": name if can_view_model_names else "Restricted", "cost": c})
+        nr = dict(row)
+        nr["totalCost"] = total
+        nr["modelBreakdowns"] = kept if can_view_breakdown else []
+        transformed.append(nr)
+
+    if isinstance(max_days, int) and max_days > 0:
+        transformed = transformed[-max_days:]
+
+    return transformed
 
 
 def detect_spikes(rows: List[Dict[str, Any]], lookback_days: int = 7, threshold_mult: float = 2.0) -> List[Dict[str, Any]]:
@@ -378,7 +472,10 @@ def build_dashboard_html(
     spike_threshold_mult: float = 2.0,
     max_table_rows: int = 120,
     chart_max_points: int = 1200,
+    role_name: str = "admin",
+    policy: Optional[Dict[str, Any]] = None,
 ) -> str:
+    policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
     grand_total = sum(day_total_cost(r) for r in rows)
     chart_rows = downsample_rows(rows, chart_max_points)
@@ -410,8 +507,9 @@ def build_dashboard_html(
         )
     movers_rows = "\n".join(movers_rows_parts)
 
+    visible_spikes = summary.get("spikes", []) if policy.get("canViewSpikes", True) else []
     spikes_rows_parts: List[str] = []
-    for idx, x in enumerate(summary.get("spikes", [])[:10], start=1):
+    for idx, x in enumerate(visible_spikes[:10], start=1):
         date_key = str(x["date"])
         spikes_rows_parts.append(
             f"<tr id='spike-row-{date_key}'><td>{idx}</td><td>{x['date']}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
@@ -419,7 +517,7 @@ def build_dashboard_html(
     spikes_rows = "\n".join(spikes_rows_parts) if spikes_rows_parts else "<tr><td colspan='5'>No spikes detected</td></tr>"
 
     spike_by_date: Dict[str, Dict[str, float]] = {}
-    for s in summary.get("spikes", []):
+    for s in visible_spikes:
         d = s.get("date")
         if isinstance(d, str):
             spike_by_date[d] = {
@@ -459,6 +557,7 @@ def build_dashboard_html(
     json_day_breakdown_by_date = json.dumps(day_breakdown_by_date)
     json_day_total_by_date = json.dumps(day_total_by_date)
     json_all_models = json.dumps(all_models)
+    json_policy = json.dumps(policy)
 
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -490,6 +589,7 @@ def build_dashboard_html(
 </head>
 <body>
   <h2>Token Usage Dashboard · {provider}</h2>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Role: <strong>{role_name}</strong></div>
   <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · Home/End first/last day · s toggle spike-only · d sort DoD · x changes-only · r reset to latest · c copy link · ? help</div>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
     <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
@@ -598,6 +698,7 @@ def build_dashboard_html(
     const dayBreakdownByDate = {json_day_breakdown_by_date};
     const dayTotalByDate = {json_day_total_by_date};
     const allModels = {json_all_models};
+    const accessPolicy = {json_policy};
 
     const colors = ["#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#ea580c", "#0891b2", "#4f46e5", "#65a30d", "#be123c"];
     const canvas = document.getElementById('costChart');
@@ -622,6 +723,22 @@ def build_dashboard_html(
     let selectedSpikeDate = null;
     let selectedDate = null;
     let spikeOnlyMode = false;
+
+    function hideSectionByHeading(titleText, message) {{
+      const h = Array.from(document.querySelectorAll('h3')).find(x => x.textContent.trim() === titleText);
+      if (!h) return;
+      let n = h.nextElementSibling;
+      while (n && n.tagName !== 'H3') {{
+        n.style.display = 'none';
+        n = n.nextElementSibling;
+      }}
+      const note = document.createElement('div');
+      note.style.fontSize = '12px';
+      note.style.color = '#6b7280';
+      note.style.marginBottom = '8px';
+      note.textContent = message;
+      h.insertAdjacentElement('afterend', note);
+    }}
     let sortByDodMode = false;
     let showOnlyChangesMode = false;
 
@@ -1162,7 +1279,17 @@ def build_dashboard_html(
       }}
     }});
 
-    initCustomReportBuilder();
+    if (!accessPolicy.canViewMovers) {{
+      hideSectionByHeading('Top 7d Movers', 'You do not have permission to view movers.');
+    }}
+    if (!accessPolicy.canViewSpikes) {{
+      hideSectionByHeading('Daily Cost Spikes', 'You do not have permission to view spikes.');
+    }}
+    if (!accessPolicy.canUseCustomReportBuilder) {{
+      hideSectionByHeading('Custom Report Builder', 'You do not have permission to use custom reports.');
+    }} else {{
+      initCustomReportBuilder();
+    }}
     window.addEventListener('resize', resize);
     resize();
   </script>
@@ -1187,6 +1314,9 @@ def main() -> int:
     parser.add_argument("--report-granularity", choices=["daily", "weekly", "monthly"], default="daily", help="Custom report time granularity")
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
+    parser.add_argument("--role", choices=["admin", "analyst", "viewer"], help="RBAC role used for data access")
+    parser.add_argument("--user", help="Username for role mapping (used with --rbac-config)")
+    parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
 
@@ -1201,6 +1331,14 @@ def main() -> int:
         eprint("No daily rows found in payload.")
         return 2
 
+    try:
+        role_name, policy = resolve_access_policy(args.role, args.user, args.rbac_config)
+    except Exception as exc:
+        eprint(f"Failed to resolve RBAC policy: {exc}")
+        return 3
+
+    rows = apply_access_policy(rows, policy)
+
     html = build_dashboard_html(
         args.provider,
         rows,
@@ -1209,6 +1347,8 @@ def main() -> int:
         spike_threshold_mult=args.spike_threshold_mult,
         max_table_rows=args.max_table_rows,
         chart_max_points=args.chart_max_points,
+        role_name=role_name,
+        policy=policy,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -1220,14 +1360,20 @@ def main() -> int:
             spike_lookback_days=args.spike_lookback_days,
             spike_threshold_mult=args.spike_threshold_mult,
         )
+        summary["role"] = role_name
+        summary["policy"] = policy
         Path(args.summary_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.custom_report_json:
+        if not policy.get("canUseCustomReportBuilder", True):
+            eprint(f"Role '{role_name}' does not have permission to export custom report JSON.")
+            return 4
         metrics = [x.strip() for x in (args.report_metrics or '').split(',') if x.strip()]
         models = [x.strip() for x in (args.report_models or '').split(',') if x.strip()] if args.report_models else []
         report_rows = generate_custom_report(rows, metrics=metrics, models=models, granularity=args.report_granularity)
         report_payload = {
             "provider": args.provider,
+            "role": role_name,
             "granularity": args.report_granularity,
             "metrics": metrics,
             "models": models,

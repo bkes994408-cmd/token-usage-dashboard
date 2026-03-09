@@ -3,6 +3,7 @@
 from unittest import TestCase, main
 
 from token_usage_dashboard import (
+    apply_access_policy,
     build_dashboard_html,
     build_model_table_rows,
     build_summary,
@@ -11,6 +12,7 @@ from token_usage_dashboard import (
     generate_custom_report,
     model_totals,
     prepare_chart_series,
+    resolve_access_policy,
 )
 
 
@@ -200,6 +202,29 @@ class TestTokenDashboard(TestCase):
         self.assertIn("id=\"customReportBody\"", html)
         self.assertIn("generateCustomReportRows", html)
         self.assertIn("initCustomReportBuilder", html)
+
+    def test_apply_access_policy_viewer_hides_breakdown(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}, {"modelName": "o3", "cost": 1.0}]},
+        ]
+        _, policy = resolve_access_policy("viewer", None, None)
+        filtered = apply_access_policy(rows, policy)
+        self.assertEqual(filtered[0]["modelBreakdowns"], [])
+        self.assertAlmostEqual(filtered[0]["totalCost"], 4.0)
+
+    def test_apply_access_policy_allowed_models(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}, {"modelName": "o3", "cost": 1.0}]},
+        ]
+        policy = {
+            "canViewModelBreakdown": True,
+            "canViewModelNames": True,
+            "allowedModels": ["o3"],
+        }
+        filtered = apply_access_policy(rows, policy)
+        self.assertEqual(len(filtered[0]["modelBreakdowns"]), 1)
+        self.assertEqual(filtered[0]["modelBreakdowns"][0]["modelName"], "o3")
+        self.assertAlmostEqual(filtered[0]["totalCost"], 1.0)
 
 
 if __name__ == "__main__":

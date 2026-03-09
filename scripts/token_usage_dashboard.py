@@ -308,6 +308,68 @@ def build_summary(
     }
 
 
+def _bucket_for_granularity(day: date, granularity: str) -> str:
+    g = (granularity or "daily").lower()
+    if g == "weekly":
+        y, w, _ = day.isocalendar()
+        return f"{y}-W{w:02d}"
+    if g == "monthly":
+        return day.strftime("%Y-%m")
+    return day.strftime("%Y-%m-%d")
+
+
+def generate_custom_report(
+    rows: List[Dict[str, Any]],
+    metrics: List[str],
+    models: Optional[List[str]] = None,
+    granularity: str = "daily",
+) -> List[Dict[str, Any]]:
+    selected_metrics = [m for m in metrics if m in {"total_cost", "active_models", "avg_cost_per_model"}]
+    if not selected_metrics:
+        selected_metrics = ["total_cost"]
+
+    model_filter = {m for m in (models or []) if isinstance(m, str) and m.strip()}
+    buckets: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+    for row in rows:
+        d = parse_date(str(row.get("date", "")))
+        if not d:
+            continue
+        bucket = _bucket_for_granularity(d, granularity)
+        breakdowns = row.get("modelBreakdowns") if isinstance(row.get("modelBreakdowns"), list) else []
+        model_map: Dict[str, float] = defaultdict(float)
+        for b in breakdowns:
+            if not isinstance(b, dict):
+                continue
+            name = b.get("modelName")
+            cost = b.get("cost")
+            if not isinstance(name, str) or not isinstance(cost, (int, float)):
+                continue
+            if model_filter and name not in model_filter:
+                continue
+            model_map[name] += float(cost)
+
+        buckets[bucket]["total_cost"] += sum(model_map.values())
+        buckets[bucket]["active_models"] += float(len(model_map))
+        buckets[bucket]["days"] += 1.0
+
+    out: List[Dict[str, Any]] = []
+    for bucket in sorted(buckets.keys()):
+        item: Dict[str, Any] = {"period": bucket}
+        days = buckets[bucket].get("days", 1.0) or 1.0
+        total_cost = buckets[bucket].get("total_cost", 0.0)
+        active_models = buckets[bucket].get("active_models", 0.0) / days
+        if "total_cost" in selected_metrics:
+            item["totalCostUSD"] = round(total_cost, 6)
+        if "active_models" in selected_metrics:
+            item["avgActiveModels"] = round(active_models, 6)
+        if "avg_cost_per_model" in selected_metrics:
+            item["avgCostPerActiveModelUSD"] = round((total_cost / active_models) if active_models > 0 else 0.0, 6)
+        out.append(item)
+
+    return out
+
+
 def build_dashboard_html(
     provider: str,
     rows: List[Dict[str, Any]],
@@ -391,9 +453,12 @@ def build_dashboard_html(
     json_labels = json.dumps(labels)
     json_series = json.dumps(series)
     json_day_totals = json.dumps(day_totals)
+    all_models = sorted({str(x["model"]) for day in day_breakdown_by_date.values() for x in day if isinstance(x, dict) and isinstance(x.get("model"), str)})
+
     json_spike_by_date = json.dumps(spike_by_date)
     json_day_breakdown_by_date = json.dumps(day_breakdown_by_date)
     json_day_total_by_date = json.dumps(day_total_by_date)
+    json_all_models = json.dumps(all_models)
 
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -481,6 +546,36 @@ def build_dashboard_html(
     <tbody id="selectedDayBody"><tr><td colspan="6">Click a spike marker to focus a day</td></tr></tbody>
   </table>
 
+  <h3>Custom Report Builder</h3>
+  <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px;align-items:flex-start;">
+    <fieldset style="border:1px solid #e5e7eb;border-radius:10px;padding:8px 10px;min-width:220px;">
+      <legend style="font-size:12px;color:#6b7280;">Metrics</legend>
+      <label style="display:block;font-size:12px;"><input type="checkbox" class="metricOpt" value="total_cost" checked/> Total Cost</label>
+      <label style="display:block;font-size:12px;"><input type="checkbox" class="metricOpt" value="active_models"/> Avg Active Models</label>
+      <label style="display:block;font-size:12px;"><input type="checkbox" class="metricOpt" value="avg_cost_per_model"/> Avg Cost / Active Model</label>
+    </fieldset>
+    <fieldset style="border:1px solid #e5e7eb;border-radius:10px;padding:8px 10px;min-width:220px;max-height:170px;overflow:auto;">
+      <legend style="font-size:12px;color:#6b7280;">Models (blank = all)</legend>
+      <div id="modelFilters"></div>
+    </fieldset>
+    <div>
+      <label style="font-size:12px;color:#6b7280;">Time Granularity</label><br/>
+      <select id="reportGranularity" style="margin-top:4px;padding:4px 6px;border-radius:8px;border:1px solid #d1d5db;">
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+      </select>
+      <div style="margin-top:8px;display:flex;gap:6px;">
+        <button id="generateReportBtn" type="button" style="font-size:12px;border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:8px;padding:5px 10px;cursor:pointer;">Generate report</button>
+        <button id="downloadReportCsvBtn" type="button" style="font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:8px;padding:5px 10px;cursor:pointer;">Download CSV</button>
+      </div>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>Period</th><th>Total Cost</th><th>Avg Active Models</th><th>Avg Cost / Active Model</th></tr></thead>
+    <tbody id="customReportBody"><tr><td colspan="4">Select filters then click Generate report</td></tr></tbody>
+  </table>
+
   <div id="kbdHelp" class="kbd-help">
     <div><strong>Keyboard shortcuts</strong></div>
     <div><code>←/→</code> or <code>j/k</code>: step day</div>
@@ -502,6 +597,7 @@ def build_dashboard_html(
     const spikeByDate = {json_spike_by_date};
     const dayBreakdownByDate = {json_day_breakdown_by_date};
     const dayTotalByDate = {json_day_total_by_date};
+    const allModels = {json_all_models};
 
     const colors = ["#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#ea580c", "#0891b2", "#4f46e5", "#65a30d", "#be123c"];
     const canvas = document.getElementById('costChart');
@@ -518,6 +614,11 @@ def build_dashboard_html(
     const copyLinkBtn = document.getElementById('copyLinkBtn');
     const copyLinkHint = document.getElementById('copyLinkHint');
     const kbdHelp = document.getElementById('kbdHelp');
+    const modelFilters = document.getElementById('modelFilters');
+    const reportGranularity = document.getElementById('reportGranularity');
+    const generateReportBtn = document.getElementById('generateReportBtn');
+    const downloadReportCsvBtn = document.getElementById('downloadReportCsvBtn');
+    const customReportBody = document.getElementById('customReportBody');
     let selectedSpikeDate = null;
     let selectedDate = null;
     let spikeOnlyMode = false;
@@ -578,6 +679,107 @@ def build_dashboard_html(
         const rowClass = i === 0 ? 'model-top' : '';
         return `<tr class="${{rowClass}}"><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
       }}).join('');
+    }}
+
+    function selectedMetricKeys() {{
+      const checked = Array.from(document.querySelectorAll('.metricOpt:checked')).map(x => x.value);
+      return checked.length ? checked : ['total_cost'];
+    }}
+
+    function selectedModels() {{
+      return Array.from(document.querySelectorAll('.modelOpt:checked')).map(x => x.value);
+    }}
+
+    function bucketFor(dateStr, granularity) {{
+      if (granularity === 'monthly') return dateStr.slice(0, 7);
+      if (granularity === 'weekly') {{
+        const dt = new Date(dateStr + 'T00:00:00Z');
+        const tmp = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate()));
+        const day = (tmp.getUTCDay() + 6) % 7;
+        tmp.setUTCDate(tmp.getUTCDate() - day + 3);
+        const firstThursday = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 4));
+        const week = 1 + Math.round(((tmp - firstThursday) / 86400000 - 3 + ((firstThursday.getUTCDay() + 6) % 7)) / 7);
+        return `${{tmp.getUTCFullYear()}}-W${{String(week).padStart(2, '0')}}`;
+      }}
+      return dateStr;
+    }}
+
+    function generateCustomReportRows(metrics, models, granularity) {{
+      const modelSet = new Set(models || []);
+      const hasModelFilter = modelSet.size > 0;
+      const rows = [];
+      labels.forEach((d) => {{
+        const breakdown = dayBreakdownByDate[d] || [];
+        const filtered = breakdown.filter(x => !hasModelFilter || modelSet.has(x.model));
+        const totalCost = filtered.reduce((s, x) => s + (x.costUSD || 0), 0);
+        rows.push({{ date: d, totalCost, activeModels: filtered.length }});
+      }});
+
+      const grouped = new Map();
+      rows.forEach((r) => {{
+        const period = bucketFor(r.date, granularity);
+        if (!grouped.has(period)) grouped.set(period, {{ period, totalCost: 0, activeModels: 0, days: 0 }});
+        const g = grouped.get(period);
+        g.totalCost += r.totalCost;
+        g.activeModels += r.activeModels;
+        g.days += 1;
+      }});
+
+      return Array.from(grouped.values()).sort((a, b) => a.period.localeCompare(b.period)).map((g) => {{
+        const avgActiveModels = g.days > 0 ? g.activeModels / g.days : 0;
+        return {{
+          period: g.period,
+          totalCost: g.totalCost,
+          avgActiveModels,
+          avgCostPerModel: avgActiveModels > 0 ? (g.totalCost / avgActiveModels) : 0,
+          metrics
+        }};
+      }});
+    }}
+
+    function renderCustomReport() {{
+      const metrics = selectedMetricKeys();
+      const models = selectedModels();
+      const granularity = reportGranularity?.value || 'daily';
+      const rows = generateCustomReportRows(metrics, models, granularity);
+      if (!rows.length) {{
+        customReportBody.innerHTML = '<tr><td colspan="4">No rows</td></tr>';
+        return [];
+      }}
+      customReportBody.innerHTML = rows.map(r => {{
+        const total = metrics.includes('total_cost') ? `$${{r.totalCost.toFixed(2)}}` : '-';
+        const active = metrics.includes('active_models') ? r.avgActiveModels.toFixed(2) : '-';
+        const avg = metrics.includes('avg_cost_per_model') ? `$${{r.avgCostPerModel.toFixed(2)}}` : '-';
+        return `<tr><td>${{r.period}}</td><td>${{total}}</td><td>${{active}}</td><td>${{avg}}</td></tr>`;
+      }}).join('');
+      return rows;
+    }}
+
+    function downloadCustomReportCsv(rows) {{
+      if (!rows || !rows.length) return;
+      const header = ['period','totalCostUSD','avgActiveModels','avgCostPerActiveModelUSD'];
+      const lines = [header.join(',')].concat(rows.map(r => [r.period, r.totalCost.toFixed(6), r.avgActiveModels.toFixed(6), r.avgCostPerModel.toFixed(6)].join(',')));
+      const blob = new Blob([lines.join('\\n')], {{ type: 'text/csv;charset=utf-8;' }});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'custom_usage_report.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }}
+
+    function initCustomReportBuilder() {{
+      if (modelFilters) {{
+        modelFilters.innerHTML = allModels.map((m) => `<label style="display:block;font-size:12px;"><input type="checkbox" class="modelOpt" value="${{m}}"/> ${{m}}</label>`).join('');
+      }}
+      let latestRows = renderCustomReport();
+      generateReportBtn?.addEventListener('click', () => {{
+        latestRows = renderCustomReport();
+      }});
+      downloadReportCsvBtn?.addEventListener('click', () => {{
+        latestRows = latestRows && latestRows.length ? latestRows : renderCustomReport();
+        downloadCustomReportCsv(latestRows);
+      }});
     }}
 
     function resize() {{
@@ -960,6 +1162,7 @@ def build_dashboard_html(
       }}
     }});
 
+    initCustomReportBuilder();
     window.addEventListener('resize', resize);
     resize();
   </script>
@@ -978,6 +1181,10 @@ def main() -> int:
     parser.add_argument("--spike-threshold-mult", type=positive_float, default=2.0, help="Spike threshold multiplier vs baseline")
     parser.add_argument("--output", default="token_usage_dashboard.html", help="Output HTML file path")
     parser.add_argument("--summary-json", help="Also write summary JSON to this path")
+    parser.add_argument("--custom-report-json", help="Write custom report JSON to this path")
+    parser.add_argument("--report-metrics", default="total_cost", help="Comma-separated: total_cost,active_models,avg_cost_per_model")
+    parser.add_argument("--report-models", help="Comma-separated model filter (blank means all models)")
+    parser.add_argument("--report-granularity", choices=["daily", "weekly", "monthly"], default="daily", help="Custom report time granularity")
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
@@ -1014,6 +1221,19 @@ def main() -> int:
             spike_threshold_mult=args.spike_threshold_mult,
         )
         Path(args.summary_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if args.custom_report_json:
+        metrics = [x.strip() for x in (args.report_metrics or '').split(',') if x.strip()]
+        models = [x.strip() for x in (args.report_models or '').split(',') if x.strip()] if args.report_models else []
+        report_rows = generate_custom_report(rows, metrics=metrics, models=models, granularity=args.report_granularity)
+        report_payload = {
+            "provider": args.provider,
+            "granularity": args.report_granularity,
+            "metrics": metrics,
+            "models": models,
+            "rows": report_rows,
+        }
+        Path(args.custom_report_json).write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     resolved = str(out.resolve())
     print(resolved)

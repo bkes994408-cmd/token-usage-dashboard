@@ -10,6 +10,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 - Detects daily spikes (configurable threshold)
 - Supports deep-link state (`#date=...&spikeOnly=1`)
 - Keyboard-driven navigation and spike focus
+- New: Custom Report Builder (choose metrics, model filters, daily/weekly/monthly granularity, export CSV)
 
 ## Quick start
 
@@ -42,6 +43,10 @@ python3 scripts/token_usage_dashboard.py \
   --spike-threshold-mult 2.0 \
   --output /tmp/token_usage_dashboard.html \
   --summary-json /tmp/token_usage_summary.json \
+  --custom-report-json /tmp/custom_report.json \
+  --report-metrics total_cost,active_models,avg_cost_per_model \
+  --report-models gpt-5,o3 \
+  --report-granularity weekly \
   --open
 ```
 

@@ -8,6 +8,7 @@ from token_usage_dashboard import (
     build_summary,
     detect_spikes,
     downsample_rows,
+    generate_custom_report,
     model_totals,
     prepare_chart_series,
 )
@@ -174,6 +175,31 @@ class TestTokenDashboard(TestCase):
         ]
         html = build_dashboard_html("codex", rows, top_models=3, chart_max_points=8)
         self.assertIn("Chart points: 8/20", html)
+
+    def test_custom_report_generation_metrics_models_granularity(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}, {"modelName": "o3", "cost": 1.0}]},
+            {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.0}]},
+            {"date": "2026-03-08", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]},
+        ]
+        report = generate_custom_report(rows, metrics=["total_cost", "active_models", "avg_cost_per_model"], models=["gpt-5"], granularity="monthly")
+        self.assertEqual(len(report), 1)
+        self.assertEqual(report[0]["period"], "2026-03")
+        self.assertAlmostEqual(report[0]["totalCostUSD"], 10.0)
+
+    def test_dashboard_html_contains_custom_report_builder(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]},
+            {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 2.0}]},
+        ]
+        html = build_dashboard_html("codex", rows, top_models=2)
+        self.assertIn("Custom Report Builder", html)
+        self.assertIn("id=\"reportGranularity\"", html)
+        self.assertIn("id=\"generateReportBtn\"", html)
+        self.assertIn("id=\"downloadReportCsvBtn\"", html)
+        self.assertIn("id=\"customReportBody\"", html)
+        self.assertIn("generateCustomReportRows", html)
+        self.assertIn("initCustomReportBuilder", html)
 
 
 if __name__ == "__main__":

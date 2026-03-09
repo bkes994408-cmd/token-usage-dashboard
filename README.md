@@ -29,7 +29,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 ```bash
 ./run_dashboard.sh --provider codex --days 30
 ./run_dashboard.sh --provider claude --days 14 --no-open
-./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --max-table-rows 150
+./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --max-table-rows 150 --chart-max-points 1000
 ```
 
 ### Direct Python command

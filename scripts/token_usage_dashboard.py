@@ -112,6 +112,25 @@ def filter_days(rows: List[Dict[str, Any]], days: Optional[int]) -> List[Dict[st
     return out
 
 
+def downsample_rows(rows: List[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
+    """Keep chart points bounded for large datasets while preserving trend shape."""
+    if max_points < 2 or len(rows) <= max_points:
+        return rows
+
+    step = (len(rows) - 1) / (max_points - 1)
+    out: List[Dict[str, Any]] = []
+    last_idx = -1
+    for i in range(max_points):
+        idx = int(round(i * step))
+        idx = min(len(rows) - 1, max(0, idx))
+        if idx != last_idx:
+            out.append(rows[idx])
+            last_idx = idx
+    if out[-1] is not rows[-1]:
+        out[-1] = rows[-1]
+    return out
+
+
 def model_totals(rows: Iterable[Dict[str, Any]]) -> Dict[str, float]:
     totals: Dict[str, float] = defaultdict(float)
     for row in rows:
@@ -296,10 +315,12 @@ def build_dashboard_html(
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
     max_table_rows: int = 120,
+    chart_max_points: int = 1200,
 ) -> str:
     totals = model_totals(rows)
     grand_total = sum(day_total_cost(r) for r in rows)
-    labels, series, day_totals = prepare_chart_series(rows, top_models=top_models)
+    chart_rows = downsample_rows(rows, chart_max_points)
+    labels, series, day_totals = prepare_chart_series(chart_rows, top_models=top_models)
     latest_day = rows[-1]["date"] if rows else "—"
     last_7d = sum(day_totals[-7:]) if day_totals else 0.0
     prev_7d = sum(day_totals[-14:-7]) if len(day_totals) > 7 else 0.0
@@ -431,7 +452,7 @@ def build_dashboard_html(
   </div>
 
   <h3>Model Breakdown</h3>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Showing up to top {max_table_rows} models for faster rendering.</div>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Showing up to top {max_table_rows} models for faster rendering. Chart points: {len(chart_rows)}/{len(rows)}.</div>
   <table>
     <thead><tr><th>#</th><th>Model</th><th>Total Cost</th><th>Share</th></tr></thead>
     <tbody>{table_rows}</tbody>
@@ -503,29 +524,51 @@ def build_dashboard_html(
     let sortByDodMode = false;
     let showOnlyChangesMode = false;
 
-    function renderSelectedDay(date) {{
+    const labelIndexByDate = Object.fromEntries(labels.map((d, i) => [d, i]));
+    const dayViewCache = new Map();
+
+    function getDayView(date) {{
+      if (dayViewCache.has(date)) return dayViewCache.get(date);
       const baseRows = dayBreakdownByDate[date] || [];
-      const idx = labels.indexOf(date);
+      const idx = labelIndexByDate[date] ?? -1;
       const prevDate = idx > 0 ? labels[idx - 1] : null;
       const prevRows = prevDate ? (dayBreakdownByDate[prevDate] || []) : [];
       const prevMap = Object.fromEntries(prevRows.map(r => [r.model, r.costUSD || 0]));
-      let rows = baseRows.map(r => ({{
+      const currTotal = dayTotalByDate[date] || 0;
+      const prevTotal = prevDate ? (dayTotalByDate[prevDate] || 0) : 0;
+      const rows = baseRows.map(r => ({{
         ...r,
         dod: (r.costUSD || 0) - (prevMap[r.model] || 0),
+        prevCost: prevMap[r.model] || 0,
       }}));
-      const totalDelta = currTotal - prevTotal;
+      const view = {{ rows, currTotal, prevTotal }};
+      dayViewCache.set(date, view);
+      return view;
+    }}
+
+    function renderSelectedDay(date) {{
+      const view = getDayView(date);
+      const total = view.currTotal || 0;
+      const prevTotal = view.prevTotal || 0;
+      let rows = view.rows.slice();
+
+      if (showOnlyChangesMode) rows = rows.filter(r => Math.abs(r.dod || 0) > 1e-9);
+      if (sortByDodMode) rows.sort((a, b) => (b.dod || 0) - (a.dod || 0));
+
+      const totalDelta = total - prevTotal;
       const totalDeltaPct = prevTotal > 0 ? ((totalDelta / prevTotal) * 100) : null;
       const totalDeltaText = `${{totalDelta >= 0 ? '+' : ''}}$${{totalDelta.toFixed(2)}}`;
       const totalDeltaPctText = totalDeltaPct === null ? 'N/A' : `${{totalDeltaPct >= 0 ? '+' : ''}}${{totalDeltaPct.toFixed(1)}}%`;
       selectedDayTitle.textContent = `Selected Day Model Breakdown · ${{date}} · DoD ${{totalDeltaText}} (${{totalDeltaPctText}})`;
-      if (selectedDayMeta) selectedDayMeta.textContent = `Day total: $${{currTotal.toFixed(2)}} · Previous day total: $${{prevTotal.toFixed(2)}}`;
+      if (selectedDayMeta) selectedDayMeta.textContent = `Day total: $${{total.toFixed(2)}} · Previous day total: $${{prevTotal.toFixed(2)}}`;
+
       if (!rows.length) {{
         selectedDayBody.innerHTML = '<tr><td colspan="6">No model breakdown rows for current filter</td></tr>';
         return;
       }}
       selectedDayBody.innerHTML = rows.map((r, i) => {{
         const share = total > 0 ? (((r.costUSD || 0) / total) * 100).toFixed(1) : '0.0';
-        const prev = prevMap[r.model] || 0;
+        const prev = r.prevCost || 0;
         const dod = r.dod || 0;
         const dodPct = prev > 0 ? (dod / prev) * 100 : null;
         const dodText = `${{dod >= 0 ? '+' : ''}}$${{dod.toFixed(2)}}`;
@@ -936,6 +979,7 @@ def main() -> int:
     parser.add_argument("--output", default="token_usage_dashboard.html", help="Output HTML file path")
     parser.add_argument("--summary-json", help="Also write summary JSON to this path")
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
+    parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
 
@@ -957,6 +1001,7 @@ def main() -> int:
         spike_lookback_days=args.spike_lookback_days,
         spike_threshold_mult=args.spike_threshold_mult,
         max_table_rows=args.max_table_rows,
+        chart_max_points=args.chart_max_points,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")

@@ -7,6 +7,7 @@ from token_usage_dashboard import (
     build_model_table_rows,
     build_summary,
     detect_spikes,
+    downsample_rows,
     model_totals,
     prepare_chart_series,
 )
@@ -158,6 +159,21 @@ class TestTokenDashboard(TestCase):
         html = build_dashboard_html("codex", rows, top_models=3, max_table_rows=2)
         self.assertIn("Showing up to top 2 models", html)
         self.assertIn("Remaining 1 models", html)
+
+    def test_downsample_rows_keeps_bounds(self):
+        rows = [{"date": f"2026-01-{d:02d}", "modelBreakdowns": []} for d in range(1, 32)]
+        sampled = downsample_rows(rows, max_points=10)
+        self.assertEqual(len(sampled), 10)
+        self.assertEqual(sampled[0]["date"], rows[0]["date"])
+        self.assertEqual(sampled[-1]["date"], rows[-1]["date"])
+
+    def test_dashboard_html_shows_downsample_hint(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "m1", "cost": float(d)}]}
+            for d in range(1, 21)
+        ]
+        html = build_dashboard_html("codex", rows, top_models=3, chart_max_points=8)
+        self.assertIn("Chart points: 8/20", html)
 
 
 if __name__ == "__main__":

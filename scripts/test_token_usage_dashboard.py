@@ -2,7 +2,14 @@
 
 from unittest import TestCase, main
 
-from token_usage_dashboard import build_dashboard_html, build_summary, detect_spikes, model_totals, prepare_chart_series
+from token_usage_dashboard import (
+    build_dashboard_html,
+    build_model_table_rows,
+    build_summary,
+    detect_spikes,
+    model_totals,
+    prepare_chart_series,
+)
 
 
 class TestTokenDashboard(TestCase):
@@ -129,6 +136,28 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(series["a"], [3.0, 2.0])
         self.assertEqual(series["Other"], [1.0, 4.0])
         self.assertEqual(totals, [4.0, 6.0])
+
+    def test_build_model_table_rows_collapses_tail(self):
+        ranked = [("a", 50.0), ("b", 30.0), ("c", 20.0)]
+        html = build_model_table_rows(ranked, grand_total=100.0, max_rows=2)
+        self.assertIn("<td>1</td><td>a</td>", html)
+        self.assertIn("<td>2</td><td>b</td>", html)
+        self.assertIn("Remaining 1 models", html)
+
+    def test_dashboard_html_respects_max_table_rows(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "modelBreakdowns": [
+                    {"modelName": "m1", "cost": 3},
+                    {"modelName": "m2", "cost": 2},
+                    {"modelName": "m3", "cost": 1},
+                ],
+            }
+        ]
+        html = build_dashboard_html("codex", rows, top_models=3, max_table_rows=2)
+        self.assertIn("Showing up to top 2 models", html)
+        self.assertIn("Remaining 1 models", html)
 
 
 if __name__ == "__main__":

@@ -198,6 +198,25 @@ def prepare_chart_series(rows: List[Dict[str, Any]], top_models: int) -> Tuple[L
 def usd(v: float) -> str:
     return f"${v:,.2f}"
 
+def build_model_table_rows(models_ranked: List[Tuple[str, float]], grand_total: float, max_rows: int) -> str:
+    if max_rows < 1:
+        max_rows = 1
+    visible = models_ranked[:max_rows]
+    hidden = models_ranked[max_rows:]
+
+    rows = [
+        f"<tr><td>{idx}</td><td>{m}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
+        for idx, (m, c) in enumerate(visible, start=1)
+    ]
+
+    if hidden:
+        hidden_total = sum(c for _, c in hidden)
+        rows.append(
+            f"<tr><td>…</td><td>Remaining {len(hidden)} models</td><td>{usd(hidden_total)}</td><td>{(hidden_total / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
+        )
+
+    return "\n".join(rows)
+
 
 def _window_model_totals(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, float], Dict[str, float]]:
     last_rows = rows[-7:] if rows else []
@@ -276,6 +295,7 @@ def build_dashboard_html(
     top_models: int,
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
+    max_table_rows: int = 120,
 ) -> str:
     totals = model_totals(rows)
     grand_total = sum(day_total_cost(r) for r in rows)
@@ -289,10 +309,7 @@ def build_dashboard_html(
         trend = "N/A"
 
     models_ranked = sorted(totals.items(), key=lambda x: x[1], reverse=True)
-    table_rows = "\n".join(
-        f"<tr><td>{idx}</td><td>{m}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
-        for idx, (m, c) in enumerate(models_ranked, start=1)
-    )
+    table_rows = build_model_table_rows(models_ranked, grand_total, max_rows=max_table_rows)
 
     summary = build_summary(
         provider,
@@ -414,6 +431,7 @@ def build_dashboard_html(
   </div>
 
   <h3>Model Breakdown</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Showing up to top {max_table_rows} models for faster rendering.</div>
   <table>
     <thead><tr><th>#</th><th>Model</th><th>Total Cost</th><th>Share</th></tr></thead>
     <tbody>{table_rows}</tbody>
@@ -495,10 +513,6 @@ def build_dashboard_html(
         ...r,
         dod: (r.costUSD || 0) - (prevMap[r.model] || 0),
       }}));
-      if (showOnlyChangesMode) rows = rows.filter(r => Math.abs(r.dod || 0) > 1e-9);
-      if (sortByDodMode) rows.sort((a, b) => (b.dod || 0) - (a.dod || 0));
-      const currTotal = dayTotalByDate[date] || baseRows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
-      const prevTotal = prevDate ? (dayTotalByDate[prevDate] || 0) : 0;
       const totalDelta = currTotal - prevTotal;
       const totalDeltaPct = prevTotal > 0 ? ((totalDelta / prevTotal) * 100) : null;
       const totalDeltaText = `${{totalDelta >= 0 ? '+' : ''}}$${{totalDelta.toFixed(2)}}`;
@@ -509,7 +523,6 @@ def build_dashboard_html(
         selectedDayBody.innerHTML = '<tr><td colspan="6">No model breakdown rows for current filter</td></tr>';
         return;
       }}
-      const total = rows.reduce((acc, r) => acc + (r.costUSD || 0), 0);
       selectedDayBody.innerHTML = rows.map((r, i) => {{
         const share = total > 0 ? (((r.costUSD || 0) / total) * 100).toFixed(1) : '0.0';
         const prev = prevMap[r.model] || 0;
@@ -922,6 +935,7 @@ def main() -> int:
     parser.add_argument("--spike-threshold-mult", type=positive_float, default=2.0, help="Spike threshold multiplier vs baseline")
     parser.add_argument("--output", default="token_usage_dashboard.html", help="Output HTML file path")
     parser.add_argument("--summary-json", help="Also write summary JSON to this path")
+    parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
 
@@ -942,6 +956,7 @@ def main() -> int:
         top_models=args.top_models,
         spike_lookback_days=args.spike_lookback_days,
         spike_threshold_mult=args.spike_threshold_mult,
+        max_table_rows=args.max_table_rows,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")

@@ -5,6 +5,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 ## What it does
 
 - Builds a self-contained HTML dashboard from CodexBar JSON
+- Optimized for larger datasets (throttled tooltip rendering, cached range/day summaries, capped initial model table rows)
 - Shows model cost breakdown and top 7-day movers
 - Detects daily spikes (configurable threshold)
 - Supports deep-link state (`#date=...&spikeOnly=1`)
@@ -28,7 +29,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 ```bash
 ./run_dashboard.sh --provider codex --days 30
 ./run_dashboard.sh --provider claude --days 14 --no-open
-./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8
+./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --max-table-rows 150
 ```
 
 ### Direct Python command

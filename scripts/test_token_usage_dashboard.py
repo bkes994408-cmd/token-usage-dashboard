@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from pathlib import Path
 from unittest import TestCase, main
 
 from token_usage_dashboard import (
@@ -13,6 +14,8 @@ from token_usage_dashboard import (
     model_totals,
     prepare_chart_series,
     resolve_access_policy,
+    resolve_multi_tenant_context,
+    manage_tenant_config,
 )
 
 
@@ -225,6 +228,60 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(len(filtered[0]["modelBreakdowns"]), 1)
         self.assertEqual(filtered[0]["modelBreakdowns"][0]["modelName"], "o3")
         self.assertAlmostEqual(filtered[0]["totalCost"], 1.0)
+
+
+    def test_resolve_multi_tenant_context_isolates_org_data(self):
+        payload = {
+            "organizations": {
+                "org-a": {"daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]},
+                "org-b": {"daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "o3", "cost": 9.0}]}]},
+            }
+        }
+        import json, tempfile, os
+        cfg = {
+            "organizations": {
+                "org-a": {
+                    "defaultRole": "viewer",
+                    "users": {"alice": {"role": "admin", "group": "eng"}},
+                    "groups": {"eng": {"dashboardViews": ["eng-core"]}},
+                    "dashboardViews": {"eng-core": {"allowedModels": ["gpt-5"]}},
+                },
+                "org-b": {"users": {}, "groups": {}, "dashboardViews": {}},
+            }
+        }
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as f:
+            f.write(json.dumps(cfg))
+            path = f.name
+        try:
+            rows, role, policy, meta = resolve_multi_tenant_context(payload, path, 'org-a', None, 'alice', 'eng-core')
+            self.assertEqual(role, 'admin')
+            self.assertEqual(meta['organizationId'], 'org-a')
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['modelBreakdowns'][0]['modelName'], 'gpt-5')
+            self.assertEqual(policy.get('allowedModels'), ['gpt-5'])
+        finally:
+            os.unlink(path)
+
+    def test_manage_tenant_config_user_and_view(self):
+        import json, tempfile, os
+        cfg = {
+            "organizations": {
+                "org-a": {"users": {}, "groups": {"analytics": {"dashboardViews": []}}, "dashboardViews": {}}
+            }
+        }
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as f:
+            f.write(json.dumps(cfg))
+            path = f.name
+        try:
+            manage_tenant_config(path, 'org-a', 'create', 'bob', 'analyst', 'analytics', None, None, None, None, None)
+            manage_tenant_config(path, 'org-a', None, None, None, None, 'create', 'ops-view', 'gpt-5,o3', 30, None)
+            result = manage_tenant_config(path, 'org-a', None, None, None, None, 'assign', 'ops-view', None, None, 'analytics')
+            self.assertIn('bob', result['users'])
+            self.assertIn('ops-view', result['views'])
+            data = json.loads(Path(path).read_text())
+            self.assertIn('ops-view', data['organizations']['org-a']['groups']['analytics']['dashboardViews'])
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

@@ -252,6 +252,208 @@ def apply_access_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> L
     return transformed
 
 
+
+
+
+def _load_tenant_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Tenant config must be a JSON object.")
+    return parsed
+
+
+def _get_org_node(cfg: Dict[str, Any], org_id: Optional[str]) -> Tuple[Optional[str], Dict[str, Any]]:
+    orgs = cfg.get("organizations") if isinstance(cfg.get("organizations"), dict) else {}
+    if not orgs:
+        return None, {}
+
+    target = org_id or str(cfg.get("defaultOrganization") or "")
+    if not target:
+        target = next(iter(orgs.keys()))
+    node = orgs.get(target)
+    if not isinstance(node, dict):
+        raise RuntimeError(f"Organization '{target}' not found in tenant config.")
+    return target, node
+
+
+def _resolve_role_policies(org_node: Dict[str, Any], global_roles: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    merged = {k: dict(v) for k, v in DEFAULT_ROLE_POLICIES.items()}
+    if isinstance(global_roles, dict):
+        for role_name, role_policy in global_roles.items():
+            if isinstance(role_policy, dict):
+                merged.setdefault(str(role_name), {})
+                merged[str(role_name)].update(role_policy)
+
+    org_roles = org_node.get("roles") if isinstance(org_node.get("roles"), dict) else {}
+    for role_name, role_policy in org_roles.items():
+        if isinstance(role_policy, dict):
+            merged.setdefault(str(role_name), {})
+            merged[str(role_name)].update(role_policy)
+    return merged
+
+
+def resolve_multi_tenant_context(
+    payload: Dict[str, Any],
+    tenant_config_path: Optional[str],
+    org_id: Optional[str],
+    role: Optional[str],
+    user: Optional[str],
+    requested_dashboard: Optional[str],
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any], Dict[str, Any]]:
+    cfg = _load_tenant_config(tenant_config_path)
+    resolved_org_id, org_node = _get_org_node(cfg, org_id)
+
+    if resolved_org_id:
+        org_payloads = payload.get("organizations") if isinstance(payload.get("organizations"), dict) else {}
+        org_payload = org_payloads.get(resolved_org_id)
+        if not isinstance(org_payload, dict):
+            raise RuntimeError(f"Organization '{resolved_org_id}' has no usage payload data.")
+        rows = parse_daily(org_payload)
+    else:
+        rows = parse_daily(payload)
+
+    users = org_node.get("users") if isinstance(org_node.get("users"), dict) else {}
+    groups = org_node.get("groups") if isinstance(org_node.get("groups"), dict) else {}
+    global_roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+    role_policies = _resolve_role_policies(org_node, global_roles)
+
+    selected_role = role or ""
+    user_record = users.get(user) if user and isinstance(users.get(user), dict) else {}
+    if not selected_role and isinstance(user_record.get("role"), str):
+        selected_role = str(user_record.get("role"))
+    if not selected_role:
+        selected_role = str(org_node.get("defaultRole") or cfg.get("defaultRole") or "admin")
+
+    base_policy = role_policies.get(selected_role, role_policies.get("viewer", DEFAULT_ROLE_POLICIES["viewer"]))
+    policy = dict(base_policy)
+
+    dashboard_views = org_node.get("dashboardViews") if isinstance(org_node.get("dashboardViews"), dict) else {}
+    group_name = str(user_record.get("group") or "") if isinstance(user_record, dict) else ""
+    allowed_view_ids: List[str] = []
+    if group_name and isinstance(groups.get(group_name), dict):
+        view_ids = groups[group_name].get("dashboardViews")
+        if isinstance(view_ids, list):
+            allowed_view_ids = [str(v) for v in view_ids]
+
+    selected_dashboard = requested_dashboard
+    if not selected_dashboard:
+        if isinstance(user_record.get("defaultDashboard"), str):
+            selected_dashboard = str(user_record.get("defaultDashboard"))
+        elif allowed_view_ids:
+            selected_dashboard = allowed_view_ids[0]
+
+    selected_view = {}
+    if selected_dashboard:
+        raw_view = dashboard_views.get(selected_dashboard)
+        if not isinstance(raw_view, dict):
+            raise RuntimeError(f"Dashboard view '{selected_dashboard}' not found in organization '{resolved_org_id}'.")
+        if allowed_view_ids and selected_dashboard not in allowed_view_ids:
+            raise RuntimeError(f"User '{user}' cannot access dashboard view '{selected_dashboard}'.")
+        selected_view = raw_view
+        if isinstance(raw_view.get("allowedModels"), list):
+            policy["allowedModels"] = [str(x) for x in raw_view.get("allowedModels", [])]
+        if isinstance(raw_view.get("maxDays"), int):
+            policy["maxDays"] = int(raw_view["maxDays"])
+
+    tenant_meta = {
+        "organizationId": resolved_org_id,
+        "user": user,
+        "group": group_name or None,
+        "dashboardView": selected_dashboard,
+        "dashboardViewConfig": selected_view,
+    }
+    return rows, selected_role, policy, tenant_meta
+
+
+def manage_tenant_config(
+    tenant_config_path: str,
+    org_id: str,
+    user_action: Optional[str],
+    target_user: Optional[str],
+    target_role: Optional[str],
+    target_group: Optional[str],
+    view_action: Optional[str],
+    view_id: Optional[str],
+    view_models: Optional[str],
+    view_max_days: Optional[int],
+    view_group: Optional[str],
+) -> Dict[str, Any]:
+    cfg = _load_tenant_config(tenant_config_path)
+    _, org_node = _get_org_node(cfg, org_id)
+
+    org_node.setdefault("users", {})
+    org_node.setdefault("groups", {})
+    org_node.setdefault("dashboardViews", {})
+
+    users = org_node["users"]
+    groups = org_node["groups"]
+    views = org_node["dashboardViews"]
+
+    actions: List[str] = []
+
+    if user_action:
+        if user_action == "list":
+            actions.append(f"users={list(users.keys())}")
+        elif user_action in {"create", "update"}:
+            if not target_user:
+                raise RuntimeError("--target-user is required for user create/update.")
+            role_name = target_role or str(org_node.get("defaultRole") or cfg.get("defaultRole") or "viewer")
+            users[target_user] = {
+                "role": role_name,
+                "group": target_group,
+            }
+            actions.append(f"{user_action}_user={target_user}")
+        elif user_action == "delete":
+            if not target_user:
+                raise RuntimeError("--target-user is required for user delete.")
+            users.pop(target_user, None)
+            actions.append(f"delete_user={target_user}")
+
+    if view_action:
+        if view_action == "list":
+            actions.append(f"views={list(views.keys())}")
+        elif view_action in {"create", "update"}:
+            if not view_id:
+                raise RuntimeError("--view-id is required for view create/update.")
+            view_node = views.get(view_id) if isinstance(views.get(view_id), dict) else {}
+            if view_models is not None:
+                view_node["allowedModels"] = [x.strip() for x in view_models.split(',') if x.strip()]
+            if isinstance(view_max_days, int) and view_max_days > 0:
+                view_node["maxDays"] = view_max_days
+            views[view_id] = view_node
+            actions.append(f"{view_action}_view={view_id}")
+        elif view_action == "delete":
+            if not view_id:
+                raise RuntimeError("--view-id is required for view delete.")
+            views.pop(view_id, None)
+            for g in groups.values():
+                if isinstance(g, dict) and isinstance(g.get("dashboardViews"), list):
+                    g["dashboardViews"] = [v for v in g["dashboardViews"] if v != view_id]
+            actions.append(f"delete_view={view_id}")
+        elif view_action in {"assign", "unassign"}:
+            if not view_id or not view_group:
+                raise RuntimeError("--view-id and --view-group are required for assign/unassign.")
+            g = groups.get(view_group) if isinstance(groups.get(view_group), dict) else {"dashboardViews": []}
+            ids = g.get("dashboardViews") if isinstance(g.get("dashboardViews"), list) else []
+            if view_action == "assign" and view_id not in ids:
+                ids.append(view_id)
+            if view_action == "unassign":
+                ids = [v for v in ids if v != view_id]
+            g["dashboardViews"] = ids
+            groups[view_group] = g
+            actions.append(f"{view_action}_view={view_id}_group={view_group}")
+
+    Path(tenant_config_path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "organizationId": org_id,
+        "actions": actions,
+        "users": sorted(users.keys()),
+        "views": sorted(views.keys()),
+        "groups": sorted(groups.keys()),
+    }
 def detect_spikes(rows: List[Dict[str, Any]], lookback_days: int = 7, threshold_mult: float = 2.0) -> List[Dict[str, Any]]:
     spikes: List[Dict[str, Any]] = []
     daily = [day_total_cost(r) for r in rows]
@@ -1314,9 +1516,21 @@ def main() -> int:
     parser.add_argument("--report-granularity", choices=["daily", "weekly", "monthly"], default="daily", help="Custom report time granularity")
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
-    parser.add_argument("--role", choices=["admin", "analyst", "viewer"], help="RBAC role used for data access")
-    parser.add_argument("--user", help="Username for role mapping (used with --rbac-config)")
+    parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
+    parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
+    parser.add_argument("--tenant-config", help="Path to multi-tenant organization config JSON")
+    parser.add_argument("--org-id", help="Organization ID for strict tenant isolation")
+    parser.add_argument("--dashboard-view", help="Dashboard view ID scoped to selected organization")
+    parser.add_argument("--manage-users", choices=["list", "create", "update", "delete"], help="Manage users in tenant config then exit")
+    parser.add_argument("--target-user", help="Target username for --manage-users")
+    parser.add_argument("--target-role", help="Target role for --manage-users create/update")
+    parser.add_argument("--target-group", help="Target group for --manage-users create/update")
+    parser.add_argument("--manage-views", choices=["list", "create", "update", "delete", "assign", "unassign"], help="Manage dashboard views in tenant config then exit")
+    parser.add_argument("--view-id", help="Dashboard view ID for --manage-views")
+    parser.add_argument("--view-models", help="Comma-separated allowed model names for view create/update")
+    parser.add_argument("--view-max-days", type=positive_int, help="Max days filter for view create/update")
+    parser.add_argument("--view-group", help="Group name for view assign/unassign")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
 
@@ -1326,16 +1540,56 @@ def main() -> int:
         eprint(str(exc))
         return 1
 
-    rows = filter_days(parse_daily(payload), args.days)
+    if args.manage_users or args.manage_views:
+        if not args.tenant_config or not args.org_id:
+            eprint("--tenant-config and --org-id are required for tenant management operations.")
+            return 5
+        try:
+            result = manage_tenant_config(
+                tenant_config_path=args.tenant_config,
+                org_id=args.org_id,
+                user_action=args.manage_users,
+                target_user=args.target_user,
+                target_role=args.target_role,
+                target_group=args.target_group,
+                view_action=args.manage_views,
+                view_id=args.view_id,
+                view_models=args.view_models,
+                view_max_days=args.view_max_days,
+                view_group=args.view_group,
+            )
+        except Exception as exc:
+            eprint(f"Failed to manage tenant config: {exc}")
+            return 6
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    tenant_meta: Dict[str, Any] = {}
+    if args.tenant_config:
+        try:
+            tenant_rows, role_name, policy, tenant_meta = resolve_multi_tenant_context(
+                payload=payload,
+                tenant_config_path=args.tenant_config,
+                org_id=args.org_id,
+                role=args.role,
+                user=args.user,
+                requested_dashboard=args.dashboard_view,
+            )
+        except Exception as exc:
+            eprint(f"Failed to resolve tenant context: {exc}")
+            return 3
+        rows = filter_days(tenant_rows, args.days)
+    else:
+        rows = filter_days(parse_daily(payload), args.days)
+        try:
+            role_name, policy = resolve_access_policy(args.role, args.user, args.rbac_config)
+        except Exception as exc:
+            eprint(f"Failed to resolve RBAC policy: {exc}")
+            return 3
+
     if not rows:
         eprint("No daily rows found in payload.")
         return 2
-
-    try:
-        role_name, policy = resolve_access_policy(args.role, args.user, args.rbac_config)
-    except Exception as exc:
-        eprint(f"Failed to resolve RBAC policy: {exc}")
-        return 3
 
     rows = apply_access_policy(rows, policy)
 
@@ -1362,6 +1616,8 @@ def main() -> int:
         )
         summary["role"] = role_name
         summary["policy"] = policy
+        if tenant_meta:
+            summary["tenant"] = tenant_meta
         Path(args.summary_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.custom_report_json:
@@ -1378,6 +1634,7 @@ def main() -> int:
             "metrics": metrics,
             "models": models,
             "rows": report_rows,
+            "tenant": tenant_meta or None,
         }
         Path(args.custom_report_json).write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

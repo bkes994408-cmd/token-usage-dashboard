@@ -2,7 +2,18 @@
 
 from unittest import TestCase, main
 
-from token_usage_dashboard import build_dashboard_html, build_summary, detect_spikes, model_totals, prepare_chart_series
+from token_usage_dashboard import (
+    apply_access_policy,
+    build_dashboard_html,
+    build_model_table_rows,
+    build_summary,
+    detect_spikes,
+    downsample_rows,
+    generate_custom_report,
+    model_totals,
+    prepare_chart_series,
+    resolve_access_policy,
+)
 
 
 class TestTokenDashboard(TestCase):
@@ -129,6 +140,91 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(series["a"], [3.0, 2.0])
         self.assertEqual(series["Other"], [1.0, 4.0])
         self.assertEqual(totals, [4.0, 6.0])
+
+    def test_build_model_table_rows_collapses_tail(self):
+        ranked = [("a", 50.0), ("b", 30.0), ("c", 20.0)]
+        html = build_model_table_rows(ranked, grand_total=100.0, max_rows=2)
+        self.assertIn("<td>1</td><td>a</td>", html)
+        self.assertIn("<td>2</td><td>b</td>", html)
+        self.assertIn("Remaining 1 models", html)
+
+    def test_dashboard_html_respects_max_table_rows(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "modelBreakdowns": [
+                    {"modelName": "m1", "cost": 3},
+                    {"modelName": "m2", "cost": 2},
+                    {"modelName": "m3", "cost": 1},
+                ],
+            }
+        ]
+        html = build_dashboard_html("codex", rows, top_models=3, max_table_rows=2)
+        self.assertIn("Showing up to top 2 models", html)
+        self.assertIn("Remaining 1 models", html)
+
+    def test_downsample_rows_keeps_bounds(self):
+        rows = [{"date": f"2026-01-{d:02d}", "modelBreakdowns": []} for d in range(1, 32)]
+        sampled = downsample_rows(rows, max_points=10)
+        self.assertEqual(len(sampled), 10)
+        self.assertEqual(sampled[0]["date"], rows[0]["date"])
+        self.assertEqual(sampled[-1]["date"], rows[-1]["date"])
+
+    def test_dashboard_html_shows_downsample_hint(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "m1", "cost": float(d)}]}
+            for d in range(1, 21)
+        ]
+        html = build_dashboard_html("codex", rows, top_models=3, chart_max_points=8)
+        self.assertIn("Chart points: 8/20", html)
+
+    def test_custom_report_generation_metrics_models_granularity(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}, {"modelName": "o3", "cost": 1.0}]},
+            {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.0}]},
+            {"date": "2026-03-08", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]},
+        ]
+        report = generate_custom_report(rows, metrics=["total_cost", "active_models", "avg_cost_per_model"], models=["gpt-5"], granularity="monthly")
+        self.assertEqual(len(report), 1)
+        self.assertEqual(report[0]["period"], "2026-03")
+        self.assertAlmostEqual(report[0]["totalCostUSD"], 10.0)
+
+    def test_dashboard_html_contains_custom_report_builder(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]},
+            {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 2.0}]},
+        ]
+        html = build_dashboard_html("codex", rows, top_models=2)
+        self.assertIn("Custom Report Builder", html)
+        self.assertIn("id=\"reportGranularity\"", html)
+        self.assertIn("id=\"generateReportBtn\"", html)
+        self.assertIn("id=\"downloadReportCsvBtn\"", html)
+        self.assertIn("id=\"customReportBody\"", html)
+        self.assertIn("generateCustomReportRows", html)
+        self.assertIn("initCustomReportBuilder", html)
+
+    def test_apply_access_policy_viewer_hides_breakdown(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}, {"modelName": "o3", "cost": 1.0}]},
+        ]
+        _, policy = resolve_access_policy("viewer", None, None)
+        filtered = apply_access_policy(rows, policy)
+        self.assertEqual(filtered[0]["modelBreakdowns"], [])
+        self.assertAlmostEqual(filtered[0]["totalCost"], 4.0)
+
+    def test_apply_access_policy_allowed_models(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}, {"modelName": "o3", "cost": 1.0}]},
+        ]
+        policy = {
+            "canViewModelBreakdown": True,
+            "canViewModelNames": True,
+            "allowedModels": ["o3"],
+        }
+        filtered = apply_access_policy(rows, policy)
+        self.assertEqual(len(filtered[0]["modelBreakdowns"]), 1)
+        self.assertEqual(filtered[0]["modelBreakdowns"][0]["modelName"], "o3")
+        self.assertAlmostEqual(filtered[0]["totalCost"], 1.0)
 
 
 if __name__ == "__main__":

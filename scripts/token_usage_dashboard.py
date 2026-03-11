@@ -6,6 +6,7 @@ Generate a local HTML dashboard for CodexBar model usage/cost data.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import subprocess
@@ -50,6 +51,20 @@ DEFAULT_ROLE_POLICIES: Dict[str, Dict[str, Any]] = {
 
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def esc(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def json_for_script(value: Any) -> str:
+    # Prevent inline-script breakouts (`</script>`) and JS line-separator hazards.
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def run_codexbar_cost(provider: str) -> Dict[str, Any]:
@@ -193,9 +208,35 @@ def day_total_cost(row: Dict[str, Any]) -> float:
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except (TypeError, ValueError):
+            return default
     return default
+
+
+def _safe_int(value: Any, default: int = 0, minimum: Optional[int] = None) -> int:
+    if isinstance(value, bool):
+        out = default
+    elif isinstance(value, int):
+        out = value
+    elif isinstance(value, float):
+        out = int(value)
+    elif isinstance(value, str):
+        try:
+            out = int(float(value.strip()))
+        except (TypeError, ValueError):
+            out = default
+    else:
+        out = default
+    if minimum is not None:
+        return max(minimum, out)
+    return out
 
 
 def _normalize_call_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -369,6 +410,16 @@ def _load_rbac_config(path: Optional[str]) -> Dict[str, Any]:
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("RBAC config must be a JSON object.")
+    return parsed
+
+
+def _load_alert_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Alert config must be a JSON object.")
     return parsed
 
 
@@ -666,6 +717,97 @@ def detect_spikes(rows: List[Dict[str, Any]], lookback_days: int = 7, threshold_
     return spikes
 
 
+def forecast_cost(rows: List[Dict[str, Any]], horizon_days: int = 7, lookback_days: int = 14) -> Dict[str, Any]:
+    daily = [day_total_cost(r) for r in rows]
+    if not daily:
+        return {"horizonDays": horizon_days, "predictedTotalCostUSD": 0.0, "method": "moving_average"}
+
+    window = daily[-max(1, lookback_days):]
+    avg = sum(window) / len(window)
+    trend = 0.0
+    if len(window) >= 2:
+        trend = (window[-1] - window[0]) / float(len(window) - 1)
+
+    predicted_days: List[float] = []
+    for i in range(1, horizon_days + 1):
+        val = max(0.0, avg + trend * i)
+        predicted_days.append(val)
+
+    return {
+        "horizonDays": horizon_days,
+        "predictedTotalCostUSD": sum(predicted_days),
+        "predictedAvgDailyCostUSD": (sum(predicted_days) / horizon_days) if horizon_days > 0 else 0.0,
+        "baselineAvgDailyCostUSD": avg,
+        "dailyTrendUSD": trend,
+        "method": "moving_average_plus_linear_trend",
+    }
+
+
+def detect_cost_anomalies(rows: List[Dict[str, Any]], lookback_days: int = 7, z_threshold: float = 2.5) -> List[Dict[str, Any]]:
+    daily = [day_total_cost(r) for r in rows]
+    out: List[Dict[str, Any]] = []
+    for i in range(len(daily)):
+        if i < lookback_days:
+            continue
+        w = daily[i - lookback_days:i]
+        if not w:
+            continue
+        mean = sum(w) / len(w)
+        var = sum((x - mean) ** 2 for x in w) / len(w)
+        std = var ** 0.5
+        curr = daily[i]
+        z = ((curr - mean) / std) if std > 1e-12 else 0.0
+        if z >= z_threshold:
+            out.append({
+                "date": rows[i].get("date"),
+                "costUSD": curr,
+                "baselineMeanUSD": mean,
+                "zScore": z,
+                "severity": "high" if z >= (z_threshold + 1.0) else "medium",
+            })
+    return out
+
+
+def evaluate_alert_rules(
+    rows: List[Dict[str, Any]],
+    forecast_7d: Dict[str, Any],
+    anomalies: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = config or {}
+    rules = cfg.get("rules") if isinstance(cfg.get("rules"), dict) else {}
+    channels = cfg.get("notificationChannels") if isinstance(cfg.get("notificationChannels"), list) else []
+
+    budget_threshold = _safe_float(rules.get("budgetThresholdUSD"), default=0.0)
+    budget_forecast_pct = _safe_float(rules.get("budgetForecastPct"), default=100.0)
+    anomaly_count_threshold = _safe_int(rules.get("anomalyCountThreshold", 1), default=1, minimum=1)
+
+    triggered: List[Dict[str, Any]] = []
+    if budget_threshold > 0:
+        predicted = _safe_float(forecast_7d.get("predictedTotalCostUSD"))
+        ratio = (predicted / budget_threshold * 100.0) if budget_threshold > 0 else 0.0
+        if ratio >= budget_forecast_pct:
+            triggered.append({
+                "rule": "budget_forecast_threshold",
+                "severity": "high" if ratio >= 120 else "medium",
+                "message": f"7-day forecast {predicted:.2f} USD reached {ratio:.1f}% of budget ({budget_threshold:.2f} USD)",
+            })
+
+    if len(anomalies) >= anomaly_count_threshold:
+        last = anomalies[-1]
+        triggered.append({
+            "rule": "anomaly_count_threshold",
+            "severity": "high" if len(anomalies) >= (anomaly_count_threshold + 2) else "medium",
+            "message": f"Detected {len(anomalies)} anomalies in recent window. Latest: {last.get('date')} z={_safe_float(last.get('zScore', 0.0)):.2f}",
+        })
+
+    return {
+        "rules": rules,
+        "notificationChannels": [str(x) for x in channels],
+        "triggered": triggered,
+    }
+
+
 def prepare_chart_series(rows: List[Dict[str, Any]], top_models: int) -> Tuple[List[str], Dict[str, List[float]], List[float]]:
     totals = model_totals(rows)
     top = [m for m, _ in sorted(totals.items(), key=lambda x: x[1], reverse=True)[:top_models]]
@@ -709,7 +851,7 @@ def build_model_table_rows(models_ranked: List[Tuple[str, float]], grand_total: 
     hidden = models_ranked[max_rows:]
 
     rows = [
-        f"<tr><td>{idx}</td><td>{m}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
+        f"<tr><td>{idx}</td><td>{esc(m)}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
         for idx, (m, c) in enumerate(visible, start=1)
     ]
 
@@ -747,6 +889,7 @@ def build_summary(
     rows: List[Dict[str, Any]],
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
+    alert_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -776,6 +919,10 @@ def build_summary(
 
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
     pattern_analysis = build_llm_pattern_analysis(rows)
+    forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
+    forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
+    anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
+    alerts = evaluate_alert_rules(rows, forecast7, anomalies, config=alert_config)
 
     return {
         "provider": provider,
@@ -791,6 +938,12 @@ def build_summary(
         "models": [{"model": m, "totalCostUSD": c} for m, c in ranked],
         "movers": movers,
         "spikes": spikes,
+        "forecast": {
+            "next7Days": forecast7,
+            "next30Days": forecast30,
+        },
+        "costAnomalies": anomalies,
+        "alerts": alerts,
         "llmPatternAnalysis": pattern_analysis,
     }
 
@@ -867,6 +1020,7 @@ def build_dashboard_html(
     chart_max_points: int = 1200,
     role_name: str = "admin",
     policy: Optional[Dict[str, Any]] = None,
+    alert_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -889,6 +1043,7 @@ def build_dashboard_html(
         rows,
         spike_lookback_days=spike_lookback_days,
         spike_threshold_mult=spike_threshold_mult,
+        alert_config=alert_config,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -896,7 +1051,7 @@ def build_dashboard_html(
     for idx, x in enumerate(summary.get("movers", [])[:8], start=1):
         pct = f"{x['deltaPct']:+.1f}%" if isinstance(x.get("deltaPct"), (int, float)) else "N/A"
         movers_rows_parts.append(
-            f"<tr><td>{idx}</td><td>{x['model']}</td><td>{usd(float(x['last7dCostUSD']))}</td><td>{usd(float(x['prev7dCostUSD']))}</td><td>{usd(float(x['deltaCostUSD']))}</td><td>{pct}</td></tr>"
+            f"<tr><td>{idx}</td><td>{esc(x['model'])}</td><td>{usd(float(x['last7dCostUSD']))}</td><td>{usd(float(x['prev7dCostUSD']))}</td><td>{usd(float(x['deltaCostUSD']))}</td><td>{pct}</td></tr>"
         )
     movers_rows = "\n".join(movers_rows_parts)
 
@@ -905,10 +1060,23 @@ def build_dashboard_html(
     for idx, x in enumerate(visible_spikes[:10], start=1):
         date_key = str(x["date"])
         spikes_rows_parts.append(
-            f"<tr id='spike-row-{date_key}'><td>{idx}</td><td>{x['date']}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
+            f"<tr id='spike-row-{esc(date_key)}'><td>{idx}</td><td>{esc(x['date'])}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
         )
     spikes_rows = "\n".join(spikes_rows_parts) if spikes_rows_parts else "<tr><td colspan='5'>No spikes detected</td></tr>"
 
+    forecast = summary.get("forecast") if isinstance(summary.get("forecast"), dict) else {}
+    f7 = forecast.get("next7Days") if isinstance(forecast.get("next7Days"), dict) else {}
+    f30 = forecast.get("next30Days") if isinstance(forecast.get("next30Days"), dict) else {}
+    anomalies = summary.get("costAnomalies") if isinstance(summary.get("costAnomalies"), list) else []
+    alerts = summary.get("alerts") if isinstance(summary.get("alerts"), dict) else {}
+    alert_rows = "\n".join([
+        f"<tr><td>{i+1}</td><td>{esc(a.get('rule'))}</td><td>{esc(a.get('severity'))}</td><td>{esc(a.get('message'))}</td></tr>"
+        for i, a in enumerate(alerts.get("triggered", [])[:8])
+    ]) or "<tr><td colspan='4'>No alert triggered</td></tr>"
+    anomaly_rows = "\n".join([
+        f"<tr><td>{i+1}</td><td>{esc(a.get('date'))}</td><td>{usd(float(a.get('costUSD', 0.0)))}</td><td>{_safe_float(a.get('zScore', 0.0)):.2f}</td><td>{esc(a.get('severity'))}</td></tr>"
+        for i, a in enumerate(anomalies[:10])
+    ]) or "<tr><td colspan='5'>No anomaly detected</td></tr>"
 
     pattern = summary.get("llmPatternAnalysis") if isinstance(summary.get("llmPatternAnalysis"), dict) else {"available": False}
     def _render_pattern_rows(items: List[Dict[str, Any]], key_name: str = "key") -> str:
@@ -917,7 +1085,7 @@ def build_dashboard_html(
         out_rows: List[str] = []
         for idx, item in enumerate(items[:8], start=1):
             out_rows.append(
-                f"<tr><td>{idx}</td><td>{item.get(key_name, 'unknown')}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{int(float(item.get('count', 0.0)))}</td></tr>"
+                f"<tr><td>{idx}</td><td>{esc(item.get(key_name, 'unknown'))}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{int(float(item.get('count', 0.0)))}</td></tr>"
             )
         return "\n".join(out_rows)
 
@@ -932,18 +1100,18 @@ def build_dashboard_html(
         for idx, item in enumerate(pattern["efficiency"][:8], start=1):
             cpk = item.get("costPer1kTokensUSD")
             lat = item.get("avgLatencyMs")
-            buf.append(f"<tr><td>{idx}</td><td>{item.get('model', 'unknown')}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{(f'{cpk:.4f}' if isinstance(cpk, (int, float)) else 'N/A')}</td><td>{(f'{lat:.1f}' if isinstance(lat, (int, float)) else 'N/A')}</td></tr>")
+            buf.append(f"<tr><td>{idx}</td><td>{esc(item.get('model', 'unknown'))}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{(f'{cpk:.4f}' if isinstance(cpk, (int, float)) else 'N/A')}</td><td>{(f'{lat:.1f}' if isinstance(lat, (int, float)) else 'N/A')}</td></tr>")
         pattern_eff_rows = "\n".join(buf)
 
     keyword_rows = "<tr><td colspan='3'>No keyword data</td></tr>"
     if pattern.get("available") and isinstance(pattern.get("anonymizedPromptKeywords"), list) and pattern.get("anonymizedPromptKeywords"):
-        keyword_rows = "\n".join([f"<tr><td>{i+1}</td><td>{k.get('keyword')}</td><td>{k.get('count')}</td></tr>" for i, k in enumerate(pattern.get("anonymizedPromptKeywords", [])[:12])])
+        keyword_rows = "\n".join([f"<tr><td>{i+1}</td><td>{esc(k.get('keyword'))}</td><td>{k.get('count')}</td></tr>" for i, k in enumerate(pattern.get("anonymizedPromptKeywords", [])[:12])])
 
     def _render_hotspot_rows(items: List[Dict[str, Any]], key_name: str) -> str:
         if not items:
             return "<tr><td colspan='4'>No data</td></tr>"
         return "\n".join([
-            f"<tr><td>{i+1}</td><td>{x.get(key_name, 'unknown')}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{float(x.get('totalTokens', 0.0)):,.0f}</td></tr>"
+            f"<tr><td>{i+1}</td><td>{esc(x.get(key_name, 'unknown'))}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{float(x.get('totalTokens', 0.0)):,.0f}</td></tr>"
             for i, x in enumerate(items[:10])
         ])
 
@@ -987,23 +1155,23 @@ def build_dashboard_html(
         day_breakdown_by_date[d] = [{"model": n, "costUSD": c} for n, c in ranked]
         day_total_by_date[d] = sum(model_map.values())
 
-    json_labels = json.dumps(labels)
-    json_series = json.dumps(series)
-    json_day_totals = json.dumps(day_totals)
+    json_labels = json_for_script(labels)
+    json_series = json_for_script(series)
+    json_day_totals = json_for_script(day_totals)
     all_models = sorted({str(x["model"]) for day in day_breakdown_by_date.values() for x in day if isinstance(x, dict) and isinstance(x.get("model"), str)})
 
-    json_spike_by_date = json.dumps(spike_by_date)
-    json_day_breakdown_by_date = json.dumps(day_breakdown_by_date)
-    json_day_total_by_date = json.dumps(day_total_by_date)
-    json_all_models = json.dumps(all_models)
-    json_policy = json.dumps(policy)
+    json_spike_by_date = json_for_script(spike_by_date)
+    json_day_breakdown_by_date = json_for_script(day_breakdown_by_date)
+    json_day_total_by_date = json_for_script(day_total_by_date)
+    json_all_models = json_for_script(all_models)
+    json_policy = json_for_script(policy)
 
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
-  <title>Token Usage Dashboard · {provider}</title>
+  <title>Token Usage Dashboard · {esc(provider)}</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 24px; color: #1f2937; }}
     .grid {{ display: grid; grid-template-columns: repeat(5, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }}
@@ -1027,8 +1195,8 @@ def build_dashboard_html(
   </style>
 </head>
 <body>
-  <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Role: <strong>{role_name}</strong></div>
+  <h2>Token Usage Dashboard · {esc(provider)}</h2>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Role: <strong>{esc(role_name)}</strong></div>
   <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · Home/End first/last day · s toggle spike-only · d sort DoD · x changes-only · r reset to latest · c copy link · ? help</div>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
     <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
@@ -1072,6 +1240,27 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>7d Baseline</th><th>Ratio</th></tr></thead>
     <tbody id="spikesBody">{spikes_rows}</tbody>
+  </table>
+
+  <h3>Cost Forecast & Anomaly Alerts</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Forecast windows: next 7/30 days + anomaly detection (z-score) + configurable alert rules.</div>
+  <table>
+    <thead><tr><th>Window</th><th>Predicted Total Cost</th><th>Predicted Avg Daily</th><th>Baseline Avg Daily</th><th>Trend / day</th></tr></thead>
+    <tbody>
+      <tr><td>Next 7 days</td><td>{usd(float(f7.get('predictedTotalCostUSD', 0.0)))}</td><td>{usd(float(f7.get('predictedAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f7.get('baselineAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f7.get('dailyTrendUSD', 0.0)))}</td></tr>
+      <tr><td>Next 30 days</td><td>{usd(float(f30.get('predictedTotalCostUSD', 0.0)))}</td><td>{usd(float(f30.get('predictedAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f30.get('baselineAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f30.get('dailyTrendUSD', 0.0)))}</td></tr>
+    </tbody>
+  </table>
+  <h4>Detected Cost Anomalies</h4>
+  <table>
+    <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>Z-score</th><th>Severity</th></tr></thead>
+    <tbody>{anomaly_rows}</tbody>
+  </table>
+  <h4>Triggered Alerts</h4>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Notification channels: {esc(', '.join(alerts.get('notificationChannels', [])) if alerts.get('notificationChannels') else 'not configured')}</div>
+  <table>
+    <thead><tr><th>#</th><th>Rule</th><th>Severity</th><th>Message</th></tr></thead>
+    <tbody>{alert_rows}</tbody>
   </table>
 
   <h3>LLM Usage Pattern Deep Analysis</h3>
@@ -1223,6 +1412,15 @@ def build_dashboard_html(
     let selectedDate = null;
     let spikeOnlyMode = false;
 
+    function escapeHtml(value) {{
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
+
     function hideSectionByHeading(titleText, message) {{
       const h = Array.from(document.querySelectorAll('h3')).find(x => x.textContent.trim() === titleText);
       if (!h) return;
@@ -1293,7 +1491,7 @@ def build_dashboard_html(
         const dodClass = dod > 0 ? 'dod-pos' : (dod < 0 ? 'dod-neg' : 'dod-neutral');
         const dodPctClass = dodPct === null ? 'dod-neutral' : (dodPct > 0 ? 'dod-pos' : (dodPct < 0 ? 'dod-neg' : 'dod-neutral'));
         const rowClass = i === 0 ? 'model-top' : '';
-        return `<tr class="${{rowClass}}"><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
+        return `<tr class="${{rowClass}}"><td>${{i + 1}}</td><td>${{escapeHtml(r.model)}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
       }}).join('');
     }}
 
@@ -1366,7 +1564,7 @@ def build_dashboard_html(
         const total = metrics.includes('total_cost') ? `$${{r.totalCost.toFixed(2)}}` : '-';
         const active = metrics.includes('active_models') ? r.avgActiveModels.toFixed(2) : '-';
         const avg = metrics.includes('avg_cost_per_model') ? `$${{r.avgCostPerModel.toFixed(2)}}` : '-';
-        return `<tr><td>${{r.period}}</td><td>${{total}}</td><td>${{active}}</td><td>${{avg}}</td></tr>`;
+        return `<tr><td>${{escapeHtml(r.period)}}</td><td>${{total}}</td><td>${{active}}</td><td>${{avg}}</td></tr>`;
       }}).join('');
       return rows;
     }}
@@ -1386,7 +1584,7 @@ def build_dashboard_html(
 
     function initCustomReportBuilder() {{
       if (modelFilters) {{
-        modelFilters.innerHTML = allModels.map((m) => `<label style="display:block;font-size:12px;"><input type="checkbox" class="modelOpt" value="${{m}}"/> ${{m}}</label>`).join('');
+        modelFilters.innerHTML = allModels.map((m) => `<label style="display:block;font-size:12px;"><input type="checkbox" class="modelOpt" value="${{escapeHtml(m)}}"/> ${{escapeHtml(m)}}</label>`).join('');
       }}
       let latestRows = renderCustomReport();
       generateReportBtn?.addEventListener('click', () => {{
@@ -1816,6 +2014,7 @@ def main() -> int:
     parser.add_argument("--report-granularity", choices=["daily", "weekly", "monthly"], default="daily", help="Custom report time granularity")
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
+    parser.add_argument("--alert-config", help="Path to alert rules/notification channels JSON")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -1895,6 +2094,12 @@ def main() -> int:
 
     rows = apply_access_policy(rows, policy)
 
+    try:
+        alert_config = _load_alert_config(args.alert_config)
+    except Exception as exc:
+        eprint(f"Failed to load alert config: {exc}")
+        return 7
+
     html = build_dashboard_html(
         args.provider,
         rows,
@@ -1905,6 +2110,7 @@ def main() -> int:
         chart_max_points=args.chart_max_points,
         role_name=role_name,
         policy=policy,
+        alert_config=alert_config,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -1915,6 +2121,7 @@ def main() -> int:
             rows,
             spike_lookback_days=args.spike_lookback_days,
             spike_threshold_mult=args.spike_threshold_mult,
+            alert_config=alert_config,
         )
         summary["role"] = role_name
         summary["policy"] = policy

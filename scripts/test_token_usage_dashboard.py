@@ -10,6 +10,9 @@ from token_usage_dashboard import (
     build_summary,
     build_llm_pattern_analysis,
     detect_spikes,
+    detect_cost_anomalies,
+    evaluate_alert_rules,
+    forecast_cost,
     downsample_rows,
     generate_custom_report,
     main as dashboard_main,
@@ -138,6 +141,41 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(len(summary_default["spikes"]), 0)
         self.assertEqual(len(summary_sensitive["spikes"]), 1)
 
+    def test_forecast_and_alerts(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]}
+            for d in range(1, 16)
+        ]
+        f7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
+        self.assertEqual(f7["horizonDays"], 7)
+        self.assertGreater(f7["predictedTotalCostUSD"], 0.0)
+
+        anomalies = detect_cost_anomalies(rows + [{"date": "2026-03-16", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 100.0}]}], lookback_days=7, z_threshold=1.5)
+        self.assertGreaterEqual(len(anomalies), 1)
+
+        alerts = evaluate_alert_rules(
+            rows,
+            f7,
+            anomalies,
+            config={
+                "rules": {"budgetThresholdUSD": 10, "budgetForecastPct": 50, "anomalyCountThreshold": 1},
+                "notificationChannels": ["email", "discord:webhook"],
+            },
+        )
+        self.assertTrue(len(alerts["triggered"]) >= 1)
+        self.assertIn("email", alerts["notificationChannels"])
+
+    def test_build_summary_includes_forecast_and_alerts(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}
+            for d in range(1, 15)
+        ]
+        summary = build_summary("codex", rows, alert_config={"rules": {"budgetThresholdUSD": 20, "budgetForecastPct": 80}})
+        self.assertIn("forecast", summary)
+        self.assertIn("costAnomalies", summary)
+        self.assertIn("alerts", summary)
+        self.assertIn("next7Days", summary["forecast"])
+
 
     def test_dashboard_html_contains_all_pattern_sections(self):
         rows = [{
@@ -216,6 +254,9 @@ class TestTokenDashboard(TestCase):
         self.assertIn("copyDeepLink", html)
         self.assertIn("id=\"copyLinkBtn\"", html)
         self.assertIn("id=\"selectedDayMeta\"", html)
+        self.assertIn("Cost Forecast & Anomaly Alerts", html)
+        self.assertIn("Detected Cost Anomalies", html)
+        self.assertIn("Triggered Alerts", html)
         self.assertIn("LLM Usage Pattern Deep Analysis", html)
         self.assertIn("id=\"sortByDodToggle\"", html)
         self.assertIn("id=\"showOnlyChangesToggle\"", html)
@@ -479,6 +520,58 @@ class TestTokenDashboard(TestCase):
                 manage_tenant_config(path, "org-a", None, None, None, None, "assign", "missing-view", None, None, "analytics")
         finally:
             os.unlink(path)
+
+    def test_alert_config_parsing_tolerates_invalid_numbers(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]
+        alerts = evaluate_alert_rules(
+            rows,
+            {"predictedTotalCostUSD": 100.0},
+            [{"date": "2026-03-01", "zScore": "not-a-number"}],
+            config={
+                "rules": {
+                    "budgetThresholdUSD": "bad-threshold",
+                    "budgetForecastPct": "85.5",
+                    "anomalyCountThreshold": "abc",
+                },
+                "notificationChannels": ["email", 123],
+            },
+        )
+        self.assertEqual(alerts["notificationChannels"], ["email", "123"])
+        self.assertTrue(any(a["rule"] == "anomaly_count_threshold" for a in alerts["triggered"]))
+
+    def test_dashboard_html_escapes_xss_dynamic_strings(self):
+        evil = "<img src=x onerror=alert(1)>"
+        rows = [{
+            "date": "2026-03-01",
+            "modelBreakdowns": [{"modelName": evil, "cost": 3.0}],
+            "llmCalls": [{"modelName": evil, "task": evil, "promptTokens": 1, "completionTokens": 1, "totalTokens": 2, "cost": 0.1}],
+        }]
+        html = build_dashboard_html(
+            f"codex</title><script>alert(9)</script>",
+            rows,
+            top_models=3,
+            role_name="viewer<script>alert(8)</script>",
+            alert_config={
+                "rules": {"budgetThresholdUSD": 1, "budgetForecastPct": 1, "anomalyCountThreshold": 1},
+                "notificationChannels": ["slack<script>alert(7)</script>", evil],
+            },
+        )
+        self.assertNotIn("<script>alert(9)</script>", html)
+        self.assertNotIn("<td><img src=x onerror=alert(1)>", html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
+        self.assertIn("escapeHtml", html)
+
+    def test_dashboard_html_escapes_alert_fields(self):
+        rows = [{"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]} for d in range(1, 10)]
+        anomalies = [{"date": "2026-03-09", "costUSD": 99.0, "zScore": 9.1, "severity": "<b>high</b>"}]
+        alerts = evaluate_alert_rules(
+            rows,
+            {"predictedTotalCostUSD": 100.0},
+            anomalies,
+            config={"rules": {"budgetThresholdUSD": 1, "budgetForecastPct": 1, "anomalyCountThreshold": 1}, "notificationChannels": ["discord</td><script>alert(4)</script>"]},
+        )
+        html = build_dashboard_html("codex", rows, top_models=2, alert_config={"rules": alerts["rules"], "notificationChannels": alerts["notificationChannels"]})
+        self.assertIn("&lt;/td&gt;&lt;script&gt;alert(4)&lt;/script&gt;", html)
 
 
 if __name__ == "__main__":

@@ -191,8 +191,33 @@ def day_total_cost(row: Dict[str, Any]) -> float:
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return default
+        try:
+            return int(float(s))
+        except (TypeError, ValueError):
+            return default
     return default
 
 
@@ -573,11 +598,7 @@ def evaluate_alert_rules(
 
     budget_threshold = _safe_float(rules.get("budgetThresholdUSD"), default=0.0)
     budget_forecast_pct = _safe_float(rules.get("budgetForecastPct"), default=100.0)
-    try:
-        anomaly_count_threshold = int(rules.get("anomalyCountThreshold", 1) or 1)
-    except (TypeError, ValueError):
-        anomaly_count_threshold = 1
-    anomaly_count_threshold = max(1, anomaly_count_threshold)
+    anomaly_count_threshold = max(1, _safe_int(rules.get("anomalyCountThreshold", 1), default=1))
 
     triggered: List[Dict[str, Any]] = []
     if budget_threshold > 0:
@@ -592,10 +613,12 @@ def evaluate_alert_rules(
 
     if len(anomalies) >= anomaly_count_threshold:
         last = anomalies[-1]
+        latest_date = str(last.get("date") or "unknown")
+        latest_z = _safe_float(last.get("zScore"), default=0.0)
         triggered.append({
             "rule": "anomaly_count_threshold",
             "severity": "high" if len(anomalies) >= (anomaly_count_threshold + 2) else "medium",
-            "message": f"Detected {len(anomalies)} anomalies in recent window. Latest: {last.get('date')} z={float(last.get('zScore', 0.0)):.2f}",
+            "message": f"Detected {len(anomalies)} anomalies in recent window. Latest: {latest_date} z={latest_z:.2f}",
         })
 
     return {
@@ -1092,6 +1115,15 @@ def build_dashboard_html(
     const allModels = {json_all_models};
     const accessPolicy = {json_policy};
 
+    function escapeHtml(value) {{
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;');
+    }}
+
     const colors = ["#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#ea580c", "#0891b2", "#4f46e5", "#65a30d", "#be123c"];
     const canvas = document.getElementById('costChart');
     const ctx = canvas.getContext('2d');
@@ -1186,7 +1218,7 @@ def build_dashboard_html(
         const dodClass = dod > 0 ? 'dod-pos' : (dod < 0 ? 'dod-neg' : 'dod-neutral');
         const dodPctClass = dodPct === null ? 'dod-neutral' : (dodPct > 0 ? 'dod-pos' : (dodPct < 0 ? 'dod-neg' : 'dod-neutral'));
         const rowClass = i === 0 ? 'model-top' : '';
-        return `<tr class="${{rowClass}}"><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
+        return `<tr class="${{rowClass}}"><td>${{i + 1}}</td><td>${{escapeHtml(r.model)}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
       }}).join('');
     }}
 
@@ -1259,7 +1291,7 @@ def build_dashboard_html(
         const total = metrics.includes('total_cost') ? `$${{r.totalCost.toFixed(2)}}` : '-';
         const active = metrics.includes('active_models') ? r.avgActiveModels.toFixed(2) : '-';
         const avg = metrics.includes('avg_cost_per_model') ? `$${{r.avgCostPerModel.toFixed(2)}}` : '-';
-        return `<tr><td>${{r.period}}</td><td>${{total}}</td><td>${{active}}</td><td>${{avg}}</td></tr>`;
+        return `<tr><td>${{escapeHtml(r.period)}}</td><td>${{total}}</td><td>${{active}}</td><td>${{avg}}</td></tr>`;
       }}).join('');
       return rows;
     }}
@@ -1279,7 +1311,7 @@ def build_dashboard_html(
 
     function initCustomReportBuilder() {{
       if (modelFilters) {{
-        modelFilters.innerHTML = allModels.map((m) => `<label style="display:block;font-size:12px;"><input type="checkbox" class="modelOpt" value="${{m}}"/> ${{m}}</label>`).join('');
+        modelFilters.innerHTML = allModels.map((m) => `<label style="display:block;font-size:12px;"><input type="checkbox" class="modelOpt" value="${{escapeHtml(m)}}"/> ${{escapeHtml(m)}}</label>`).join('');
       }}
       let latestRows = renderCustomReport();
       generateReportBtn?.addEventListener('click', () => {{

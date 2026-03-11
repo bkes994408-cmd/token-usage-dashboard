@@ -43,6 +43,33 @@ class TestTokenDashboard(TestCase):
         self.assertIsInstance(alerts, dict)
         self.assertIn("triggered", alerts)
 
+    def test_alert_config_parsing_tolerates_string_numbers_and_bad_types(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]}
+            for d in range(1, 16)
+        ]
+        f7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
+        anomalies = [
+            {"date": "2026-03-16\"><img src=x onerror=alert(1)>", "costUSD": 200.0, "zScore": "not-a-number", "severity": "high"},
+            {"date": "2026-03-17", "costUSD": 210.0, "zScore": 2.5, "severity": "high"},
+        ]
+        alerts = evaluate_alert_rules(
+            rows,
+            f7,
+            anomalies,
+            config={
+                "rules": {
+                    "budgetThresholdUSD": "10",
+                    "budgetForecastPct": "50",
+                    "anomalyCountThreshold": "2",
+                },
+                "notificationChannels": ["discord"],
+            },
+        )
+        self.assertGreaterEqual(len(alerts.get("triggered", [])), 1)
+        messages = [a.get("message", "") for a in alerts.get("triggered", [])]
+        self.assertTrue(any("Detected" in m for m in messages))
+
     def test_dashboard_html_escapes_xss_dynamic_strings(self):
         rows = [
             {
@@ -82,6 +109,9 @@ class TestTokenDashboard(TestCase):
         self.assertIn("data-date=", html)
         self.assertIn("\\u003cimg src=x onerror=alert(1)>", html)
         self.assertIn("&lt;script&gt;alert(&#x27;p&#x27;)&lt;/script&gt;", html)
+        self.assertIn("function escapeHtml(value)", html)
+        self.assertIn("escapeHtml(r.model)", html)
+        self.assertIn("escapeHtml(m)", html)
 
 
 if __name__ == "__main__":

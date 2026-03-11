@@ -11,6 +11,8 @@ Interactive local dashboard for CodexBar usage/cost data.
 - Supports deep-link state (`#date=...&spikeOnly=1`)
 - Keyboard-driven navigation and spike focus
 - New: Custom Report Builder (choose metrics, model filters, daily/weekly/monthly granularity, export CSV)
+- New: Multi-tenant organization isolation + org-level users/roles/dashboard-view assignment
+- New: Cost forecasting (next N days) + anomaly consumption alerts (z-score based)
 
 ## Quick start
 
@@ -30,7 +32,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 ```bash
 ./run_dashboard.sh --provider codex --days 30
 ./run_dashboard.sh --provider claude --days 14 --no-open
-./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --max-table-rows 150 --chart-max-points 1000
+./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --forecast-days 14 --anomaly-z-threshold 2.3 --max-table-rows 150 --chart-max-points 1000
 ```
 
 ### Direct Python command
@@ -48,6 +50,49 @@ python3 scripts/token_usage_dashboard.py \
   --report-models gpt-5,o3 \
   --report-granularity weekly \
   --open
+```
+
+### Multi-tenant / organization mode
+
+```bash
+python3 scripts/token_usage_dashboard.py \
+  --provider codex \
+  --input /tmp/tenant_usage_payload.json \
+  --tenant-config /tmp/tenant_config.json \
+  --org-id acme \
+  --user alice \
+  --dashboard-view eng-core \
+  --output /tmp/token_usage_dashboard_acme.html
+```
+
+User management (create/update/delete/list):
+
+```bash
+python3 scripts/token_usage_dashboard.py --tenant-config /tmp/tenant_config.json --org-id acme \
+  --manage-users create --target-user bob --target-role analyst --target-group analytics
+```
+
+Tenant payload format should include per-org daily data, e.g.:
+
+```json
+{
+  "provider": "codex",
+  "organizations": {
+    "acme": { "daily": [ ... ] },
+    "globex": { "daily": [ ... ] }
+  }
+}
+```
+
+See `docs/TENANT_CONFIG_EXAMPLE.json` for org/user/group/role/view config schema.
+
+Dashboard view management (create/update/delete/list/assign/unassign):
+
+```bash
+python3 scripts/token_usage_dashboard.py --tenant-config /tmp/tenant_config.json --org-id acme \
+  --manage-views create --view-id analytics-view --view-models gpt-5,o3 --view-max-days 30
+python3 scripts/token_usage_dashboard.py --tenant-config /tmp/tenant_config.json --org-id acme \
+  --manage-views assign --view-id analytics-view --view-group analytics
 ```
 
 ## Keyboard shortcuts

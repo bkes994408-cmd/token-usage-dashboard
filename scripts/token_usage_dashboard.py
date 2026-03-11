@@ -220,7 +220,8 @@ def apply_access_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> L
     can_view_breakdown = bool(policy.get("canViewModelBreakdown", True))
     can_view_model_names = bool(policy.get("canViewModelNames", True))
     allowed_models = policy.get("allowedModels")
-    allowed_set = {str(x) for x in allowed_models} if isinstance(allowed_models, list) else set()
+    has_allowed_models = isinstance(allowed_models, list)
+    allowed_set = {str(x) for x in allowed_models} if has_allowed_models else set()
     max_days = policy.get("maxDays")
 
     transformed: List[Dict[str, Any]] = []
@@ -235,7 +236,7 @@ def apply_access_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> L
             cost = b.get("cost")
             if not isinstance(name, str) or not isinstance(cost, (int, float)):
                 continue
-            if allowed_set and name not in allowed_set:
+            if has_allowed_models and name not in allowed_set:
                 continue
             c = float(cost)
             total += c
@@ -252,6 +253,222 @@ def apply_access_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> L
     return transformed
 
 
+
+
+
+def _load_tenant_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Tenant config must be a JSON object.")
+    return parsed
+
+
+def _get_org_node(cfg: Dict[str, Any], org_id: Optional[str]) -> Tuple[Optional[str], Dict[str, Any]]:
+    orgs = cfg.get("organizations") if isinstance(cfg.get("organizations"), dict) else {}
+    if not orgs:
+        return None, {}
+
+    target = org_id or str(cfg.get("defaultOrganization") or "")
+    if not target:
+        target = next(iter(orgs.keys()))
+    node = orgs.get(target)
+    if not isinstance(node, dict):
+        raise RuntimeError(f"Organization '{target}' not found in tenant config.")
+    return target, node
+
+
+def _resolve_role_policies(org_node: Dict[str, Any], global_roles: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    merged = {k: dict(v) for k, v in DEFAULT_ROLE_POLICIES.items()}
+    if isinstance(global_roles, dict):
+        for role_name, role_policy in global_roles.items():
+            if isinstance(role_policy, dict):
+                merged.setdefault(str(role_name), {})
+                merged[str(role_name)].update(role_policy)
+
+    org_roles = org_node.get("roles") if isinstance(org_node.get("roles"), dict) else {}
+    for role_name, role_policy in org_roles.items():
+        if isinstance(role_policy, dict):
+            merged.setdefault(str(role_name), {})
+            merged[str(role_name)].update(role_policy)
+    return merged
+
+
+def resolve_multi_tenant_context(
+    payload: Dict[str, Any],
+    tenant_config_path: Optional[str],
+    org_id: Optional[str],
+    role: Optional[str],
+    user: Optional[str],
+    requested_dashboard: Optional[str],
+    allow_role_override: bool = False,
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any], Dict[str, Any]]:
+    cfg = _load_tenant_config(tenant_config_path)
+    resolved_org_id, org_node = _get_org_node(cfg, org_id)
+
+    if resolved_org_id:
+        org_payloads = payload.get("organizations") if isinstance(payload.get("organizations"), dict) else {}
+        org_payload = org_payloads.get(resolved_org_id)
+        if not isinstance(org_payload, dict):
+            raise RuntimeError(f"Organization '{resolved_org_id}' has no usage payload data.")
+        rows = parse_daily(org_payload)
+    else:
+        rows = parse_daily(payload)
+
+    users = org_node.get("users") if isinstance(org_node.get("users"), dict) else {}
+    groups = org_node.get("groups") if isinstance(org_node.get("groups"), dict) else {}
+    global_roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+    role_policies = _resolve_role_policies(org_node, global_roles)
+
+    selected_role = ""
+    user_record = users.get(user) if user and isinstance(users.get(user), dict) else {}
+    if isinstance(user_record.get("role"), str):
+        selected_role = str(user_record.get("role"))
+    elif role and (allow_role_override or not user):
+        selected_role = role
+    if not selected_role:
+        selected_role = str(org_node.get("defaultRole") or cfg.get("defaultRole") or "admin")
+
+    base_policy = role_policies.get(selected_role, role_policies.get("viewer", DEFAULT_ROLE_POLICIES["viewer"]))
+    policy = dict(base_policy)
+
+    dashboard_views = org_node.get("dashboardViews") if isinstance(org_node.get("dashboardViews"), dict) else {}
+    group_name = str(user_record.get("group") or "") if isinstance(user_record, dict) else ""
+    allowed_view_ids: List[str] = []
+    if group_name and isinstance(groups.get(group_name), dict):
+        view_ids = groups[group_name].get("dashboardViews")
+        if isinstance(view_ids, list):
+            allowed_view_ids = [str(v) for v in view_ids]
+
+    default_dashboard = str(user_record.get("defaultDashboard")) if isinstance(user_record.get("defaultDashboard"), str) else ""
+    explicit_allowlist: Optional[List[str]] = allowed_view_ids if allowed_view_ids else None
+    if user and explicit_allowlist is None and default_dashboard:
+        explicit_allowlist = [default_dashboard]
+    elif user and explicit_allowlist is None:
+        explicit_allowlist = []
+
+    selected_dashboard = requested_dashboard
+    if not selected_dashboard:
+        if default_dashboard:
+            selected_dashboard = default_dashboard
+        elif allowed_view_ids:
+            selected_dashboard = allowed_view_ids[0]
+
+    selected_view = {}
+    if selected_dashboard:
+        raw_view = dashboard_views.get(selected_dashboard)
+        if not isinstance(raw_view, dict):
+            raise RuntimeError(f"Dashboard view '{selected_dashboard}' not found in organization '{resolved_org_id}'.")
+        if explicit_allowlist is not None and selected_dashboard not in explicit_allowlist:
+            raise RuntimeError(f"User '{user}' cannot access dashboard view '{selected_dashboard}'.")
+        selected_view = raw_view
+        if isinstance(raw_view.get("allowedModels"), list):
+            policy["allowedModels"] = [str(x) for x in raw_view.get("allowedModels", [])]
+        if isinstance(raw_view.get("maxDays"), int):
+            policy["maxDays"] = int(raw_view["maxDays"])
+    elif user and not explicit_allowlist:
+        policy["allowedModels"] = []
+
+    tenant_meta = {
+        "organizationId": resolved_org_id,
+        "user": user,
+        "group": group_name or None,
+        "dashboardView": selected_dashboard,
+        "dashboardViewConfig": selected_view,
+    }
+    return rows, selected_role, policy, tenant_meta
+
+
+def manage_tenant_config(
+    tenant_config_path: str,
+    org_id: str,
+    user_action: Optional[str],
+    target_user: Optional[str],
+    target_role: Optional[str],
+    target_group: Optional[str],
+    view_action: Optional[str],
+    view_id: Optional[str],
+    view_models: Optional[str],
+    view_max_days: Optional[int],
+    view_group: Optional[str],
+) -> Dict[str, Any]:
+    cfg = _load_tenant_config(tenant_config_path)
+    _, org_node = _get_org_node(cfg, org_id)
+
+    org_node.setdefault("users", {})
+    org_node.setdefault("groups", {})
+    org_node.setdefault("dashboardViews", {})
+
+    users = org_node["users"]
+    groups = org_node["groups"]
+    views = org_node["dashboardViews"]
+
+    actions: List[str] = []
+
+    if user_action:
+        if user_action == "list":
+            actions.append(f"users={list(users.keys())}")
+        elif user_action in {"create", "update"}:
+            if not target_user:
+                raise RuntimeError("--target-user is required for user create/update.")
+            role_name = target_role or str(org_node.get("defaultRole") or cfg.get("defaultRole") or "viewer")
+            users[target_user] = {
+                "role": role_name,
+                "group": target_group,
+            }
+            actions.append(f"{user_action}_user={target_user}")
+        elif user_action == "delete":
+            if not target_user:
+                raise RuntimeError("--target-user is required for user delete.")
+            users.pop(target_user, None)
+            actions.append(f"delete_user={target_user}")
+
+    if view_action:
+        if view_action == "list":
+            actions.append(f"views={list(views.keys())}")
+        elif view_action in {"create", "update"}:
+            if not view_id:
+                raise RuntimeError("--view-id is required for view create/update.")
+            view_node = views.get(view_id) if isinstance(views.get(view_id), dict) else {}
+            if view_models is not None:
+                view_node["allowedModels"] = [x.strip() for x in view_models.split(',') if x.strip()]
+            if isinstance(view_max_days, int) and view_max_days > 0:
+                view_node["maxDays"] = view_max_days
+            views[view_id] = view_node
+            actions.append(f"{view_action}_view={view_id}")
+        elif view_action == "delete":
+            if not view_id:
+                raise RuntimeError("--view-id is required for view delete.")
+            views.pop(view_id, None)
+            for g in groups.values():
+                if isinstance(g, dict) and isinstance(g.get("dashboardViews"), list):
+                    g["dashboardViews"] = [v for v in g["dashboardViews"] if v != view_id]
+            actions.append(f"delete_view={view_id}")
+        elif view_action in {"assign", "unassign"}:
+            if not view_id or not view_group:
+                raise RuntimeError("--view-id and --view-group are required for assign/unassign.")
+            if view_action == "assign" and view_id not in views:
+                raise RuntimeError(f"Dashboard view '{view_id}' does not exist.")
+            g = groups.get(view_group) if isinstance(groups.get(view_group), dict) else {"dashboardViews": []}
+            ids = g.get("dashboardViews") if isinstance(g.get("dashboardViews"), list) else []
+            if view_action == "assign" and view_id not in ids:
+                ids.append(view_id)
+            if view_action == "unassign":
+                ids = [v for v in ids if v != view_id]
+            g["dashboardViews"] = ids
+            groups[view_group] = g
+            actions.append(f"{view_action}_view={view_id}_group={view_group}")
+
+    Path(tenant_config_path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "organizationId": org_id,
+        "actions": actions,
+        "users": sorted(users.keys()),
+        "views": sorted(views.keys()),
+        "groups": sorted(groups.keys()),
+    }
 def detect_spikes(rows: List[Dict[str, Any]], lookback_days: int = 7, threshold_mult: float = 2.0) -> List[Dict[str, Any]]:
     spikes: List[Dict[str, Any]] = []
     daily = [day_total_cost(r) for r in rows]
@@ -351,11 +568,114 @@ def _window_model_totals(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, float], 
     return dict(last_totals), dict(prev_totals)
 
 
+
+
+def forecast_daily_costs(rows: List[Dict[str, Any]], forecast_days: int = 7, lookback_days: int = 30) -> Dict[str, Any]:
+    if forecast_days < 1:
+        forecast_days = 1
+    if lookback_days < 2:
+        lookback_days = 2
+
+    dated_costs: List[Tuple[date, float]] = []
+    for row in rows:
+        d = parse_date(str(row.get("date", "")))
+        if not d:
+            continue
+        dated_costs.append((d, day_total_cost(row)))
+    if len(dated_costs) < 2:
+        return {
+            "method": "linear-regression",
+            "lookbackDays": lookback_days,
+            "forecastDays": forecast_days,
+            "predictions": [],
+            "totalForecastCostUSD": 0.0,
+        }
+
+    window = dated_costs[-lookback_days:]
+    base_day = window[0][0]
+    xs = [(d - base_day).days for d, _ in window]
+    ys = [c for _, c in window]
+
+    n = len(xs)
+    sx = sum(xs)
+    sy = sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    denom = n * sxx - sx * sx
+    slope = ((n * sxy - sx * sy) / denom) if denom != 0 else 0.0
+    intercept = (sy - slope * sx) / n if n else 0.0
+
+    last_day = window[-1][0]
+    predictions: List[Dict[str, Any]] = []
+    total = 0.0
+    for i in range(1, forecast_days + 1):
+        d = last_day + timedelta(days=i)
+        x = (d - base_day).days
+        y = max(0.0, intercept + slope * x)
+        y = round(y, 6)
+        total += y
+        predictions.append({"date": d.strftime("%Y-%m-%d"), "costUSD": y})
+
+    return {
+        "method": "linear-regression",
+        "lookbackDays": lookback_days,
+        "forecastDays": forecast_days,
+        "slope": round(slope, 6),
+        "predictions": predictions,
+        "totalForecastCostUSD": round(total, 6),
+    }
+
+
+def detect_anomaly_alerts(rows: List[Dict[str, Any]], lookback_days: int = 14, z_threshold: float = 2.5, min_cost: float = 0.0) -> List[Dict[str, Any]]:
+    if lookback_days < 2:
+        lookback_days = 2
+    daily = [day_total_cost(r) for r in rows]
+    alerts: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        if i < lookback_days:
+            continue
+        cost = daily[i]
+        if cost < min_cost:
+            continue
+        baseline = daily[i - lookback_days:i]
+        mean = sum(baseline) / len(baseline) if baseline else 0.0
+        variance = sum((x - mean) ** 2 for x in baseline) / len(baseline) if baseline else 0.0
+        std = variance ** 0.5
+        if std <= 0:
+            if mean <= 0:
+                continue
+            if cost >= mean * max(1.5, z_threshold):
+                alerts.append({
+                    "date": row.get("date"),
+                    "costUSD": round(cost, 6),
+                    "baselineMeanUSD": round(mean, 6),
+                    "baselineStdUSD": 0.0,
+                    "zScore": round(z_threshold, 4),
+                    "severity": "high",
+                })
+            continue
+        z = (cost - mean) / std
+        if z >= z_threshold:
+            severity = "high" if z >= (z_threshold + 1.5) else ("medium" if z >= (z_threshold + 0.5) else "low")
+            alerts.append({
+                "date": row.get("date"),
+                "costUSD": round(cost, 6),
+                "baselineMeanUSD": round(mean, 6),
+                "baselineStdUSD": round(std, 6),
+                "zScore": round(z, 4),
+                "severity": severity,
+            })
+    return alerts
 def build_summary(
     provider: str,
     rows: List[Dict[str, Any]],
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
+    forecast_days: int = 7,
+    forecast_lookback_days: int = 30,
+    anomaly_lookback_days: int = 14,
+    anomaly_z_threshold: float = 2.5,
+    anomaly_min_cost: float = 0.0,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -384,6 +704,13 @@ def build_summary(
     movers.sort(key=lambda x: x["deltaCostUSD"], reverse=True)
 
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
+    forecast = forecast_daily_costs(rows, forecast_days=forecast_days, lookback_days=forecast_lookback_days)
+    anomaly_alerts = detect_anomaly_alerts(
+        rows,
+        lookback_days=anomaly_lookback_days,
+        z_threshold=anomaly_z_threshold,
+        min_cost=anomaly_min_cost,
+    )
 
     return {
         "provider": provider,
@@ -399,6 +726,8 @@ def build_summary(
         "models": [{"model": m, "totalCostUSD": c} for m, c in ranked],
         "movers": movers,
         "spikes": spikes,
+        "forecast": forecast,
+        "anomalyAlerts": anomaly_alerts,
     }
 
 
@@ -470,6 +799,11 @@ def build_dashboard_html(
     top_models: int,
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
+    forecast_days: int = 7,
+    forecast_lookback_days: int = 30,
+    anomaly_lookback_days: int = 14,
+    anomaly_z_threshold: float = 2.5,
+    anomaly_min_cost: float = 0.0,
     max_table_rows: int = 120,
     chart_max_points: int = 1200,
     role_name: str = "admin",
@@ -496,8 +830,15 @@ def build_dashboard_html(
         rows,
         spike_lookback_days=spike_lookback_days,
         spike_threshold_mult=spike_threshold_mult,
+        forecast_days=forecast_days,
+        forecast_lookback_days=forecast_lookback_days,
+        anomaly_lookback_days=anomaly_lookback_days,
+        anomaly_z_threshold=anomaly_z_threshold,
+        anomaly_min_cost=anomaly_min_cost,
     )
     spike_count = len(summary.get("spikes", []))
+    forecast_total = float((summary.get("forecast") or {}).get("totalForecastCostUSD", 0.0))
+    anomaly_count = len(summary.get("anomalyAlerts", []))
 
     movers_rows_parts: List[str] = []
     for idx, x in enumerate(summary.get("movers", [])[:8], start=1):
@@ -515,6 +856,20 @@ def build_dashboard_html(
             f"<tr id='spike-row-{date_key}'><td>{idx}</td><td>{x['date']}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
         )
     spikes_rows = "\n".join(spikes_rows_parts) if spikes_rows_parts else "<tr><td colspan='5'>No spikes detected</td></tr>"
+
+    forecast_rows_parts: List[str] = []
+    for idx, x in enumerate((summary.get("forecast") or {}).get("predictions", [])[:14], start=1):
+        forecast_rows_parts.append(
+            f"<tr><td>{idx}</td><td>{x['date']}</td><td>{usd(float(x['costUSD']))}</td></tr>"
+        )
+    forecast_rows = "\n".join(forecast_rows_parts) if forecast_rows_parts else "<tr><td colspan='3'>Forecast unavailable (need at least 2 data points)</td></tr>"
+
+    anomaly_rows_parts: List[str] = []
+    for idx, x in enumerate(summary.get("anomalyAlerts", [])[-12:][::-1], start=1):
+        anomaly_rows_parts.append(
+            f"<tr><td>{idx}</td><td>{x['date']}</td><td>{usd(float(x['costUSD']))}</td><td>{x['zScore']:.2f}</td><td>{x['severity']}</td></tr>"
+        )
+    anomaly_rows = "\n".join(anomaly_rows_parts) if anomaly_rows_parts else "<tr><td colspan='5'>No anomaly alerts</td></tr>"
 
     spike_by_date: Dict[str, Dict[str, float]] = {}
     for s in visible_spikes:
@@ -567,7 +922,7 @@ def build_dashboard_html(
   <title>Token Usage Dashboard · {provider}</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 24px; color: #1f2937; }}
-    .grid {{ display: grid; grid-template-columns: repeat(5, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(7, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }}
     .card {{ border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 14px; background: #fff; }}
     .label {{ color: #6b7280; font-size: 12px; }}
     .value {{ font-size: 24px; font-weight: 700; margin-top: 4px; }}
@@ -609,6 +964,8 @@ def build_dashboard_html(
     <div class=\"card\"><div class=\"label\">Total cost</div><div class=\"value\">{usd(grand_total)}</div></div>
     <div class=\"card\"><div class=\"label\">7d trend vs prev 7d</div><div class=\"value\">{trend}</div></div>
     <div class=\"card\"><div class=\"label\">Spikes detected</div><div class=\"value\">{spike_count}</div></div>
+    <div class=\"card\"><div class=\"label\">Forecast next {forecast_days}d</div><div class=\"value\">{usd(forecast_total)}</div></div>
+    <div class=\"card\"><div class=\"label\">Anomaly alerts</div><div class=\"value\">{anomaly_count}</div></div>
   </div>
 
   <div class=\"chart-wrap\" id=\"chartWrap\">
@@ -633,6 +990,19 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>7d Baseline</th><th>Ratio</th></tr></thead>
     <tbody id="spikesBody">{spikes_rows}</tbody>
+  </table>
+
+  <h3>Cost Forecast (Next {forecast_days} Days)</h3>
+  <table>
+    <thead><tr><th>#</th><th>Date</th><th>Forecast Cost</th></tr></thead>
+    <tbody id="forecastBody">{forecast_rows}</tbody>
+  </table>
+
+  <h3>Anomaly Consumption Alerts</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Triggered when daily cost z-score ≥ {anomaly_z_threshold} over previous {anomaly_lookback_days} days.</div>
+  <table>
+    <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>Z-score</th><th>Severity</th></tr></thead>
+    <tbody id="anomalyBody">{anomaly_rows}</tbody>
   </table>
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
@@ -1332,6 +1702,11 @@ def main() -> int:
     parser.add_argument("--top-models", type=positive_int, default=6, help="Top models to chart")
     parser.add_argument("--spike-lookback-days", type=positive_int, default=7, help="Lookback window (days) for spike baseline")
     parser.add_argument("--spike-threshold-mult", type=positive_float, default=2.0, help="Spike threshold multiplier vs baseline")
+    parser.add_argument("--forecast-days", type=positive_int, default=7, help="Forecast N future days")
+    parser.add_argument("--forecast-lookback-days", type=positive_int, default=30, help="History window used for forecast regression")
+    parser.add_argument("--anomaly-lookback-days", type=positive_int, default=14, help="Lookback days used for anomaly z-score baseline")
+    parser.add_argument("--anomaly-z-threshold", type=positive_float, default=2.5, help="Alert when z-score is above this threshold")
+    parser.add_argument("--anomaly-min-cost", type=positive_float, default=0.01, help="Minimum daily cost required to emit anomaly alert")
     parser.add_argument("--output", default="token_usage_dashboard.html", help="Output HTML file path")
     parser.add_argument("--summary-json", help="Also write summary JSON to this path")
     parser.add_argument("--custom-report-json", help="Write custom report JSON to this path")
@@ -1340,11 +1715,48 @@ def main() -> int:
     parser.add_argument("--report-granularity", choices=["daily", "weekly", "monthly"], default="daily", help="Custom report time granularity")
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
-    parser.add_argument("--role", choices=["admin", "analyst", "viewer"], help="RBAC role used for data access")
-    parser.add_argument("--user", help="Username for role mapping (used with --rbac-config)")
+    parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
+    parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
+    parser.add_argument("--tenant-config", help="Path to multi-tenant organization config JSON")
+    parser.add_argument("--org-id", help="Organization ID for strict tenant isolation")
+    parser.add_argument("--dashboard-view", help="Dashboard view ID scoped to selected organization")
+    parser.add_argument("--allow-role-override", action="store_true", help="Allow --role to override user role in tenant mode")
+    parser.add_argument("--manage-users", choices=["list", "create", "update", "delete"], help="Manage users in tenant config then exit")
+    parser.add_argument("--target-user", help="Target username for --manage-users")
+    parser.add_argument("--target-role", help="Target role for --manage-users create/update")
+    parser.add_argument("--target-group", help="Target group for --manage-users create/update")
+    parser.add_argument("--manage-views", choices=["list", "create", "update", "delete", "assign", "unassign"], help="Manage dashboard views in tenant config then exit")
+    parser.add_argument("--view-id", help="Dashboard view ID for --manage-views")
+    parser.add_argument("--view-models", help="Comma-separated allowed model names for view create/update")
+    parser.add_argument("--view-max-days", type=positive_int, help="Max days filter for view create/update")
+    parser.add_argument("--view-group", help="Group name for view assign/unassign")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
+
+    if args.manage_users or args.manage_views:
+        if not args.tenant_config or not args.org_id:
+            eprint("--tenant-config and --org-id are required for tenant management operations.")
+            return 5
+        try:
+            result = manage_tenant_config(
+                tenant_config_path=args.tenant_config,
+                org_id=args.org_id,
+                user_action=args.manage_users,
+                target_user=args.target_user,
+                target_role=args.target_role,
+                target_group=args.target_group,
+                view_action=args.manage_views,
+                view_id=args.view_id,
+                view_models=args.view_models,
+                view_max_days=args.view_max_days,
+                view_group=args.view_group,
+            )
+        except Exception as exc:
+            eprint(f"Failed to manage tenant config: {exc}")
+            return 6
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
 
     try:
         payload = load_payload(args.input, args.provider)
@@ -1352,16 +1764,32 @@ def main() -> int:
         eprint(str(exc))
         return 1
 
-    rows = filter_days(parse_daily(payload), args.days)
+    tenant_meta: Dict[str, Any] = {}
+    if args.tenant_config:
+        try:
+            tenant_rows, role_name, policy, tenant_meta = resolve_multi_tenant_context(
+                payload=payload,
+                tenant_config_path=args.tenant_config,
+                org_id=args.org_id,
+                role=args.role,
+                user=args.user,
+                requested_dashboard=args.dashboard_view,
+            )
+        except Exception as exc:
+            eprint(f"Failed to resolve tenant context: {exc}")
+            return 3
+        rows = filter_days(tenant_rows, args.days)
+    else:
+        rows = filter_days(parse_daily(payload), args.days)
+        try:
+            role_name, policy = resolve_access_policy(args.role, args.user, args.rbac_config)
+        except Exception as exc:
+            eprint(f"Failed to resolve RBAC policy: {exc}")
+            return 3
+
     if not rows:
         eprint("No daily rows found in payload.")
         return 2
-
-    try:
-        role_name, policy = resolve_access_policy(args.role, args.user, args.rbac_config)
-    except Exception as exc:
-        eprint(f"Failed to resolve RBAC policy: {exc}")
-        return 3
 
     rows = apply_access_policy(rows, policy)
 
@@ -1371,6 +1799,11 @@ def main() -> int:
         top_models=args.top_models,
         spike_lookback_days=args.spike_lookback_days,
         spike_threshold_mult=args.spike_threshold_mult,
+        forecast_days=args.forecast_days,
+        forecast_lookback_days=args.forecast_lookback_days,
+        anomaly_lookback_days=args.anomaly_lookback_days,
+        anomaly_z_threshold=args.anomaly_z_threshold,
+        anomaly_min_cost=args.anomaly_min_cost,
         max_table_rows=args.max_table_rows,
         chart_max_points=args.chart_max_points,
         role_name=role_name,
@@ -1385,9 +1818,16 @@ def main() -> int:
             rows,
             spike_lookback_days=args.spike_lookback_days,
             spike_threshold_mult=args.spike_threshold_mult,
+            forecast_days=args.forecast_days,
+            forecast_lookback_days=args.forecast_lookback_days,
+            anomaly_lookback_days=args.anomaly_lookback_days,
+            anomaly_z_threshold=args.anomaly_z_threshold,
+            anomaly_min_cost=args.anomaly_min_cost,
         )
         summary["role"] = role_name
         summary["policy"] = policy
+        if tenant_meta:
+            summary["tenant"] = tenant_meta
         Path(args.summary_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.custom_report_json:
@@ -1404,6 +1844,7 @@ def main() -> int:
             "metrics": metrics,
             "models": models,
             "rows": report_rows,
+            "tenant": tenant_meta or None,
         }
         Path(args.custom_report_json).write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

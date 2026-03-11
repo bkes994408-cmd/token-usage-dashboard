@@ -6,6 +6,7 @@ Generate a local HTML dashboard for CodexBar model usage/cost data.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import subprocess
@@ -25,7 +26,6 @@ DEFAULT_ROLE_POLICIES: Dict[str, Dict[str, Any]] = {
         "canViewSpikes": True,
         "canViewMovers": True,
         "canUseCustomReportBuilder": True,
-        "canViewPatternAnalysis": True,
     },
     "analyst": {
         "canViewTotals": True,
@@ -34,7 +34,6 @@ DEFAULT_ROLE_POLICIES: Dict[str, Dict[str, Any]] = {
         "canViewSpikes": True,
         "canViewMovers": True,
         "canUseCustomReportBuilder": True,
-        "canViewPatternAnalysis": True,
     },
     "viewer": {
         "canViewTotals": True,
@@ -43,7 +42,6 @@ DEFAULT_ROLE_POLICIES: Dict[str, Dict[str, Any]] = {
         "canViewSpikes": False,
         "canViewMovers": False,
         "canUseCustomReportBuilder": False,
-        "canViewPatternAnalysis": False,
     },
 }
 
@@ -196,170 +194,6 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return default
-
-
-def _normalize_call_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Build normalized per-call records from row-level payloads.
-
-    Supported nested keys (per day): llmCalls/apiCalls/requests/events.
-    """
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        day = str(row.get("date") or "")
-        for key in ("llmCalls", "apiCalls", "requests", "events"):
-            raw_calls = row.get(key)
-            if not isinstance(raw_calls, list):
-                continue
-            for c in raw_calls:
-                if not isinstance(c, dict):
-                    continue
-                prompt_tokens = _safe_float(c.get("promptTokens") or c.get("inputTokens"))
-                completion_tokens = _safe_float(c.get("completionTokens") or c.get("outputTokens"))
-                total_tokens = _safe_float(c.get("totalTokens"), prompt_tokens + completion_tokens)
-                cost = _safe_float(c.get("cost") or c.get("costUSD"))
-                latency_ms = _safe_float(c.get("latencyMs") or c.get("responseMs") or c.get("durationMs"), default=-1.0)
-                model = c.get("modelName") or c.get("model") or "unknown"
-                model_type = c.get("modelType") or str(model).split("-")[0]
-                task = c.get("useCase") or c.get("task") or c.get("scenario") or "unspecified"
-                out.append(
-                    {
-                        "date": day,
-                        "model": str(model),
-                        "modelType": str(model_type),
-                        "task": str(task),
-                        "user": str(c.get("userId") or c.get("user") or "unknown"),
-                        "project": str(c.get("projectId") or c.get("project") or "unknown"),
-                        "session": str(c.get("sessionId") or c.get("conversationId") or "unknown"),
-                        "workflow": str(c.get("workflowId") or c.get("flowId") or task),
-                        "promptTokens": prompt_tokens,
-                        "completionTokens": completion_tokens,
-                        "totalTokens": total_tokens,
-                        "costUSD": cost,
-                        "latencyMs": latency_ms if latency_ms >= 0 else None,
-                        "prompt": str(c.get("prompt") or ""),
-                    }
-                )
-    return out
-
-
-def _quantile(sorted_values: List[float], q: float) -> float:
-    if not sorted_values:
-        return 0.0
-    idx = (len(sorted_values) - 1) * q
-    lo = int(idx)
-    hi = min(len(sorted_values) - 1, lo + 1)
-    frac = idx - lo
-    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
-
-
-def _top_dimension(records: List[Dict[str, Any]], key: str, limit: int = 8) -> List[Dict[str, Any]]:
-    agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "totalTokens": 0.0, "promptTokens": 0.0, "completionTokens": 0.0, "count": 0.0})
-    for r in records:
-        dim = str(r.get(key) or "unknown")
-        agg[dim]["costUSD"] += _safe_float(r.get("costUSD"))
-        agg[dim]["totalTokens"] += _safe_float(r.get("totalTokens"))
-        agg[dim]["promptTokens"] += _safe_float(r.get("promptTokens"))
-        agg[dim]["completionTokens"] += _safe_float(r.get("completionTokens"))
-        agg[dim]["count"] += 1.0
-    ranked = sorted(agg.items(), key=lambda kv: (kv[1]["costUSD"], kv[1]["totalTokens"]), reverse=True)
-    return [{"key": k, **v} for k, v in ranked[:limit]]
-
-
-def _tokenize_prompt_anonymized(text: str) -> List[str]:
-    masked = (text or "").lower()
-    # Mask sensitive patterns before tokenization
-    masked = re.sub(r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b", " <email> ", masked)
-    masked = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", " <uuid> ", masked)
-    masked = re.sub(r"\b\d{6,}\b", " <number> ", masked)
-
-    cleaned = re.findall(r"[\w<>-]+", masked)
-    stop = {"the", "and", "for", "that", "this", "with", "from", "are", "was", "you", "your", "請", "幫", "一下", "一個", "我們", "需要", "分析"}
-    out: List[str] = []
-    for t in cleaned:
-        if t in {"<email>", "<uuid>", "<number>"}:
-            out.append(t)
-            continue
-        if len(t) < 3 or t in stop:
-            continue
-        # Mask probable long IDs with mixed alnum (session / trace IDs)
-        if len(t) >= 12 and any(ch.isdigit() for ch in t) and any(ch.isalpha() for ch in t):
-            out.append("<id>")
-            continue
-        out.append(t)
-    return out
-
-
-def build_llm_pattern_analysis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    records = _normalize_call_records(rows)
-    if not records:
-        return {"available": False, "reason": "No call-level payload (llmCalls/apiCalls/requests/events)."}
-
-    prompt_values = sorted([_safe_float(r.get("promptTokens")) for r in records])
-    completion_values = sorted([_safe_float(r.get("completionTokens")) for r in records])
-
-    by_model = _top_dimension(records, "model")
-    by_model_type = _top_dimension(records, "modelType")
-    by_task = _top_dimension(records, "task")
-    by_user = _top_dimension(records, "user")
-    by_project = _top_dimension(records, "project")
-
-    # high-consumption hotspots
-    top_calls = sorted(records, key=lambda r: (_safe_float(r.get("costUSD")), _safe_float(r.get("totalTokens"))), reverse=True)[:10]
-    by_session = _top_dimension(records, "session", limit=10)
-    by_workflow = _top_dimension(records, "workflow", limit=10)
-
-    # model efficiency
-    efficiency: List[Dict[str, Any]] = []
-    for m in by_model:
-        total_tokens = _safe_float(m.get("totalTokens"))
-        total_cost = _safe_float(m.get("costUSD"))
-        matching = [r for r in records if r.get("model") == m.get("key") and isinstance(r.get("latencyMs"), (int, float))]
-        avg_latency = (sum(float(r["latencyMs"]) for r in matching) / len(matching)) if matching else None
-        efficiency.append(
-            {
-                "model": m.get("key"),
-                "costUSD": total_cost,
-                "totalTokens": total_tokens,
-                "costPer1kTokensUSD": (total_cost / total_tokens * 1000.0) if total_tokens > 0 else None,
-                "avgLatencyMs": avg_latency,
-                "sampleCount": int(m.get("count", 0)),
-            }
-        )
-
-    keyword_counts: Dict[str, int] = defaultdict(int)
-    for r in records:
-        for tk in _tokenize_prompt_anonymized(str(r.get("prompt") or "")):
-            keyword_counts[tk] += 1
-    top_keywords = sorted(keyword_counts.items(), key=lambda kv: kv[1], reverse=True)[:20]
-
-    return {
-        "available": True,
-        "calls": len(records),
-        "promptTokens": {
-            "avg": sum(prompt_values) / len(prompt_values),
-            "p50": _quantile(prompt_values, 0.5),
-            "p95": _quantile(prompt_values, 0.95),
-        },
-        "completionTokens": {
-            "avg": sum(completion_values) / len(completion_values),
-            "p50": _quantile(completion_values, 0.5),
-            "p95": _quantile(completion_values, 0.95),
-        },
-        "dimensions": {
-            "byModel": by_model,
-            "byModelType": by_model_type,
-            "byTask": by_task,
-            "byUser": by_user,
-            "byProject": by_project,
-        },
-        "hotspots": {
-            "topApiCalls": top_calls,
-            "topSessions": by_session,
-            "topWorkflows": by_workflow,
-        },
-        "efficiency": efficiency,
-        "anonymizedPromptKeywords": [{"keyword": k, "count": v} for k, v in top_keywords],
-    }
 
 
 def _load_rbac_config(path: Optional[str]) -> Dict[str, Any]:
@@ -739,7 +573,11 @@ def evaluate_alert_rules(
 
     budget_threshold = _safe_float(rules.get("budgetThresholdUSD"), default=0.0)
     budget_forecast_pct = _safe_float(rules.get("budgetForecastPct"), default=100.0)
-    anomaly_count_threshold = int(rules.get("anomalyCountThreshold", 1) or 1)
+    try:
+        anomaly_count_threshold = int(rules.get("anomalyCountThreshold", 1) or 1)
+    except (TypeError, ValueError):
+        anomaly_count_threshold = 1
+    anomaly_count_threshold = max(1, anomaly_count_threshold)
 
     triggered: List[Dict[str, Any]] = []
     if budget_threshold > 0:
@@ -803,6 +641,15 @@ def prepare_chart_series(rows: List[Dict[str, Any]], top_models: int) -> Tuple[L
 def usd(v: float) -> str:
     return f"${v:,.2f}"
 
+
+def esc(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def json_for_script(value: Any) -> str:
+    return json.dumps(value).replace("<", "\\u003c")
+
+
 def build_model_table_rows(models_ranked: List[Tuple[str, float]], grand_total: float, max_rows: int) -> str:
     if max_rows < 1:
         max_rows = 1
@@ -810,7 +657,7 @@ def build_model_table_rows(models_ranked: List[Tuple[str, float]], grand_total: 
     hidden = models_ranked[max_rows:]
 
     rows = [
-        f"<tr><td>{idx}</td><td>{m}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
+        f"<tr><td>{idx}</td><td>{esc(m)}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
         for idx, (m, c) in enumerate(visible, start=1)
     ]
 
@@ -877,7 +724,6 @@ def build_summary(
     movers.sort(key=lambda x: x["deltaCostUSD"], reverse=True)
 
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
-    pattern_analysis = build_llm_pattern_analysis(rows)
     forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
     forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
     anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
@@ -903,7 +749,6 @@ def build_summary(
         },
         "costAnomalies": anomalies,
         "alerts": alerts,
-        "llmPatternAnalysis": pattern_analysis,
     }
 
 
@@ -1010,7 +855,7 @@ def build_dashboard_html(
     for idx, x in enumerate(summary.get("movers", [])[:8], start=1):
         pct = f"{x['deltaPct']:+.1f}%" if isinstance(x.get("deltaPct"), (int, float)) else "N/A"
         movers_rows_parts.append(
-            f"<tr><td>{idx}</td><td>{x['model']}</td><td>{usd(float(x['last7dCostUSD']))}</td><td>{usd(float(x['prev7dCostUSD']))}</td><td>{usd(float(x['deltaCostUSD']))}</td><td>{pct}</td></tr>"
+            f"<tr><td>{idx}</td><td>{esc(x['model'])}</td><td>{usd(float(x['last7dCostUSD']))}</td><td>{usd(float(x['prev7dCostUSD']))}</td><td>{usd(float(x['deltaCostUSD']))}</td><td>{pct}</td></tr>"
         )
     movers_rows = "\n".join(movers_rows_parts)
 
@@ -1018,8 +863,9 @@ def build_dashboard_html(
     spikes_rows_parts: List[str] = []
     for idx, x in enumerate(visible_spikes[:10], start=1):
         date_key = str(x["date"])
+        safe_date_key = re.sub(r"[^a-zA-Z0-9_-]", "_", date_key)
         spikes_rows_parts.append(
-            f"<tr id='spike-row-{date_key}'><td>{idx}</td><td>{x['date']}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
+            f"<tr id='spike-row-{safe_date_key}' data-date='{esc(date_key)}'><td>{idx}</td><td>{esc(x['date'])}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
         )
     spikes_rows = "\n".join(spikes_rows_parts) if spikes_rows_parts else "<tr><td colspan='5'>No spikes detected</td></tr>"
 
@@ -1029,58 +875,15 @@ def build_dashboard_html(
     anomalies = summary.get("costAnomalies") if isinstance(summary.get("costAnomalies"), list) else []
     alerts = summary.get("alerts") if isinstance(summary.get("alerts"), dict) else {}
     alert_rows = "\n".join([
-        f"<tr><td>{i+1}</td><td>{a.get('rule')}</td><td>{a.get('severity')}</td><td>{a.get('message')}</td></tr>"
+        f"<tr><td>{i+1}</td><td>{esc(a.get('rule'))}</td><td>{esc(a.get('severity'))}</td><td>{esc(a.get('message'))}</td></tr>"
         for i, a in enumerate(alerts.get("triggered", [])[:8])
     ]) or "<tr><td colspan='4'>No alert triggered</td></tr>"
     anomaly_rows = "\n".join([
-        f"<tr><td>{i+1}</td><td>{a.get('date')}</td><td>{usd(float(a.get('costUSD', 0.0)))}</td><td>{float(a.get('zScore', 0.0)):.2f}</td><td>{a.get('severity')}</td></tr>"
+        f"<tr><td>{i+1}</td><td>{esc(a.get('date'))}</td><td>{usd(float(a.get('costUSD', 0.0)))}</td><td>{float(a.get('zScore', 0.0)):.2f}</td><td>{esc(a.get('severity'))}</td></tr>"
         for i, a in enumerate(anomalies[:10])
     ]) or "<tr><td colspan='5'>No anomaly detected</td></tr>"
-
-    pattern = summary.get("llmPatternAnalysis") if isinstance(summary.get("llmPatternAnalysis"), dict) else {"available": False}
-    def _render_pattern_rows(items: List[Dict[str, Any]], key_name: str = "key") -> str:
-        if not items:
-            return "<tr><td colspan='5'>No data</td></tr>"
-        out_rows: List[str] = []
-        for idx, item in enumerate(items[:8], start=1):
-            out_rows.append(
-                f"<tr><td>{idx}</td><td>{item.get(key_name, 'unknown')}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{int(float(item.get('count', 0.0)))}</td></tr>"
-            )
-        return "\n".join(out_rows)
-
-    pattern_model_rows = _render_pattern_rows(pattern.get("dimensions", {}).get("byModel", [])) if pattern.get("available") else "<tr><td colspan='5'>No call-level analysis data</td></tr>"
-    pattern_model_type_rows = _render_pattern_rows(pattern.get("dimensions", {}).get("byModelType", [])) if pattern.get("available") else "<tr><td colspan='5'>No call-level analysis data</td></tr>"
-    pattern_project_rows = _render_pattern_rows(pattern.get("dimensions", {}).get("byProject", [])) if pattern.get("available") else "<tr><td colspan='5'>No call-level analysis data</td></tr>"
-    pattern_task_rows = _render_pattern_rows(pattern.get("dimensions", {}).get("byTask", [])) if pattern.get("available") else "<tr><td colspan='5'>No call-level analysis data</td></tr>"
-    pattern_user_rows = _render_pattern_rows(pattern.get("dimensions", {}).get("byUser", [])) if pattern.get("available") else "<tr><td colspan='5'>No call-level analysis data</td></tr>"
-    pattern_eff_rows = "<tr><td colspan='6'>No efficiency data</td></tr>"
-    if pattern.get("available") and isinstance(pattern.get("efficiency"), list) and pattern.get("efficiency"):
-        buf: List[str] = []
-        for idx, item in enumerate(pattern["efficiency"][:8], start=1):
-            cpk = item.get("costPer1kTokensUSD")
-            lat = item.get("avgLatencyMs")
-            buf.append(f"<tr><td>{idx}</td><td>{item.get('model', 'unknown')}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{(f'{cpk:.4f}' if isinstance(cpk, (int, float)) else 'N/A')}</td><td>{(f'{lat:.1f}' if isinstance(lat, (int, float)) else 'N/A')}</td></tr>")
-        pattern_eff_rows = "\n".join(buf)
-
-    keyword_rows = "<tr><td colspan='3'>No keyword data</td></tr>"
-    if pattern.get("available") and isinstance(pattern.get("anonymizedPromptKeywords"), list) and pattern.get("anonymizedPromptKeywords"):
-        keyword_rows = "\n".join([f"<tr><td>{i+1}</td><td>{k.get('keyword')}</td><td>{k.get('count')}</td></tr>" for i, k in enumerate(pattern.get("anonymizedPromptKeywords", [])[:12])])
-
-    def _render_hotspot_rows(items: List[Dict[str, Any]], key_name: str) -> str:
-        if not items:
-            return "<tr><td colspan='4'>No data</td></tr>"
-        return "\n".join([
-            f"<tr><td>{i+1}</td><td>{x.get(key_name, 'unknown')}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{float(x.get('totalTokens', 0.0)):,.0f}</td></tr>"
-            for i, x in enumerate(items[:10])
-        ])
-
-    top_api_rows = _render_hotspot_rows(pattern.get("hotspots", {}).get("topApiCalls", []), "model") if pattern.get("available") else "<tr><td colspan='4'>No call-level analysis data</td></tr>"
-    top_session_rows = _render_hotspot_rows(pattern.get("hotspots", {}).get("topSessions", []), "key") if pattern.get("available") else "<tr><td colspan='4'>No call-level analysis data</td></tr>"
-    top_workflow_rows = _render_hotspot_rows(pattern.get("hotspots", {}).get("topWorkflows", []), "key") if pattern.get("available") else "<tr><td colspan='4'>No call-level analysis data</td></tr>"
-
-    prompt_stats = pattern.get("promptTokens", {}) if pattern.get("available") else {}
-    completion_stats = pattern.get("completionTokens", {}) if pattern.get("available") else {}
-
+    notification_channels = alerts.get("notificationChannels", []) if isinstance(alerts.get("notificationChannels"), list) else []
+    notification_channels_text = ", ".join(str(c) for c in notification_channels) if notification_channels else "not configured"
 
     spike_by_date: Dict[str, Dict[str, float]] = {}
     for s in visible_spikes:
@@ -1114,23 +917,23 @@ def build_dashboard_html(
         day_breakdown_by_date[d] = [{"model": n, "costUSD": c} for n, c in ranked]
         day_total_by_date[d] = sum(model_map.values())
 
-    json_labels = json.dumps(labels)
-    json_series = json.dumps(series)
-    json_day_totals = json.dumps(day_totals)
+    json_labels = json_for_script(labels)
+    json_series = json_for_script(series)
+    json_day_totals = json_for_script(day_totals)
     all_models = sorted({str(x["model"]) for day in day_breakdown_by_date.values() for x in day if isinstance(x, dict) and isinstance(x.get("model"), str)})
 
-    json_spike_by_date = json.dumps(spike_by_date)
-    json_day_breakdown_by_date = json.dumps(day_breakdown_by_date)
-    json_day_total_by_date = json.dumps(day_total_by_date)
-    json_all_models = json.dumps(all_models)
-    json_policy = json.dumps(policy)
+    json_spike_by_date = json_for_script(spike_by_date)
+    json_day_breakdown_by_date = json_for_script(day_breakdown_by_date)
+    json_day_total_by_date = json_for_script(day_total_by_date)
+    json_all_models = json_for_script(all_models)
+    json_policy = json_for_script(policy)
 
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
-  <title>Token Usage Dashboard · {provider}</title>
+  <title>Token Usage Dashboard · {esc(provider)}</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 24px; color: #1f2937; }}
     .grid {{ display: grid; grid-template-columns: repeat(5, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }}
@@ -1154,8 +957,8 @@ def build_dashboard_html(
   </style>
 </head>
 <body>
-  <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Role: <strong>{role_name}</strong></div>
+  <h2>Token Usage Dashboard · {esc(provider)}</h2>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Role: <strong>{esc(role_name)}</strong></div>
   <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · Home/End first/last day · s toggle spike-only · d sort DoD · x changes-only · r reset to latest · c copy link · ? help</div>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
     <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
@@ -1171,7 +974,7 @@ def build_dashboard_html(
   </div>
   <div class=\"grid\">
     <div class=\"card\"><div class=\"label\">Date range rows</div><div class=\"value\">{len(rows)}</div></div>
-    <div class=\"card\"><div class=\"label\">Latest day</div><div class=\"value\">{latest_day}</div></div>
+    <div class=\"card\"><div class=\"label\">Latest day</div><div class=\"value\">{esc(latest_day)}</div></div>
     <div class=\"card\"><div class=\"label\">Total cost</div><div class=\"value\">{usd(grand_total)}</div></div>
     <div class=\"card\"><div class=\"label\">7d trend vs prev 7d</div><div class=\"value\">{trend}</div></div>
     <div class=\"card\"><div class=\"label\">Spikes detected</div><div class=\"value\">{spike_count}</div></div>
@@ -1216,70 +1019,12 @@ def build_dashboard_html(
     <tbody>{anomaly_rows}</tbody>
   </table>
   <h4>Triggered Alerts</h4>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Notification channels: {', '.join(alerts.get('notificationChannels', [])) if alerts.get('notificationChannels') else 'not configured'}</div>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Notification channels: {esc(notification_channels_text)}</div>
   <table>
     <thead><tr><th>#</th><th>Rule</th><th>Severity</th><th>Message</th></tr></thead>
     <tbody>{alert_rows}</tbody>
   </table>
 
-  <h3>LLM Usage Pattern Deep Analysis</h3>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Prompt/completion distribution, high-consumption hotspots, model efficiency, and anonymized prompt themes.</div>
-  <table>
-    <thead><tr><th>Metric</th><th>avg</th><th>p50</th><th>p95</th></tr></thead>
-    <tbody>
-      <tr><td>Prompt tokens</td><td>{float(prompt_stats.get('avg', 0.0)):.2f}</td><td>{float(prompt_stats.get('p50', 0.0)):.2f}</td><td>{float(prompt_stats.get('p95', 0.0)):.2f}</td></tr>
-      <tr><td>Completion tokens</td><td>{float(completion_stats.get('avg', 0.0)):.2f}</td><td>{float(completion_stats.get('p50', 0.0)):.2f}</td><td>{float(completion_stats.get('p95', 0.0)):.2f}</td></tr>
-    </tbody>
-  </table>
-  <table>
-    <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Tokens</th><th>Calls</th></tr></thead>
-    <tbody>{pattern_model_rows}</tbody>
-  </table>
-  <h4>By Model Type</h4>
-  <table>
-    <thead><tr><th>#</th><th>Model Type</th><th>Cost</th><th>Tokens</th><th>Calls</th></tr></thead>
-    <tbody>{pattern_model_type_rows}</tbody>
-  </table>
-  <h4>By Project</h4>
-  <table>
-    <thead><tr><th>#</th><th>Project</th><th>Cost</th><th>Tokens</th><th>Calls</th></tr></thead>
-    <tbody>{pattern_project_rows}</tbody>
-  </table>
-  <h4>By Task/Use Case</h4>
-  <table>
-    <thead><tr><th>#</th><th>Task</th><th>Cost</th><th>Tokens</th><th>Calls</th></tr></thead>
-    <tbody>{pattern_task_rows}</tbody>
-  </table>
-  <h4>By User</h4>
-  <table>
-    <thead><tr><th>#</th><th>User</th><th>Cost</th><th>Tokens</th><th>Calls</th></tr></thead>
-    <tbody>{pattern_user_rows}</tbody>
-  </table>
-  <h4>Hotspots · Top API Calls</h4>
-  <table>
-    <thead><tr><th>#</th><th>Model/Call</th><th>Cost</th><th>Tokens</th></tr></thead>
-    <tbody>{top_api_rows}</tbody>
-  </table>
-  <h4>Hotspots · Top Sessions</h4>
-  <table>
-    <thead><tr><th>#</th><th>Session</th><th>Cost</th><th>Tokens</th></tr></thead>
-    <tbody>{top_session_rows}</tbody>
-  </table>
-  <h4>Hotspots · Top Workflows</h4>
-  <table>
-    <thead><tr><th>#</th><th>Workflow</th><th>Cost</th><th>Tokens</th></tr></thead>
-    <tbody>{top_workflow_rows}</tbody>
-  </table>
-  <h4>Model Efficiency (Cost/Token + Latency)</h4>
-  <table>
-    <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Tokens</th><th>Cost / 1K tokens (USD)</th><th>Avg Latency (ms)</th></tr></thead>
-    <tbody>{pattern_eff_rows}</tbody>
-  </table>
-  <h4>Anonymized Prompt Keywords</h4>
-  <table>
-    <thead><tr><th>#</th><th>Keyword</th><th>Count</th></tr></thead>
-    <tbody>{keyword_rows}</tbody>
-  </table>
 
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
@@ -1664,7 +1409,7 @@ def build_dashboard_html(
     function focusSpikeDate(d, scrollRow = false) {{
       if (!spikeByDate[d]) return;
       focusDate(d);
-      const row = document.getElementById(`spike-row-${{d}}`);
+      const row = spikesBody ? spikesBody.querySelector(`tr[data-date="${{d}}"]`) : null;
       if (!row) return;
       if (scrollRow) row.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
       row.classList.add('spike-focus');
@@ -1766,7 +1511,7 @@ def build_dashboard_html(
     spikesBody?.addEventListener('click', (ev) => {{
       const tr = ev.target?.closest?.("tr[id^='spike-row-']");
       if (!tr) return;
-      const d = tr.id.replace('spike-row-', '');
+      const d = tr.getAttribute('data-date') || '';
       focusSpikeDate(d, false);
     }});
 
@@ -1931,9 +1676,6 @@ def build_dashboard_html(
     }}
     if (!accessPolicy.canViewSpikes) {{
       hideSectionByHeading('Daily Cost Spikes', 'You do not have permission to view spikes.');
-    }}
-    if (!accessPolicy.canViewPatternAnalysis) {{
-      hideSectionByHeading('LLM Usage Pattern Deep Analysis', 'You do not have permission to view deep usage pattern analysis.');
     }}
     if (!accessPolicy.canUseCustomReportBuilder) {{
       hideSectionByHeading('Custom Report Builder', 'You do not have permission to use custom reports.');

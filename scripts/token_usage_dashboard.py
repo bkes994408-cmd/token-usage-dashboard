@@ -372,6 +372,16 @@ def _load_rbac_config(path: Optional[str]) -> Dict[str, Any]:
     return parsed
 
 
+def _load_alert_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Alert config must be a JSON object.")
+    return parsed
+
+
 def resolve_access_policy(role: Optional[str], user: Optional[str], rbac_config_path: Optional[str]) -> Tuple[str, Dict[str, Any]]:
     cfg = _load_rbac_config(rbac_config_path)
     users = cfg.get("users") if isinstance(cfg.get("users"), dict) else {}
@@ -666,6 +676,97 @@ def detect_spikes(rows: List[Dict[str, Any]], lookback_days: int = 7, threshold_
     return spikes
 
 
+def forecast_cost(rows: List[Dict[str, Any]], horizon_days: int = 7, lookback_days: int = 14) -> Dict[str, Any]:
+    daily = [day_total_cost(r) for r in rows]
+    if not daily:
+        return {"horizonDays": horizon_days, "predictedTotalCostUSD": 0.0, "method": "moving_average"}
+
+    window = daily[-max(1, lookback_days):]
+    avg = sum(window) / len(window)
+    trend = 0.0
+    if len(window) >= 2:
+        trend = (window[-1] - window[0]) / float(len(window) - 1)
+
+    predicted_days: List[float] = []
+    for i in range(1, horizon_days + 1):
+        val = max(0.0, avg + trend * i)
+        predicted_days.append(val)
+
+    return {
+        "horizonDays": horizon_days,
+        "predictedTotalCostUSD": sum(predicted_days),
+        "predictedAvgDailyCostUSD": (sum(predicted_days) / horizon_days) if horizon_days > 0 else 0.0,
+        "baselineAvgDailyCostUSD": avg,
+        "dailyTrendUSD": trend,
+        "method": "moving_average_plus_linear_trend",
+    }
+
+
+def detect_cost_anomalies(rows: List[Dict[str, Any]], lookback_days: int = 7, z_threshold: float = 2.5) -> List[Dict[str, Any]]:
+    daily = [day_total_cost(r) for r in rows]
+    out: List[Dict[str, Any]] = []
+    for i in range(len(daily)):
+        if i < lookback_days:
+            continue
+        w = daily[i - lookback_days:i]
+        if not w:
+            continue
+        mean = sum(w) / len(w)
+        var = sum((x - mean) ** 2 for x in w) / len(w)
+        std = var ** 0.5
+        curr = daily[i]
+        z = ((curr - mean) / std) if std > 1e-12 else 0.0
+        if z >= z_threshold:
+            out.append({
+                "date": rows[i].get("date"),
+                "costUSD": curr,
+                "baselineMeanUSD": mean,
+                "zScore": z,
+                "severity": "high" if z >= (z_threshold + 1.0) else "medium",
+            })
+    return out
+
+
+def evaluate_alert_rules(
+    rows: List[Dict[str, Any]],
+    forecast_7d: Dict[str, Any],
+    anomalies: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = config or {}
+    rules = cfg.get("rules") if isinstance(cfg.get("rules"), dict) else {}
+    channels = cfg.get("notificationChannels") if isinstance(cfg.get("notificationChannels"), list) else []
+
+    budget_threshold = _safe_float(rules.get("budgetThresholdUSD"), default=0.0)
+    budget_forecast_pct = _safe_float(rules.get("budgetForecastPct"), default=100.0)
+    anomaly_count_threshold = int(rules.get("anomalyCountThreshold", 1) or 1)
+
+    triggered: List[Dict[str, Any]] = []
+    if budget_threshold > 0:
+        predicted = _safe_float(forecast_7d.get("predictedTotalCostUSD"))
+        ratio = (predicted / budget_threshold * 100.0) if budget_threshold > 0 else 0.0
+        if ratio >= budget_forecast_pct:
+            triggered.append({
+                "rule": "budget_forecast_threshold",
+                "severity": "high" if ratio >= 120 else "medium",
+                "message": f"7-day forecast {predicted:.2f} USD reached {ratio:.1f}% of budget ({budget_threshold:.2f} USD)",
+            })
+
+    if len(anomalies) >= anomaly_count_threshold:
+        last = anomalies[-1]
+        triggered.append({
+            "rule": "anomaly_count_threshold",
+            "severity": "high" if len(anomalies) >= (anomaly_count_threshold + 2) else "medium",
+            "message": f"Detected {len(anomalies)} anomalies in recent window. Latest: {last.get('date')} z={float(last.get('zScore', 0.0)):.2f}",
+        })
+
+    return {
+        "rules": rules,
+        "notificationChannels": [str(x) for x in channels],
+        "triggered": triggered,
+    }
+
+
 def prepare_chart_series(rows: List[Dict[str, Any]], top_models: int) -> Tuple[List[str], Dict[str, List[float]], List[float]]:
     totals = model_totals(rows)
     top = [m for m, _ in sorted(totals.items(), key=lambda x: x[1], reverse=True)[:top_models]]
@@ -747,6 +848,7 @@ def build_summary(
     rows: List[Dict[str, Any]],
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
+    alert_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -776,6 +878,10 @@ def build_summary(
 
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
     pattern_analysis = build_llm_pattern_analysis(rows)
+    forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
+    forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
+    anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
+    alerts = evaluate_alert_rules(rows, forecast7, anomalies, config=alert_config)
 
     return {
         "provider": provider,
@@ -791,6 +897,12 @@ def build_summary(
         "models": [{"model": m, "totalCostUSD": c} for m, c in ranked],
         "movers": movers,
         "spikes": spikes,
+        "forecast": {
+            "next7Days": forecast7,
+            "next30Days": forecast30,
+        },
+        "costAnomalies": anomalies,
+        "alerts": alerts,
         "llmPatternAnalysis": pattern_analysis,
     }
 
@@ -867,6 +979,7 @@ def build_dashboard_html(
     chart_max_points: int = 1200,
     role_name: str = "admin",
     policy: Optional[Dict[str, Any]] = None,
+    alert_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -889,6 +1002,7 @@ def build_dashboard_html(
         rows,
         spike_lookback_days=spike_lookback_days,
         spike_threshold_mult=spike_threshold_mult,
+        alert_config=alert_config,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -909,6 +1023,19 @@ def build_dashboard_html(
         )
     spikes_rows = "\n".join(spikes_rows_parts) if spikes_rows_parts else "<tr><td colspan='5'>No spikes detected</td></tr>"
 
+    forecast = summary.get("forecast") if isinstance(summary.get("forecast"), dict) else {}
+    f7 = forecast.get("next7Days") if isinstance(forecast.get("next7Days"), dict) else {}
+    f30 = forecast.get("next30Days") if isinstance(forecast.get("next30Days"), dict) else {}
+    anomalies = summary.get("costAnomalies") if isinstance(summary.get("costAnomalies"), list) else []
+    alerts = summary.get("alerts") if isinstance(summary.get("alerts"), dict) else {}
+    alert_rows = "\n".join([
+        f"<tr><td>{i+1}</td><td>{a.get('rule')}</td><td>{a.get('severity')}</td><td>{a.get('message')}</td></tr>"
+        for i, a in enumerate(alerts.get("triggered", [])[:8])
+    ]) or "<tr><td colspan='4'>No alert triggered</td></tr>"
+    anomaly_rows = "\n".join([
+        f"<tr><td>{i+1}</td><td>{a.get('date')}</td><td>{usd(float(a.get('costUSD', 0.0)))}</td><td>{float(a.get('zScore', 0.0)):.2f}</td><td>{a.get('severity')}</td></tr>"
+        for i, a in enumerate(anomalies[:10])
+    ]) or "<tr><td colspan='5'>No anomaly detected</td></tr>"
 
     pattern = summary.get("llmPatternAnalysis") if isinstance(summary.get("llmPatternAnalysis"), dict) else {"available": False}
     def _render_pattern_rows(items: List[Dict[str, Any]], key_name: str = "key") -> str:
@@ -1072,6 +1199,27 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>7d Baseline</th><th>Ratio</th></tr></thead>
     <tbody id="spikesBody">{spikes_rows}</tbody>
+  </table>
+
+  <h3>Cost Forecast & Anomaly Alerts</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Forecast windows: next 7/30 days + anomaly detection (z-score) + configurable alert rules.</div>
+  <table>
+    <thead><tr><th>Window</th><th>Predicted Total Cost</th><th>Predicted Avg Daily</th><th>Baseline Avg Daily</th><th>Trend / day</th></tr></thead>
+    <tbody>
+      <tr><td>Next 7 days</td><td>{usd(float(f7.get('predictedTotalCostUSD', 0.0)))}</td><td>{usd(float(f7.get('predictedAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f7.get('baselineAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f7.get('dailyTrendUSD', 0.0)))}</td></tr>
+      <tr><td>Next 30 days</td><td>{usd(float(f30.get('predictedTotalCostUSD', 0.0)))}</td><td>{usd(float(f30.get('predictedAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f30.get('baselineAvgDailyCostUSD', 0.0)))}</td><td>{usd(float(f30.get('dailyTrendUSD', 0.0)))}</td></tr>
+    </tbody>
+  </table>
+  <h4>Detected Cost Anomalies</h4>
+  <table>
+    <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>Z-score</th><th>Severity</th></tr></thead>
+    <tbody>{anomaly_rows}</tbody>
+  </table>
+  <h4>Triggered Alerts</h4>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Notification channels: {', '.join(alerts.get('notificationChannels', [])) if alerts.get('notificationChannels') else 'not configured'}</div>
+  <table>
+    <thead><tr><th>#</th><th>Rule</th><th>Severity</th><th>Message</th></tr></thead>
+    <tbody>{alert_rows}</tbody>
   </table>
 
   <h3>LLM Usage Pattern Deep Analysis</h3>
@@ -1816,6 +1964,7 @@ def main() -> int:
     parser.add_argument("--report-granularity", choices=["daily", "weekly", "monthly"], default="daily", help="Custom report time granularity")
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
+    parser.add_argument("--alert-config", help="Path to alert rules/notification channels JSON")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -1895,6 +2044,12 @@ def main() -> int:
 
     rows = apply_access_policy(rows, policy)
 
+    try:
+        alert_config = _load_alert_config(args.alert_config)
+    except Exception as exc:
+        eprint(f"Failed to load alert config: {exc}")
+        return 7
+
     html = build_dashboard_html(
         args.provider,
         rows,
@@ -1905,6 +2060,7 @@ def main() -> int:
         chart_max_points=args.chart_max_points,
         role_name=role_name,
         policy=policy,
+        alert_config=alert_config,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -1915,6 +2071,7 @@ def main() -> int:
             rows,
             spike_lookback_days=args.spike_lookback_days,
             spike_threshold_mult=args.spike_threshold_mult,
+            alert_config=alert_config,
         )
         summary["role"] = role_name
         summary["policy"] = policy

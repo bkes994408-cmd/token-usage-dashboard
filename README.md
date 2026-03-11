@@ -14,6 +14,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: Multi-tenant organization isolation + org-level users/roles/dashboard-view assignment
 
 - New: LLM 使用模式深入分析（prompt/completion 分布、高消耗 hotspot、模型效率、匿名關鍵詞）
+- New: 成本預測與異常消耗預警（7/30 天 forecast、z-score anomaly、可配置預警規則與通知通道）
 
 
 ## Quick start
@@ -45,6 +46,7 @@ python3 scripts/token_usage_dashboard.py \
   --days 30 \
   --spike-lookback-days 7 \
   --spike-threshold-mult 2.0 \
+  --alert-config docs/ALERT_CONFIG_EXAMPLE.json \
   --output /tmp/token_usage_dashboard.html \
   --summary-json /tmp/token_usage_summary.json \
   --custom-report-json /tmp/custom_report.json \

@@ -104,6 +104,24 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(alerts[0]["date"], "2026-03-16")
         self.assertIn(alerts[0]["severity"], ["low", "medium", "high"])
 
+    def test_detect_anomaly_alerts_std_zero_fallback(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}
+            for d in range(1, 15)
+        ]
+        rows.append({"date": "2026-03-15", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 30.0}]})
+        alerts = detect_anomaly_alerts(rows, lookback_days=14, z_threshold=2.5, min_cost=1.0)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["date"], "2026-03-15")
+        self.assertEqual(alerts[0]["baselineStdUSD"], 0.0)
+
+    def test_forecast_daily_costs_with_insufficient_data(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}]
+        forecast = forecast_daily_costs(rows, forecast_days=3, lookback_days=10)
+        self.assertEqual(forecast["forecastDays"], 3)
+        self.assertEqual(forecast["predictions"], [])
+        self.assertEqual(forecast["totalForecastCostUSD"], 0.0)
+
     def test_dashboard_html_contains_spike_visuals(self):
         rows = [
             {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}
@@ -239,6 +257,21 @@ class TestTokenDashboard(TestCase):
         self.assertIn("id=\"forecastBody\"", html)
         self.assertIn("Anomaly Consumption Alerts", html)
         self.assertIn("id=\"anomalyBody\"", html)
+
+    def test_dashboard_html_contains_forecast_anomaly_cards_and_summary_values(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]}
+            for d in range(1, 20)
+        ]
+        summary = build_summary("codex", rows, forecast_days=7, anomaly_lookback_days=14, anomaly_z_threshold=2.5)
+        forecast_total_text = f"${summary['forecast']['totalForecastCostUSD']:,.2f}"
+        anomaly_count_text = str(len(summary["anomalyAlerts"]))
+
+        html = build_dashboard_html("codex", rows, top_models=2, forecast_days=7, anomaly_lookback_days=14, anomaly_z_threshold=2.5)
+        self.assertIn("Forecast next 7d", html)
+        self.assertIn("Anomaly alerts", html)
+        self.assertIn(forecast_total_text, html)
+        self.assertIn(f">{anomaly_count_text}</div>", html)
 
     def test_apply_access_policy_viewer_hides_breakdown(self):
         rows = [

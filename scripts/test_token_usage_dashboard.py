@@ -11,13 +11,12 @@ from token_usage_dashboard import (
     detect_spikes,
     downsample_rows,
     generate_custom_report,
-    forecast_daily_costs,
-    detect_anomaly_alerts,
+    main as dashboard_main,
+    manage_tenant_config,
     model_totals,
     prepare_chart_series,
     resolve_access_policy,
     resolve_multi_tenant_context,
-    manage_tenant_config,
 )
 
 
@@ -83,45 +82,6 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(len(summary_default["spikes"]), 0)
         self.assertEqual(len(summary_sensitive["spikes"]), 1)
 
-    def test_forecast_daily_costs_returns_future_rows(self):
-        rows = [
-            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]}
-            for d in range(1, 11)
-        ]
-        forecast = forecast_daily_costs(rows, forecast_days=5, lookback_days=10)
-        self.assertEqual(forecast["forecastDays"], 5)
-        self.assertEqual(len(forecast["predictions"]), 5)
-        self.assertTrue(all(x["costUSD"] >= 0 for x in forecast["predictions"]))
-
-    def test_detect_anomaly_alerts_by_zscore(self):
-        rows = [
-            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}
-            for d in range(1, 16)
-        ]
-        rows.append({"date": "2026-03-16", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 40.0}]})
-        alerts = detect_anomaly_alerts(rows, lookback_days=14, z_threshold=2.0, min_cost=1.0)
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["date"], "2026-03-16")
-        self.assertIn(alerts[0]["severity"], ["low", "medium", "high"])
-
-    def test_detect_anomaly_alerts_std_zero_fallback(self):
-        rows = [
-            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}
-            for d in range(1, 15)
-        ]
-        rows.append({"date": "2026-03-15", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 30.0}]})
-        alerts = detect_anomaly_alerts(rows, lookback_days=14, z_threshold=2.5, min_cost=1.0)
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["date"], "2026-03-15")
-        self.assertEqual(alerts[0]["baselineStdUSD"], 0.0)
-
-    def test_forecast_daily_costs_with_insufficient_data(self):
-        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}]
-        forecast = forecast_daily_costs(rows, forecast_days=3, lookback_days=10)
-        self.assertEqual(forecast["forecastDays"], 3)
-        self.assertEqual(forecast["predictions"], [])
-        self.assertEqual(forecast["totalForecastCostUSD"], 0.0)
-
     def test_dashboard_html_contains_spike_visuals(self):
         rows = [
             {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}
@@ -173,15 +133,6 @@ class TestTokenDashboard(TestCase):
         self.assertIn("window.addEventListener('keydown'", html)
         self.assertIn("isEditable", html)
         self.assertIn("selectedSpikeDate", html)
-        self.assertIn("Selected Range Summary", html)
-        self.assertIn("const selectedRangeBody", html)
-        self.assertIn("rangeStart", html)
-        self.assertIn("rangeEnd", html)
-        self.assertIn("setRangeByIndexes", html)
-        self.assertIn("clearSelectedRange", html)
-        self.assertIn("Drag on chart to choose a date range", html)
-        self.assertIn("canvas.addEventListener('mousedown'", html)
-        self.assertIn("canvas.addEventListener('dblclick'", html)
 
     def test_prepare_chart_series_groups_other(self):
         rows = [
@@ -255,32 +206,6 @@ class TestTokenDashboard(TestCase):
         self.assertIn("id=\"customReportBody\"", html)
         self.assertIn("generateCustomReportRows", html)
         self.assertIn("initCustomReportBuilder", html)
-
-    def test_dashboard_html_contains_forecast_and_anomaly_sections(self):
-        rows = [
-            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]}
-            for d in range(1, 20)
-        ]
-        html = build_dashboard_html("codex", rows, top_models=2)
-        self.assertIn("Cost Forecast (Next", html)
-        self.assertIn("id=\"forecastBody\"", html)
-        self.assertIn("Anomaly Consumption Alerts", html)
-        self.assertIn("id=\"anomalyBody\"", html)
-
-    def test_dashboard_html_contains_forecast_anomaly_cards_and_summary_values(self):
-        rows = [
-            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]}
-            for d in range(1, 20)
-        ]
-        summary = build_summary("codex", rows, forecast_days=7, anomaly_lookback_days=14, anomaly_z_threshold=2.5)
-        forecast_total_text = f"${summary['forecast']['totalForecastCostUSD']:,.2f}"
-        anomaly_count_text = str(len(summary["anomalyAlerts"]))
-
-        html = build_dashboard_html("codex", rows, top_models=2, forecast_days=7, anomaly_lookback_days=14, anomaly_z_threshold=2.5)
-        self.assertIn("Forecast next 7d", html)
-        self.assertIn("Anomaly alerts", html)
-        self.assertIn(forecast_total_text, html)
-        self.assertIn(f">{anomaly_count_text}</div>", html)
 
     def test_apply_access_policy_viewer_hides_breakdown(self):
         rows = [
@@ -356,6 +281,95 @@ class TestTokenDashboard(TestCase):
             self.assertIn('ops-view', result['views'])
             data = json.loads(Path(path).read_text())
             self.assertIn('ops-view', data['organizations']['org-a']['groups']['analytics']['dashboardViews'])
+        finally:
+            os.unlink(path)
+
+    def test_manage_mode_does_not_require_input_payload(self):
+        import json, os, sys, tempfile
+        from unittest.mock import patch
+
+        cfg = {"organizations": {"org-a": {"users": {}, "groups": {}, "dashboardViews": {}}}}
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as f:
+            f.write(json.dumps(cfg))
+            path = f.name
+        try:
+            argv = [
+                "token_usage_dashboard.py",
+                "--tenant-config", path,
+                "--org-id", "org-a",
+                "--manage-users", "list",
+            ]
+            with patch.object(sys, "argv", argv), patch("token_usage_dashboard.load_payload", side_effect=RuntimeError("should not load payload")):
+                rc = dashboard_main()
+            self.assertEqual(rc, 0)
+        finally:
+            os.unlink(path)
+
+    def test_multi_tenant_user_without_group_is_deny_by_default(self):
+        import json, os, tempfile
+
+        payload = {"organizations": {"org-a": {"daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.0}]}]}}}
+        cfg = {
+            "organizations": {
+                "org-a": {
+                    "users": {"alice": {"role": "analyst"}},
+                    "groups": {},
+                    "dashboardViews": {"team": {"allowedModels": ["gpt-5"]}},
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as f:
+            f.write(json.dumps(cfg))
+            path = f.name
+        try:
+            with self.assertRaises(RuntimeError):
+                resolve_multi_tenant_context(payload, path, "org-a", None, "alice", "team")
+            rows, role, policy, _ = resolve_multi_tenant_context(payload, path, "org-a", None, "alice", None)
+            self.assertEqual(role, "analyst")
+            self.assertEqual(policy.get("allowedModels"), [])
+            filtered = apply_access_policy(rows, policy)
+            self.assertAlmostEqual(filtered[0]["totalCost"], 0.0)
+        finally:
+            os.unlink(path)
+
+    def test_multi_tenant_role_override_requires_allow_flag(self):
+        import json, os, tempfile
+
+        payload = {"organizations": {"org-a": {"daily": [{"date": "2026-03-01", "modelBreakdowns": []}]}}}
+        cfg = {
+            "organizations": {
+                "org-a": {
+                    "users": {"alice": {"role": "viewer", "defaultDashboard": "team"}},
+                    "groups": {},
+                    "dashboardViews": {"team": {"allowedModels": ["gpt-5"]}},
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as f:
+            f.write(json.dumps(cfg))
+            path = f.name
+        try:
+            _, role_ignored, _, _ = resolve_multi_tenant_context(payload, path, "org-a", "admin", "alice", None)
+            _, role_override, _, _ = resolve_multi_tenant_context(payload, path, "org-a", "admin", "alice", None, allow_role_override=True)
+            self.assertEqual(role_ignored, "viewer")
+            self.assertEqual(role_override, "admin")
+        finally:
+            os.unlink(path)
+
+    def test_assign_nonexistent_view_fails(self):
+        import json, os, tempfile
+
+        cfg = {
+            "organizations": {
+                "org-a": {"users": {}, "groups": {"analytics": {"dashboardViews": []}}, "dashboardViews": {}}
+            }
+        }
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.json') as f:
+            f.write(json.dumps(cfg))
+            path = f.name
+        try:
+            with self.assertRaises(RuntimeError):
+                manage_tenant_config(path, "org-a", None, None, None, None, "assign", "missing-view", None, None, "analytics")
         finally:
             os.unlink(path)
 

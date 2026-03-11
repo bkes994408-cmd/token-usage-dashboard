@@ -12,7 +12,6 @@ Interactive local dashboard for CodexBar usage/cost data.
 - Keyboard-driven navigation and spike focus
 - New: Custom Report Builder (choose metrics, model filters, daily/weekly/monthly granularity, export CSV)
 - New: Multi-tenant organization isolation + org-level users/roles/dashboard-view assignment
-- New: Cost forecasting (next N days) + anomaly consumption alerts (z-score based)
 
 ## Quick start
 
@@ -32,7 +31,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 ```bash
 ./run_dashboard.sh --provider codex --days 30
 ./run_dashboard.sh --provider claude --days 14 --no-open
-./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --forecast-days 14 --anomaly-z-threshold 2.3 --max-table-rows 150 --chart-max-points 1000
+./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --max-table-rows 150 --chart-max-points 1000
 ```
 
 ### Direct Python command

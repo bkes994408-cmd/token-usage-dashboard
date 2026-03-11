@@ -521,6 +521,58 @@ class TestTokenDashboard(TestCase):
         finally:
             os.unlink(path)
 
+    def test_alert_config_parsing_tolerates_invalid_numbers(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]
+        alerts = evaluate_alert_rules(
+            rows,
+            {"predictedTotalCostUSD": 100.0},
+            [{"date": "2026-03-01", "zScore": "not-a-number"}],
+            config={
+                "rules": {
+                    "budgetThresholdUSD": "bad-threshold",
+                    "budgetForecastPct": "85.5",
+                    "anomalyCountThreshold": "abc",
+                },
+                "notificationChannels": ["email", 123],
+            },
+        )
+        self.assertEqual(alerts["notificationChannels"], ["email", "123"])
+        self.assertTrue(any(a["rule"] == "anomaly_count_threshold" for a in alerts["triggered"]))
+
+    def test_dashboard_html_escapes_xss_dynamic_strings(self):
+        evil = "<img src=x onerror=alert(1)>"
+        rows = [{
+            "date": "2026-03-01",
+            "modelBreakdowns": [{"modelName": evil, "cost": 3.0}],
+            "llmCalls": [{"modelName": evil, "task": evil, "promptTokens": 1, "completionTokens": 1, "totalTokens": 2, "cost": 0.1}],
+        }]
+        html = build_dashboard_html(
+            f"codex</title><script>alert(9)</script>",
+            rows,
+            top_models=3,
+            role_name="viewer<script>alert(8)</script>",
+            alert_config={
+                "rules": {"budgetThresholdUSD": 1, "budgetForecastPct": 1, "anomalyCountThreshold": 1},
+                "notificationChannels": ["slack<script>alert(7)</script>", evil],
+            },
+        )
+        self.assertNotIn("<script>alert(9)</script>", html)
+        self.assertNotIn("<td><img src=x onerror=alert(1)>", html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
+        self.assertIn("escapeHtml", html)
+
+    def test_dashboard_html_escapes_alert_fields(self):
+        rows = [{"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]} for d in range(1, 10)]
+        anomalies = [{"date": "2026-03-09", "costUSD": 99.0, "zScore": 9.1, "severity": "<b>high</b>"}]
+        alerts = evaluate_alert_rules(
+            rows,
+            {"predictedTotalCostUSD": 100.0},
+            anomalies,
+            config={"rules": {"budgetThresholdUSD": 1, "budgetForecastPct": 1, "anomalyCountThreshold": 1}, "notificationChannels": ["discord</td><script>alert(4)</script>"]},
+        )
+        html = build_dashboard_html("codex", rows, top_models=2, alert_config={"rules": alerts["rules"], "notificationChannels": alerts["notificationChannels"]})
+        self.assertIn("&lt;/td&gt;&lt;script&gt;alert(4)&lt;/script&gt;", html)
+
 
 if __name__ == "__main__":
     main()

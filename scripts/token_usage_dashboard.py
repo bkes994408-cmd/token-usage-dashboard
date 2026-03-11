@@ -6,6 +6,7 @@ Generate a local HTML dashboard for CodexBar model usage/cost data.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import subprocess
@@ -50,6 +51,20 @@ DEFAULT_ROLE_POLICIES: Dict[str, Dict[str, Any]] = {
 
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def esc(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def json_for_script(value: Any) -> str:
+    # Prevent inline-script breakouts (`</script>`) and JS line-separator hazards.
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def run_codexbar_cost(provider: str) -> Dict[str, Any]:
@@ -193,9 +208,35 @@ def day_total_cost(row: Dict[str, Any]) -> float:
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except (TypeError, ValueError):
+            return default
     return default
+
+
+def _safe_int(value: Any, default: int = 0, minimum: Optional[int] = None) -> int:
+    if isinstance(value, bool):
+        out = default
+    elif isinstance(value, int):
+        out = value
+    elif isinstance(value, float):
+        out = int(value)
+    elif isinstance(value, str):
+        try:
+            out = int(float(value.strip()))
+        except (TypeError, ValueError):
+            out = default
+    else:
+        out = default
+    if minimum is not None:
+        return max(minimum, out)
+    return out
 
 
 def _normalize_call_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -739,7 +780,7 @@ def evaluate_alert_rules(
 
     budget_threshold = _safe_float(rules.get("budgetThresholdUSD"), default=0.0)
     budget_forecast_pct = _safe_float(rules.get("budgetForecastPct"), default=100.0)
-    anomaly_count_threshold = int(rules.get("anomalyCountThreshold", 1) or 1)
+    anomaly_count_threshold = _safe_int(rules.get("anomalyCountThreshold", 1), default=1, minimum=1)
 
     triggered: List[Dict[str, Any]] = []
     if budget_threshold > 0:
@@ -757,7 +798,7 @@ def evaluate_alert_rules(
         triggered.append({
             "rule": "anomaly_count_threshold",
             "severity": "high" if len(anomalies) >= (anomaly_count_threshold + 2) else "medium",
-            "message": f"Detected {len(anomalies)} anomalies in recent window. Latest: {last.get('date')} z={float(last.get('zScore', 0.0)):.2f}",
+            "message": f"Detected {len(anomalies)} anomalies in recent window. Latest: {last.get('date')} z={_safe_float(last.get('zScore', 0.0)):.2f}",
         })
 
     return {
@@ -810,7 +851,7 @@ def build_model_table_rows(models_ranked: List[Tuple[str, float]], grand_total: 
     hidden = models_ranked[max_rows:]
 
     rows = [
-        f"<tr><td>{idx}</td><td>{m}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
+        f"<tr><td>{idx}</td><td>{esc(m)}</td><td>{usd(c)}</td><td>{(c / grand_total * 100 if grand_total else 0):.1f}%</td></tr>"
         for idx, (m, c) in enumerate(visible, start=1)
     ]
 
@@ -1010,7 +1051,7 @@ def build_dashboard_html(
     for idx, x in enumerate(summary.get("movers", [])[:8], start=1):
         pct = f"{x['deltaPct']:+.1f}%" if isinstance(x.get("deltaPct"), (int, float)) else "N/A"
         movers_rows_parts.append(
-            f"<tr><td>{idx}</td><td>{x['model']}</td><td>{usd(float(x['last7dCostUSD']))}</td><td>{usd(float(x['prev7dCostUSD']))}</td><td>{usd(float(x['deltaCostUSD']))}</td><td>{pct}</td></tr>"
+            f"<tr><td>{idx}</td><td>{esc(x['model'])}</td><td>{usd(float(x['last7dCostUSD']))}</td><td>{usd(float(x['prev7dCostUSD']))}</td><td>{usd(float(x['deltaCostUSD']))}</td><td>{pct}</td></tr>"
         )
     movers_rows = "\n".join(movers_rows_parts)
 
@@ -1019,7 +1060,7 @@ def build_dashboard_html(
     for idx, x in enumerate(visible_spikes[:10], start=1):
         date_key = str(x["date"])
         spikes_rows_parts.append(
-            f"<tr id='spike-row-{date_key}'><td>{idx}</td><td>{x['date']}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
+            f"<tr id='spike-row-{esc(date_key)}'><td>{idx}</td><td>{esc(x['date'])}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
         )
     spikes_rows = "\n".join(spikes_rows_parts) if spikes_rows_parts else "<tr><td colspan='5'>No spikes detected</td></tr>"
 
@@ -1029,11 +1070,11 @@ def build_dashboard_html(
     anomalies = summary.get("costAnomalies") if isinstance(summary.get("costAnomalies"), list) else []
     alerts = summary.get("alerts") if isinstance(summary.get("alerts"), dict) else {}
     alert_rows = "\n".join([
-        f"<tr><td>{i+1}</td><td>{a.get('rule')}</td><td>{a.get('severity')}</td><td>{a.get('message')}</td></tr>"
+        f"<tr><td>{i+1}</td><td>{esc(a.get('rule'))}</td><td>{esc(a.get('severity'))}</td><td>{esc(a.get('message'))}</td></tr>"
         for i, a in enumerate(alerts.get("triggered", [])[:8])
     ]) or "<tr><td colspan='4'>No alert triggered</td></tr>"
     anomaly_rows = "\n".join([
-        f"<tr><td>{i+1}</td><td>{a.get('date')}</td><td>{usd(float(a.get('costUSD', 0.0)))}</td><td>{float(a.get('zScore', 0.0)):.2f}</td><td>{a.get('severity')}</td></tr>"
+        f"<tr><td>{i+1}</td><td>{esc(a.get('date'))}</td><td>{usd(float(a.get('costUSD', 0.0)))}</td><td>{_safe_float(a.get('zScore', 0.0)):.2f}</td><td>{esc(a.get('severity'))}</td></tr>"
         for i, a in enumerate(anomalies[:10])
     ]) or "<tr><td colspan='5'>No anomaly detected</td></tr>"
 
@@ -1044,7 +1085,7 @@ def build_dashboard_html(
         out_rows: List[str] = []
         for idx, item in enumerate(items[:8], start=1):
             out_rows.append(
-                f"<tr><td>{idx}</td><td>{item.get(key_name, 'unknown')}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{int(float(item.get('count', 0.0)))}</td></tr>"
+                f"<tr><td>{idx}</td><td>{esc(item.get(key_name, 'unknown'))}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{int(float(item.get('count', 0.0)))}</td></tr>"
             )
         return "\n".join(out_rows)
 
@@ -1059,18 +1100,18 @@ def build_dashboard_html(
         for idx, item in enumerate(pattern["efficiency"][:8], start=1):
             cpk = item.get("costPer1kTokensUSD")
             lat = item.get("avgLatencyMs")
-            buf.append(f"<tr><td>{idx}</td><td>{item.get('model', 'unknown')}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{(f'{cpk:.4f}' if isinstance(cpk, (int, float)) else 'N/A')}</td><td>{(f'{lat:.1f}' if isinstance(lat, (int, float)) else 'N/A')}</td></tr>")
+            buf.append(f"<tr><td>{idx}</td><td>{esc(item.get('model', 'unknown'))}</td><td>{usd(float(item.get('costUSD', 0.0)))}</td><td>{float(item.get('totalTokens', 0.0)):,.0f}</td><td>{(f'{cpk:.4f}' if isinstance(cpk, (int, float)) else 'N/A')}</td><td>{(f'{lat:.1f}' if isinstance(lat, (int, float)) else 'N/A')}</td></tr>")
         pattern_eff_rows = "\n".join(buf)
 
     keyword_rows = "<tr><td colspan='3'>No keyword data</td></tr>"
     if pattern.get("available") and isinstance(pattern.get("anonymizedPromptKeywords"), list) and pattern.get("anonymizedPromptKeywords"):
-        keyword_rows = "\n".join([f"<tr><td>{i+1}</td><td>{k.get('keyword')}</td><td>{k.get('count')}</td></tr>" for i, k in enumerate(pattern.get("anonymizedPromptKeywords", [])[:12])])
+        keyword_rows = "\n".join([f"<tr><td>{i+1}</td><td>{esc(k.get('keyword'))}</td><td>{k.get('count')}</td></tr>" for i, k in enumerate(pattern.get("anonymizedPromptKeywords", [])[:12])])
 
     def _render_hotspot_rows(items: List[Dict[str, Any]], key_name: str) -> str:
         if not items:
             return "<tr><td colspan='4'>No data</td></tr>"
         return "\n".join([
-            f"<tr><td>{i+1}</td><td>{x.get(key_name, 'unknown')}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{float(x.get('totalTokens', 0.0)):,.0f}</td></tr>"
+            f"<tr><td>{i+1}</td><td>{esc(x.get(key_name, 'unknown'))}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{float(x.get('totalTokens', 0.0)):,.0f}</td></tr>"
             for i, x in enumerate(items[:10])
         ])
 
@@ -1114,23 +1155,23 @@ def build_dashboard_html(
         day_breakdown_by_date[d] = [{"model": n, "costUSD": c} for n, c in ranked]
         day_total_by_date[d] = sum(model_map.values())
 
-    json_labels = json.dumps(labels)
-    json_series = json.dumps(series)
-    json_day_totals = json.dumps(day_totals)
+    json_labels = json_for_script(labels)
+    json_series = json_for_script(series)
+    json_day_totals = json_for_script(day_totals)
     all_models = sorted({str(x["model"]) for day in day_breakdown_by_date.values() for x in day if isinstance(x, dict) and isinstance(x.get("model"), str)})
 
-    json_spike_by_date = json.dumps(spike_by_date)
-    json_day_breakdown_by_date = json.dumps(day_breakdown_by_date)
-    json_day_total_by_date = json.dumps(day_total_by_date)
-    json_all_models = json.dumps(all_models)
-    json_policy = json.dumps(policy)
+    json_spike_by_date = json_for_script(spike_by_date)
+    json_day_breakdown_by_date = json_for_script(day_breakdown_by_date)
+    json_day_total_by_date = json_for_script(day_total_by_date)
+    json_all_models = json_for_script(all_models)
+    json_policy = json_for_script(policy)
 
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
-  <title>Token Usage Dashboard · {provider}</title>
+  <title>Token Usage Dashboard · {esc(provider)}</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 24px; color: #1f2937; }}
     .grid {{ display: grid; grid-template-columns: repeat(5, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }}
@@ -1154,8 +1195,8 @@ def build_dashboard_html(
   </style>
 </head>
 <body>
-  <h2>Token Usage Dashboard · {provider}</h2>
-  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Role: <strong>{role_name}</strong></div>
+  <h2>Token Usage Dashboard · {esc(provider)}</h2>
+  <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Role: <strong>{esc(role_name)}</strong></div>
   <div style="color:#6b7280;font-size:12px;margin-bottom:6px;">Tips: click chart points/spikes to focus a day · use ←/→ or j/k to step dates · n/p jump next/prev spike · Home/End first/last day · s toggle spike-only · d sort DoD · x changes-only · r reset to latest · c copy link · ? help</div>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
     <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#374151;">
@@ -1216,7 +1257,7 @@ def build_dashboard_html(
     <tbody>{anomaly_rows}</tbody>
   </table>
   <h4>Triggered Alerts</h4>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Notification channels: {', '.join(alerts.get('notificationChannels', [])) if alerts.get('notificationChannels') else 'not configured'}</div>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Notification channels: {esc(', '.join(alerts.get('notificationChannels', [])) if alerts.get('notificationChannels') else 'not configured')}</div>
   <table>
     <thead><tr><th>#</th><th>Rule</th><th>Severity</th><th>Message</th></tr></thead>
     <tbody>{alert_rows}</tbody>
@@ -1371,6 +1412,15 @@ def build_dashboard_html(
     let selectedDate = null;
     let spikeOnlyMode = false;
 
+    function escapeHtml(value) {{
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
+
     function hideSectionByHeading(titleText, message) {{
       const h = Array.from(document.querySelectorAll('h3')).find(x => x.textContent.trim() === titleText);
       if (!h) return;
@@ -1441,7 +1491,7 @@ def build_dashboard_html(
         const dodClass = dod > 0 ? 'dod-pos' : (dod < 0 ? 'dod-neg' : 'dod-neutral');
         const dodPctClass = dodPct === null ? 'dod-neutral' : (dodPct > 0 ? 'dod-pos' : (dodPct < 0 ? 'dod-neg' : 'dod-neutral'));
         const rowClass = i === 0 ? 'model-top' : '';
-        return `<tr class="${{rowClass}}"><td>${{i + 1}}</td><td>${{r.model}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
+        return `<tr class="${{rowClass}}"><td>${{i + 1}}</td><td>${{escapeHtml(r.model)}}</td><td>$${{(r.costUSD || 0).toFixed(2)}}</td><td>${{share}}%</td><td class="${{dodClass}}">${{dodText}}</td><td class="${{dodPctClass}}">${{dodPctText}}</td></tr>`;
       }}).join('');
     }}
 
@@ -1514,7 +1564,7 @@ def build_dashboard_html(
         const total = metrics.includes('total_cost') ? `$${{r.totalCost.toFixed(2)}}` : '-';
         const active = metrics.includes('active_models') ? r.avgActiveModels.toFixed(2) : '-';
         const avg = metrics.includes('avg_cost_per_model') ? `$${{r.avgCostPerModel.toFixed(2)}}` : '-';
-        return `<tr><td>${{r.period}}</td><td>${{total}}</td><td>${{active}}</td><td>${{avg}}</td></tr>`;
+        return `<tr><td>${{escapeHtml(r.period)}}</td><td>${{total}}</td><td>${{active}}</td><td>${{avg}}</td></tr>`;
       }}).join('');
       return rows;
     }}
@@ -1534,7 +1584,7 @@ def build_dashboard_html(
 
     function initCustomReportBuilder() {{
       if (modelFilters) {{
-        modelFilters.innerHTML = allModels.map((m) => `<label style="display:block;font-size:12px;"><input type="checkbox" class="modelOpt" value="${{m}}"/> ${{m}}</label>`).join('');
+        modelFilters.innerHTML = allModels.map((m) => `<label style="display:block;font-size:12px;"><input type="checkbox" class="modelOpt" value="${{escapeHtml(m)}}"/> ${{escapeHtml(m)}}</label>`).join('');
       }}
       let latestRows = renderCustomReport();
       generateReportBtn?.addEventListener('click', () => {{

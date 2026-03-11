@@ -10,6 +10,9 @@ from token_usage_dashboard import (
     build_summary,
     build_llm_pattern_analysis,
     detect_spikes,
+    detect_cost_anomalies,
+    evaluate_alert_rules,
+    forecast_cost,
     downsample_rows,
     generate_custom_report,
     main as dashboard_main,
@@ -138,6 +141,41 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(len(summary_default["spikes"]), 0)
         self.assertEqual(len(summary_sensitive["spikes"]), 1)
 
+    def test_forecast_and_alerts(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]}
+            for d in range(1, 16)
+        ]
+        f7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
+        self.assertEqual(f7["horizonDays"], 7)
+        self.assertGreater(f7["predictedTotalCostUSD"], 0.0)
+
+        anomalies = detect_cost_anomalies(rows + [{"date": "2026-03-16", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 100.0}]}], lookback_days=7, z_threshold=1.5)
+        self.assertGreaterEqual(len(anomalies), 1)
+
+        alerts = evaluate_alert_rules(
+            rows,
+            f7,
+            anomalies,
+            config={
+                "rules": {"budgetThresholdUSD": 10, "budgetForecastPct": 50, "anomalyCountThreshold": 1},
+                "notificationChannels": ["email", "discord:webhook"],
+            },
+        )
+        self.assertTrue(len(alerts["triggered"]) >= 1)
+        self.assertIn("email", alerts["notificationChannels"])
+
+    def test_build_summary_includes_forecast_and_alerts(self):
+        rows = [
+            {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}
+            for d in range(1, 15)
+        ]
+        summary = build_summary("codex", rows, alert_config={"rules": {"budgetThresholdUSD": 20, "budgetForecastPct": 80}})
+        self.assertIn("forecast", summary)
+        self.assertIn("costAnomalies", summary)
+        self.assertIn("alerts", summary)
+        self.assertIn("next7Days", summary["forecast"])
+
 
     def test_dashboard_html_contains_all_pattern_sections(self):
         rows = [{
@@ -216,6 +254,9 @@ class TestTokenDashboard(TestCase):
         self.assertIn("copyDeepLink", html)
         self.assertIn("id=\"copyLinkBtn\"", html)
         self.assertIn("id=\"selectedDayMeta\"", html)
+        self.assertIn("Cost Forecast & Anomaly Alerts", html)
+        self.assertIn("Detected Cost Anomalies", html)
+        self.assertIn("Triggered Alerts", html)
         self.assertIn("LLM Usage Pattern Deep Analysis", html)
         self.assertIn("id=\"sortByDodToggle\"", html)
         self.assertIn("id=\"showOnlyChangesToggle\"", html)

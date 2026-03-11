@@ -12,6 +12,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 - Keyboard-driven navigation and spike focus
 - New: Custom Report Builder (choose metrics, model filters, daily/weekly/monthly granularity, export CSV)
 - New: Multi-tenant organization isolation + org-level users/roles/dashboard-view assignment
+- New: LLM 使用模式深入分析（prompt/completion 分布、高消耗 hotspot、模型效率、匿名關鍵詞）
 
 ## Quick start
 

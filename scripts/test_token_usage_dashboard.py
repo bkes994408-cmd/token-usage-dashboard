@@ -8,6 +8,7 @@ from token_usage_dashboard import (
     build_dashboard_html,
     build_model_table_rows,
     build_summary,
+    build_llm_pattern_analysis,
     detect_spikes,
     downsample_rows,
     generate_custom_report,
@@ -41,6 +42,18 @@ class TestTokenDashboard(TestCase):
         self.assertAlmostEqual(totals["gpt-5"], 2.0)
         self.assertAlmostEqual(totals["o3"], 0.5)
 
+    def test_summary_includes_pattern_analysis(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}],
+                "llmCalls": [{"modelName": "gpt-5", "promptTokens": 10, "completionTokens": 20, "totalTokens": 30, "cost": 0.1, "prompt": "summarize logs"}],
+            }
+        ]
+        summary = build_summary("codex", rows)
+        self.assertIn("llmPatternAnalysis", summary)
+        self.assertTrue(summary["llmPatternAnalysis"]["available"])
+
     def test_summary_includes_7d_delta(self):
         rows = [
             {
@@ -58,6 +71,49 @@ class TestTokenDashboard(TestCase):
         self.assertIsInstance(summary["last7dDeltaPct"], float)
         self.assertTrue(len(summary["movers"]) >= 2)
         self.assertEqual(summary["movers"][0]["model"], "gpt-5")
+
+    def test_build_llm_pattern_analysis(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "llmCalls": [
+                    {
+                        "modelName": "gpt-5",
+                        "modelType": "chat",
+                        "useCase": "support",
+                        "userId": "alice",
+                        "projectId": "proj-a",
+                        "sessionId": "s1",
+                        "promptTokens": 100,
+                        "completionTokens": 200,
+                        "totalTokens": 300,
+                        "cost": 0.9,
+                        "latencyMs": 500,
+                        "prompt": "Please summarize Taiwan market outlook and risk factors",
+                    },
+                    {
+                        "modelName": "o3",
+                        "modelType": "reasoning",
+                        "useCase": "analysis",
+                        "userId": "bob",
+                        "projectId": "proj-b",
+                        "sessionId": "s2",
+                        "promptTokens": 400,
+                        "completionTokens": 120,
+                        "totalTokens": 520,
+                        "cost": 1.5,
+                        "latencyMs": 900,
+                        "prompt": "Analyze quarterly trend and optimization plan",
+                    },
+                ],
+            }
+        ]
+        analysis = build_llm_pattern_analysis(rows)
+        self.assertTrue(analysis["available"])
+        self.assertEqual(analysis["calls"], 2)
+        self.assertIn("dimensions", analysis)
+        self.assertTrue(len(analysis["efficiency"]) >= 2)
+        self.assertTrue(len(analysis["anonymizedPromptKeywords"]) > 0)
 
     def test_detect_spikes(self):
         rows = [
@@ -110,6 +166,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("copyDeepLink", html)
         self.assertIn("id=\"copyLinkBtn\"", html)
         self.assertIn("id=\"selectedDayMeta\"", html)
+        self.assertIn("LLM Usage Pattern Deep Analysis", html)
         self.assertIn("id=\"sortByDodToggle\"", html)
         self.assertIn("id=\"showOnlyChangesToggle\"", html)
         self.assertIn("sortByDodMode", html)

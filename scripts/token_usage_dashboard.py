@@ -220,7 +220,8 @@ def apply_access_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> L
     can_view_breakdown = bool(policy.get("canViewModelBreakdown", True))
     can_view_model_names = bool(policy.get("canViewModelNames", True))
     allowed_models = policy.get("allowedModels")
-    allowed_set = {str(x) for x in allowed_models} if isinstance(allowed_models, list) else set()
+    has_allowed_models = isinstance(allowed_models, list)
+    allowed_set = {str(x) for x in allowed_models} if has_allowed_models else set()
     max_days = policy.get("maxDays")
 
     transformed: List[Dict[str, Any]] = []
@@ -235,7 +236,7 @@ def apply_access_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> L
             cost = b.get("cost")
             if not isinstance(name, str) or not isinstance(cost, (int, float)):
                 continue
-            if allowed_set and name not in allowed_set:
+            if has_allowed_models and name not in allowed_set:
                 continue
             c = float(cost)
             total += c
@@ -302,6 +303,7 @@ def resolve_multi_tenant_context(
     role: Optional[str],
     user: Optional[str],
     requested_dashboard: Optional[str],
+    allow_role_override: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any], Dict[str, Any]]:
     cfg = _load_tenant_config(tenant_config_path)
     resolved_org_id, org_node = _get_org_node(cfg, org_id)
@@ -320,9 +322,11 @@ def resolve_multi_tenant_context(
     global_roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_policies = _resolve_role_policies(org_node, global_roles)
 
-    selected_role = role or ""
+    selected_role = ""
     user_record = users.get(user) if user and isinstance(users.get(user), dict) else {}
-    if not selected_role and isinstance(user_record.get("role"), str):
+    if role and (allow_role_override or not user):
+        selected_role = role
+    elif isinstance(user_record.get("role"), str):
         selected_role = str(user_record.get("role"))
     if not selected_role:
         selected_role = str(org_node.get("defaultRole") or cfg.get("defaultRole") or "admin")
@@ -338,10 +342,17 @@ def resolve_multi_tenant_context(
         if isinstance(view_ids, list):
             allowed_view_ids = [str(v) for v in view_ids]
 
+    default_dashboard = str(user_record.get("defaultDashboard")) if isinstance(user_record.get("defaultDashboard"), str) else ""
+    explicit_allowlist: Optional[List[str]] = allowed_view_ids if allowed_view_ids else None
+    if user and explicit_allowlist is None and default_dashboard:
+        explicit_allowlist = [default_dashboard]
+    elif user and explicit_allowlist is None:
+        explicit_allowlist = []
+
     selected_dashboard = requested_dashboard
     if not selected_dashboard:
-        if isinstance(user_record.get("defaultDashboard"), str):
-            selected_dashboard = str(user_record.get("defaultDashboard"))
+        if default_dashboard:
+            selected_dashboard = default_dashboard
         elif allowed_view_ids:
             selected_dashboard = allowed_view_ids[0]
 
@@ -350,13 +361,15 @@ def resolve_multi_tenant_context(
         raw_view = dashboard_views.get(selected_dashboard)
         if not isinstance(raw_view, dict):
             raise RuntimeError(f"Dashboard view '{selected_dashboard}' not found in organization '{resolved_org_id}'.")
-        if allowed_view_ids and selected_dashboard not in allowed_view_ids:
+        if explicit_allowlist is not None and selected_dashboard not in explicit_allowlist:
             raise RuntimeError(f"User '{user}' cannot access dashboard view '{selected_dashboard}'.")
         selected_view = raw_view
         if isinstance(raw_view.get("allowedModels"), list):
             policy["allowedModels"] = [str(x) for x in raw_view.get("allowedModels", [])]
         if isinstance(raw_view.get("maxDays"), int):
             policy["maxDays"] = int(raw_view["maxDays"])
+    elif user and not explicit_allowlist:
+        policy["allowedModels"] = []
 
     tenant_meta = {
         "organizationId": resolved_org_id,
@@ -436,6 +449,8 @@ def manage_tenant_config(
         elif view_action in {"assign", "unassign"}:
             if not view_id or not view_group:
                 raise RuntimeError("--view-id and --view-group are required for assign/unassign.")
+            if view_action == "assign" and view_id not in views:
+                raise RuntimeError(f"Dashboard view '{view_id}' does not exist.")
             g = groups.get(view_group) if isinstance(groups.get(view_group), dict) else {"dashboardViews": []}
             ids = g.get("dashboardViews") if isinstance(g.get("dashboardViews"), list) else []
             if view_action == "assign" and view_id not in ids:
@@ -1522,6 +1537,7 @@ def main() -> int:
     parser.add_argument("--tenant-config", help="Path to multi-tenant organization config JSON")
     parser.add_argument("--org-id", help="Organization ID for strict tenant isolation")
     parser.add_argument("--dashboard-view", help="Dashboard view ID scoped to selected organization")
+    parser.add_argument("--allow-role-override", action="store_true", help="Allow --role to override user role in tenant mode")
     parser.add_argument("--manage-users", choices=["list", "create", "update", "delete"], help="Manage users in tenant config then exit")
     parser.add_argument("--target-user", help="Target username for --manage-users")
     parser.add_argument("--target-role", help="Target role for --manage-users create/update")
@@ -1533,12 +1549,6 @@ def main() -> int:
     parser.add_argument("--view-group", help="Group name for view assign/unassign")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
-
-    try:
-        payload = load_payload(args.input, args.provider)
-    except Exception as exc:
-        eprint(str(exc))
-        return 1
 
     if args.manage_users or args.manage_views:
         if not args.tenant_config or not args.org_id:
@@ -1564,6 +1574,12 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
+    try:
+        payload = load_payload(args.input, args.provider)
+    except Exception as exc:
+        eprint(str(exc))
+        return 1
+
     tenant_meta: Dict[str, Any] = {}
     if args.tenant_config:
         try:
@@ -1574,6 +1590,7 @@ def main() -> int:
                 role=args.role,
                 user=args.user,
                 requested_dashboard=args.dashboard_view,
+                allow_role_override=args.allow_role_override,
             )
         except Exception as exc:
             eprint(f"Failed to resolve tenant context: {exc}")

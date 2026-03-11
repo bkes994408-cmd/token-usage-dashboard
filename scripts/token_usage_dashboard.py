@@ -742,85 +742,11 @@ def _window_model_totals(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, float], 
     return dict(last_totals), dict(prev_totals)
 
 
-def forecast_daily_costs(rows: List[Dict[str, Any]], forecast_days: int = 7, lookback_days: int = 30) -> Dict[str, Any]:
-    if forecast_days < 1:
-        forecast_days = 1
-    if lookback_days < 2:
-        lookback_days = 2
-
-    dated_costs: List[Tuple[date, float]] = []
-    for row in rows:
-        d = parse_date(str(row.get("date", "")))
-        if not d:
-            continue
-        dated_costs.append((d, day_total_cost(row)))
-    if len(dated_costs) < 2:
-        return {"method": "linear-regression", "lookbackDays": lookback_days, "forecastDays": forecast_days, "predictions": [], "totalForecastCostUSD": 0.0}
-
-    window = dated_costs[-lookback_days:]
-    base_day = window[0][0]
-    xs = [(d - base_day).days for d, _ in window]
-    ys = [c for _, c in window]
-    n = len(xs)
-    sx = sum(xs)
-    sy = sum(ys)
-    sxx = sum(x * x for x in xs)
-    sxy = sum(x * y for x, y in zip(xs, ys))
-    denom = n * sxx - sx * sx
-    slope = ((n * sxy - sx * sy) / denom) if denom != 0 else 0.0
-    intercept = (sy - slope * sx) / n if n else 0.0
-
-    last_day = window[-1][0]
-    predictions: List[Dict[str, Any]] = []
-    total = 0.0
-    for i in range(1, forecast_days + 1):
-        d = last_day + timedelta(days=i)
-        x = (d - base_day).days
-        y = max(0.0, intercept + slope * x)
-        y = round(y, 6)
-        total += y
-        predictions.append({"date": d.strftime("%Y-%m-%d"), "costUSD": y})
-    return {"method": "linear-regression", "lookbackDays": lookback_days, "forecastDays": forecast_days, "slope": round(slope, 6), "predictions": predictions, "totalForecastCostUSD": round(total, 6)}
-
-
-def detect_anomaly_alerts(rows: List[Dict[str, Any]], lookback_days: int = 14, z_threshold: float = 2.5, min_cost: float = 0.0) -> List[Dict[str, Any]]:
-    if lookback_days < 2:
-        lookback_days = 2
-    daily = [day_total_cost(r) for r in rows]
-    alerts: List[Dict[str, Any]] = []
-    for i, row in enumerate(rows):
-        if i < lookback_days:
-            continue
-        cost = daily[i]
-        if cost < min_cost:
-            continue
-        baseline = daily[i - lookback_days:i]
-        mean = sum(baseline) / len(baseline) if baseline else 0.0
-        variance = sum((x - mean) ** 2 for x in baseline) / len(baseline) if baseline else 0.0
-        std = variance ** 0.5
-        if std <= 0:
-            if mean <= 0:
-                continue
-            if cost >= mean * max(1.5, z_threshold):
-                alerts.append({"date": row.get("date"), "costUSD": round(cost, 6), "baselineMeanUSD": round(mean, 6), "baselineStdUSD": 0.0, "zScore": round(z_threshold, 4), "severity": "high"})
-            continue
-        z = (cost - mean) / std
-        if z >= z_threshold:
-            severity = "high" if z >= (z_threshold + 1.5) else ("medium" if z >= (z_threshold + 0.5) else "low")
-            alerts.append({"date": row.get("date"), "costUSD": round(cost, 6), "baselineMeanUSD": round(mean, 6), "baselineStdUSD": round(std, 6), "zScore": round(z, 4), "severity": severity})
-    return alerts
-
-
 def build_summary(
     provider: str,
     rows: List[Dict[str, Any]],
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
-    forecast_days: int = 7,
-    forecast_lookback_days: int = 30,
-    anomaly_lookback_days: int = 14,
-    anomaly_z_threshold: float = 2.5,
-    anomaly_min_cost: float = 0.0,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -849,8 +775,6 @@ def build_summary(
     movers.sort(key=lambda x: x["deltaCostUSD"], reverse=True)
 
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
-    forecast = forecast_daily_costs(rows, forecast_days=forecast_days, lookback_days=forecast_lookback_days)
-    anomaly_alerts = detect_anomaly_alerts(rows, lookback_days=anomaly_lookback_days, z_threshold=anomaly_z_threshold, min_cost=anomaly_min_cost)
     pattern_analysis = build_llm_pattern_analysis(rows)
 
     return {
@@ -867,8 +791,6 @@ def build_summary(
         "models": [{"model": m, "totalCostUSD": c} for m, c in ranked],
         "movers": movers,
         "spikes": spikes,
-        "forecast": forecast,
-        "anomalyAlerts": anomaly_alerts,
         "llmPatternAnalysis": pattern_analysis,
     }
 
@@ -941,11 +863,6 @@ def build_dashboard_html(
     top_models: int,
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
-    forecast_days: int = 7,
-    forecast_lookback_days: int = 30,
-    anomaly_lookback_days: int = 14,
-    anomaly_z_threshold: float = 2.5,
-    anomaly_min_cost: float = 0.0,
     max_table_rows: int = 120,
     chart_max_points: int = 1200,
     role_name: str = "admin",
@@ -972,15 +889,8 @@ def build_dashboard_html(
         rows,
         spike_lookback_days=spike_lookback_days,
         spike_threshold_mult=spike_threshold_mult,
-        forecast_days=forecast_days,
-        forecast_lookback_days=forecast_lookback_days,
-        anomaly_lookback_days=anomaly_lookback_days,
-        anomaly_z_threshold=anomaly_z_threshold,
-        anomaly_min_cost=anomaly_min_cost,
     )
     spike_count = len(summary.get("spikes", []))
-    forecast_total = float((summary.get("forecast") or {}).get("totalForecastCostUSD", 0.0))
-    anomaly_count = len(summary.get("anomalyAlerts", []))
 
     movers_rows_parts: List[str] = []
     for idx, x in enumerate(summary.get("movers", [])[:8], start=1):
@@ -1043,16 +953,6 @@ def build_dashboard_html(
 
     prompt_stats = pattern.get("promptTokens", {}) if pattern.get("available") else {}
     completion_stats = pattern.get("completionTokens", {}) if pattern.get("available") else {}
-
-    forecast_rows_parts: List[str] = []
-    for idx, x in enumerate((summary.get("forecast") or {}).get("predictions", [])[:14], start=1):
-        forecast_rows_parts.append(f"<tr><td>{idx}</td><td>{x.get('date')}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td></tr>")
-    forecast_rows = "\n".join(forecast_rows_parts) if forecast_rows_parts else "<tr><td colspan='3'>Forecast unavailable (need at least 2 data points)</td></tr>"
-
-    anomaly_rows_parts: List[str] = []
-    for idx, x in enumerate((summary.get("anomalyAlerts") or [])[-12:][::-1], start=1):
-        anomaly_rows_parts.append(f"<tr><td>{idx}</td><td>{x.get('date')}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{float(x.get('zScore', 0.0)):.2f}</td><td>{x.get('severity')}</td></tr>")
-    anomaly_rows = "\n".join(anomaly_rows_parts) if anomaly_rows_parts else "<tr><td colspan='5'>No anomaly alerts</td></tr>"
 
 
     spike_by_date: Dict[str, Dict[str, float]] = {}
@@ -1148,8 +1048,6 @@ def build_dashboard_html(
     <div class=\"card\"><div class=\"label\">Total cost</div><div class=\"value\">{usd(grand_total)}</div></div>
     <div class=\"card\"><div class=\"label\">7d trend vs prev 7d</div><div class=\"value\">{trend}</div></div>
     <div class=\"card\"><div class=\"label\">Spikes detected</div><div class=\"value\">{spike_count}</div></div>
-    <div class=\"card\"><div class=\"label\">Forecast next {forecast_days}d</div><div class=\"value\">{usd(forecast_total)}</div></div>
-    <div class=\"card\"><div class=\"label\">Anomaly alerts</div><div class=\"value\">{anomaly_count}</div></div>
   </div>
 
   <div class=\"chart-wrap\" id=\"chartWrap\">
@@ -1174,20 +1072,6 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>7d Baseline</th><th>Ratio</th></tr></thead>
     <tbody id="spikesBody">{spikes_rows}</tbody>
-  </table>
-
-
-  <h3>Cost Forecast (Next {forecast_days} Days)</h3>
-  <table>
-    <thead><tr><th>#</th><th>Date</th><th>Forecast Cost</th></tr></thead>
-    <tbody id="forecastBody">{forecast_rows}</tbody>
-  </table>
-
-  <h3>Anomaly Consumption Alerts</h3>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Triggered when daily cost z-score ≥ {anomaly_z_threshold} over previous {anomaly_lookback_days} days.</div>
-  <table>
-    <thead><tr><th>#</th><th>Date</th><th>Cost</th><th>Z-score</th><th>Severity</th></tr></thead>
-    <tbody id="anomalyBody">{anomaly_rows}</tbody>
   </table>
 
   <h3>LLM Usage Pattern Deep Analysis</h3>
@@ -1924,11 +1808,6 @@ def main() -> int:
     parser.add_argument("--top-models", type=positive_int, default=6, help="Top models to chart")
     parser.add_argument("--spike-lookback-days", type=positive_int, default=7, help="Lookback window (days) for spike baseline")
     parser.add_argument("--spike-threshold-mult", type=positive_float, default=2.0, help="Spike threshold multiplier vs baseline")
-    parser.add_argument("--forecast-days", type=positive_int, default=7, help="Forecast N future days")
-    parser.add_argument("--forecast-lookback-days", type=positive_int, default=30, help="History window used for forecast regression")
-    parser.add_argument("--anomaly-lookback-days", type=positive_int, default=14, help="Lookback days used for anomaly z-score baseline")
-    parser.add_argument("--anomaly-z-threshold", type=positive_float, default=2.5, help="Alert when z-score is above this threshold")
-    parser.add_argument("--anomaly-min-cost", type=positive_float, default=0.01, help="Minimum daily cost required to emit anomaly alert")
     parser.add_argument("--output", default="token_usage_dashboard.html", help="Output HTML file path")
     parser.add_argument("--summary-json", help="Also write summary JSON to this path")
     parser.add_argument("--custom-report-json", help="Write custom report JSON to this path")
@@ -2022,11 +1901,6 @@ def main() -> int:
         top_models=args.top_models,
         spike_lookback_days=args.spike_lookback_days,
         spike_threshold_mult=args.spike_threshold_mult,
-        forecast_days=args.forecast_days,
-        forecast_lookback_days=args.forecast_lookback_days,
-        anomaly_lookback_days=args.anomaly_lookback_days,
-        anomaly_z_threshold=args.anomaly_z_threshold,
-        anomaly_min_cost=args.anomaly_min_cost,
         max_table_rows=args.max_table_rows,
         chart_max_points=args.chart_max_points,
         role_name=role_name,
@@ -2041,11 +1915,6 @@ def main() -> int:
             rows,
             spike_lookback_days=args.spike_lookback_days,
             spike_threshold_mult=args.spike_threshold_mult,
-            forecast_days=args.forecast_days,
-            forecast_lookback_days=args.forecast_lookback_days,
-            anomaly_lookback_days=args.anomaly_lookback_days,
-            anomaly_z_threshold=args.anomaly_z_threshold,
-            anomaly_min_cost=args.anomaly_min_cost,
         )
         summary["role"] = role_name
         summary["policy"] = policy

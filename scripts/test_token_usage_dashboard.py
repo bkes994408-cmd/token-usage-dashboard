@@ -10,9 +10,7 @@ from token_usage_dashboard import (
     build_summary,
     build_llm_pattern_analysis,
     detect_spikes,
-    detect_anomaly_alerts,
     downsample_rows,
-    forecast_daily_costs,
     generate_custom_report,
     main as dashboard_main,
     manage_tenant_config,
@@ -140,13 +138,6 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(len(summary_default["spikes"]), 0)
         self.assertEqual(len(summary_sensitive["spikes"]), 1)
 
-    def test_forecast_and_anomaly_are_preserved(self):
-        rows = [{"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": float(d)}]} for d in range(1, 20)]
-        forecast = forecast_daily_costs(rows, forecast_days=5, lookback_days=10)
-        alerts = detect_anomaly_alerts(rows + [{"date": "2026-03-20", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 80.0}]}], lookback_days=14, z_threshold=2.0, min_cost=1.0)
-        self.assertEqual(forecast["forecastDays"], 5)
-        self.assertEqual(len(forecast["predictions"]), 5)
-        self.assertGreaterEqual(len(alerts), 1)
 
     def test_dashboard_html_contains_all_pattern_sections(self):
         rows = [{
@@ -162,7 +153,7 @@ class TestTokenDashboard(TestCase):
         for text in [
             "Prompt tokens", "Completion tokens", "By Model Type", "By Project",
             "Hotspots · Top API Calls", "Hotspots · Top Sessions", "Hotspots · Top Workflows",
-            "Anonymized Prompt Keywords", "Cost Forecast (Next", "Anomaly Consumption Alerts"
+            "Anonymized Prompt Keywords"
         ]:
             self.assertIn(text, html)
 

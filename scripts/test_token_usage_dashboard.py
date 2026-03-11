@@ -8,6 +8,7 @@ from token_usage_dashboard import (
     build_dashboard_html,
     build_model_table_rows,
     build_summary,
+    build_llm_pattern_analysis,
     detect_spikes,
     downsample_rows,
     generate_custom_report,
@@ -41,6 +42,18 @@ class TestTokenDashboard(TestCase):
         self.assertAlmostEqual(totals["gpt-5"], 2.0)
         self.assertAlmostEqual(totals["o3"], 0.5)
 
+    def test_summary_includes_pattern_analysis(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}],
+                "llmCalls": [{"modelName": "gpt-5", "promptTokens": 10, "completionTokens": 20, "totalTokens": 30, "cost": 0.1, "prompt": "summarize logs"}],
+            }
+        ]
+        summary = build_summary("codex", rows)
+        self.assertIn("llmPatternAnalysis", summary)
+        self.assertTrue(summary["llmPatternAnalysis"]["available"])
+
     def test_summary_includes_7d_delta(self):
         rows = [
             {
@@ -58,6 +71,49 @@ class TestTokenDashboard(TestCase):
         self.assertIsInstance(summary["last7dDeltaPct"], float)
         self.assertTrue(len(summary["movers"]) >= 2)
         self.assertEqual(summary["movers"][0]["model"], "gpt-5")
+
+    def test_build_llm_pattern_analysis(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "llmCalls": [
+                    {
+                        "modelName": "gpt-5",
+                        "modelType": "chat",
+                        "useCase": "support",
+                        "userId": "alice",
+                        "projectId": "proj-a",
+                        "sessionId": "s1",
+                        "promptTokens": 100,
+                        "completionTokens": 200,
+                        "totalTokens": 300,
+                        "cost": 0.9,
+                        "latencyMs": 500,
+                        "prompt": "Please summarize Taiwan market outlook and risk factors",
+                    },
+                    {
+                        "modelName": "o3",
+                        "modelType": "reasoning",
+                        "useCase": "analysis",
+                        "userId": "bob",
+                        "projectId": "proj-b",
+                        "sessionId": "s2",
+                        "promptTokens": 400,
+                        "completionTokens": 120,
+                        "totalTokens": 520,
+                        "cost": 1.5,
+                        "latencyMs": 900,
+                        "prompt": "Analyze quarterly trend and optimization plan",
+                    },
+                ],
+            }
+        ]
+        analysis = build_llm_pattern_analysis(rows)
+        self.assertTrue(analysis["available"])
+        self.assertEqual(analysis["calls"], 2)
+        self.assertIn("dimensions", analysis)
+        self.assertTrue(len(analysis["efficiency"]) >= 2)
+        self.assertTrue(len(analysis["anonymizedPromptKeywords"]) > 0)
 
     def test_detect_spikes(self):
         rows = [
@@ -81,6 +137,56 @@ class TestTokenDashboard(TestCase):
         summary_sensitive = build_summary("codex", rows, spike_lookback_days=7, spike_threshold_mult=1.2)
         self.assertEqual(len(summary_default["spikes"]), 0)
         self.assertEqual(len(summary_sensitive["spikes"]), 1)
+
+
+    def test_dashboard_html_contains_all_pattern_sections(self):
+        rows = [{
+            "date": "2026-03-01",
+            "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}],
+            "llmCalls": [{
+                "modelName": "gpt-5", "modelType": "chat", "projectId": "proj-a", "useCase": "qa", "userId": "alice", "sessionId": "sess-1", "workflowId": "wf-1",
+                "promptTokens": 10, "completionTokens": 20, "totalTokens": 30, "cost": 0.2, "latencyMs": 200,
+                "prompt": "contact me at user@example.com and trace 1234567890 id 550e8400-e29b-41d4-a716-446655440000"
+            }]
+        }]
+        html = build_dashboard_html("codex", rows, top_models=2)
+        for text in [
+            "Prompt tokens", "Completion tokens", "By Model Type", "By Project",
+            "Hotspots · Top API Calls", "Hotspots · Top Sessions", "Hotspots · Top Workflows",
+            "Anonymized Prompt Keywords"
+        ]:
+            self.assertIn(text, html)
+
+    def test_anonymization_masks_sensitive_strings(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [{
+                "modelName": "gpt-5", "promptTokens": 1, "completionTokens": 1, "totalTokens": 2, "cost": 0.01,
+                "prompt": "Email user@example.com uuid 550e8400-e29b-41d4-a716-446655440000 number 987654321012"
+            }]
+        }]
+        analysis = build_llm_pattern_analysis(rows)
+        kws = {x["keyword"] for x in analysis["anonymizedPromptKeywords"]}
+        self.assertIn("<email>", kws)
+        self.assertIn("<uuid>", kws)
+        self.assertIn("<number>", kws)
+        for forbidden in ["user", "example", "550e8400", "987654321012"]:
+            self.assertFalse(any(forbidden in k for k in kws))
+
+    def test_large_dataset_performance_smoke(self):
+        import time
+        rows = []
+        for d in range(1, 2001):
+            rows.append({
+                "date": f"2026-01-{((d - 1) % 28) + 1:02d}",
+                "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}],
+                "llmCalls": [{"modelName": "gpt-5", "promptTokens": 100, "completionTokens": 200, "totalTokens": 300, "cost": 0.1, "sessionId": f"s{d}", "workflowId": f"w{d}", "prompt": f"task {d}"}],
+            })
+        t0 = time.perf_counter()
+        html = build_dashboard_html("codex", rows, top_models=3, chart_max_points=300)
+        elapsed = time.perf_counter() - t0
+        self.assertIn("LLM Usage Pattern Deep Analysis", html)
+        self.assertLess(elapsed, 6.0)
 
     def test_dashboard_html_contains_spike_visuals(self):
         rows = [
@@ -110,6 +216,7 @@ class TestTokenDashboard(TestCase):
         self.assertIn("copyDeepLink", html)
         self.assertIn("id=\"copyLinkBtn\"", html)
         self.assertIn("id=\"selectedDayMeta\"", html)
+        self.assertIn("LLM Usage Pattern Deep Analysis", html)
         self.assertIn("id=\"sortByDodToggle\"", html)
         self.assertIn("id=\"showOnlyChangesToggle\"", html)
         self.assertIn("sortByDodMode", html)

@@ -272,6 +272,9 @@ def _normalize_call_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         "project": str(c.get("projectId") or c.get("project") or "unknown"),
                         "session": str(c.get("sessionId") or c.get("conversationId") or "unknown"),
                         "workflow": str(c.get("workflowId") or c.get("flowId") or task),
+                        "department": str(c.get("department") or c.get("dept") or c.get("team") or "unknown"),
+                        "application": str(c.get("application") or c.get("app") or c.get("service") or "unknown"),
+                        "businessLine": str(c.get("businessLine") or c.get("bizLine") or c.get("costCenter") or "unknown"),
                         "promptTokens": prompt_tokens,
                         "completionTokens": completion_tokens,
                         "totalTokens": total_tokens,
@@ -330,8 +333,11 @@ def _tokenize_prompt_anonymized(text: str) -> List[str]:
     return out
 
 
-def build_llm_pattern_analysis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    records = _normalize_call_records(rows)
+def build_llm_pattern_analysis(
+    rows: List[Dict[str, Any]],
+    normalized_records: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
     if not records:
         return {"available": False, "reason": "No call-level payload (llmCalls/apiCalls/requests/events)."}
 
@@ -400,6 +406,157 @@ def build_llm_pattern_analysis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "efficiency": efficiency,
         "anonymizedPromptKeywords": [{"keyword": k, "count": v} for k, v in top_keywords],
+    }
+
+
+def build_cost_attribution(
+    rows: List[Dict[str, Any]],
+    top_n: int = 8,
+    normalized_records: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    day_total = sum(day_total_cost(r) for r in rows)
+    if not records:
+        return {
+            "available": False,
+            "reason": "No call-level payload (llmCalls/apiCalls/requests/events).",
+            "dimensions": {},
+            "unallocatedCostUSD": day_total,
+            "totalAttributedCostUSD": 0.0,
+        }
+
+    total_cost = sum(_safe_float(r.get("costUSD")) for r in records)
+
+    def _aggregate(key: str) -> List[Dict[str, Any]]:
+        agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "totalTokens": 0.0, "count": 0.0})
+        for r in records:
+            k = str(r.get(key) or "unknown")
+            agg[k]["costUSD"] += _safe_float(r.get("costUSD"))
+            agg[k]["totalTokens"] += _safe_float(r.get("totalTokens"))
+            agg[k]["count"] += 1.0
+        ranked = sorted(agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+        return [
+            {
+                "key": k,
+                "costUSD": v["costUSD"],
+                "totalTokens": v["totalTokens"],
+                "count": int(v["count"]),
+                "sharePct": (v["costUSD"] / total_cost * 100.0) if total_cost > 0 else 0.0,
+            }
+            for k, v in ranked
+        ]
+
+    dimensions = {
+        "project": _aggregate("project"),
+        "user": _aggregate("user"),
+        "department": _aggregate("department"),
+        "application": _aggregate("application"),
+        "businessLine": _aggregate("businessLine"),
+    }
+
+    return {
+        "available": True,
+        "totalAttributedCostUSD": total_cost,
+        "unallocatedCostUSD": max(0.0, day_total - total_cost),
+        "dimensions": dimensions,
+    }
+
+
+def build_optimization_recommendations(
+    rows: List[Dict[str, Any]],
+    pattern_analysis: Dict[str, Any],
+    attribution: Dict[str, Any],
+    max_items: int = 6,
+    normalized_records: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    if not records:
+        return {"available": False, "recommendations": []}
+
+    recs: List[Dict[str, Any]] = []
+
+    efficiency = pattern_analysis.get("efficiency") if isinstance(pattern_analysis.get("efficiency"), list) else []
+    priced = [x for x in efficiency if isinstance(x.get("costPer1kTokensUSD"), (int, float)) and _safe_float(x.get("totalTokens")) > 0]
+    priced_sorted = sorted(priced, key=lambda x: _safe_float(x.get("costPer1kTokensUSD")))
+    if len(priced_sorted) >= 2:
+        cheapest = priced_sorted[0]
+        expensive = priced_sorted[-1]
+        expensive_cpk = _safe_float(expensive.get("costPer1kTokensUSD"))
+        cheapest_cpk = _safe_float(cheapest.get("costPer1kTokensUSD"))
+        if cheapest_cpk > 0 and expensive_cpk >= cheapest_cpk * 1.5:
+            recs.append(
+                {
+                    "type": "model_rightsizing",
+                    "priority": "high",
+                    "title": f"Evaluate replacing costly model '{expensive.get('model')}' for non-critical traffic.",
+                    "rationale": f"Cost/1K tokens = {expensive_cpk:.4f} vs {cheapest_cpk:.4f} on '{cheapest.get('model')}'.",
+                    "estimatedSavingsPct": min(50.0, max(8.0, (1 - cheapest_cpk / expensive_cpk) * 100.0)),
+                    "actions": [
+                        "Route low-risk workflows to lower-cost model via policy/router.",
+                        "Run A/B quality tests before full migration.",
+                    ],
+                }
+            )
+
+    p = pattern_analysis.get("promptTokens") if isinstance(pattern_analysis.get("promptTokens"), dict) else {}
+    p95_prompt = _safe_float(p.get("p95"))
+    p50_prompt = _safe_float(p.get("p50"))
+    if p50_prompt > 0 and p95_prompt >= p50_prompt * 2.0:
+        recs.append(
+            {
+                "type": "prompt_optimization",
+                "priority": "medium",
+                "title": "Prompt length variance is high; standardize prompt templates.",
+                "rationale": f"Prompt p95={p95_prompt:.0f} tokens, p50={p50_prompt:.0f} tokens.",
+                "estimatedSavingsPct": 10.0,
+                "actions": [
+                    "Add prompt linting and max-token guards.",
+                    "Move verbose context to retrieval/cache instead of inline prompt.",
+                ],
+            }
+        )
+
+    tiny_calls = [r for r in records if _safe_float(r.get("totalTokens")) <= 300]
+    if len(tiny_calls) >= max(20, int(len(records) * 0.25)):
+        recs.append(
+            {
+                "type": "batching",
+                "priority": "medium",
+                "title": "High volume of tiny calls detected; batch requests where possible.",
+                "rationale": f"{len(tiny_calls)}/{len(records)} calls are <=300 tokens.",
+                "estimatedSavingsPct": 6.0,
+                "actions": [
+                    "Merge adjacent short prompts into batched calls.",
+                    "Enable response caching for repeated prompts.",
+                ],
+            }
+        )
+
+    project_top = attribution.get("dimensions", {}).get("project", []) if isinstance(attribution.get("dimensions"), dict) else []
+    if project_top and _safe_float(project_top[0].get("sharePct")) >= 40.0:
+        recs.append(
+            {
+                "type": "budget_guardrail",
+                "priority": "high",
+                "title": f"Top project '{project_top[0].get('key')}' dominates spend; enforce budget guardrails.",
+                "rationale": f"Project share = {_safe_float(project_top[0].get('sharePct')):.1f}% of attributed cost.",
+                "estimatedSavingsPct": 12.0,
+                "actions": [
+                    "Set project-level budget threshold alerts.",
+                    "Require approval for high-cost model usage in this project.",
+                ],
+            }
+        )
+
+    return {
+        "available": True,
+        "recommendations": recs[:max_items],
+        "integrationHooks": {
+            "cloudCostManagement": {
+                "awsCostExplorer": {"supported": False, "status": "placeholder"},
+                "gcpBilling": {"supported": False, "status": "placeholder"},
+            }
+        },
     }
 
 
@@ -918,7 +1075,10 @@ def build_summary(
     movers.sort(key=lambda x: x["deltaCostUSD"], reverse=True)
 
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
-    pattern_analysis = build_llm_pattern_analysis(rows)
+    normalized_records = _normalize_call_records(rows)
+    pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
+    attribution = build_cost_attribution(rows, normalized_records=normalized_records)
+    recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution, normalized_records=normalized_records)
     forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
     forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
     anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
@@ -945,6 +1105,8 @@ def build_summary(
         "costAnomalies": anomalies,
         "alerts": alerts,
         "llmPatternAnalysis": pattern_analysis,
+        "costAttribution": attribution,
+        "optimizationRecommendations": recommendations,
     }
 
 
@@ -1122,6 +1284,29 @@ def build_dashboard_html(
     prompt_stats = pattern.get("promptTokens", {}) if pattern.get("available") else {}
     completion_stats = pattern.get("completionTokens", {}) if pattern.get("available") else {}
 
+    attribution = summary.get("costAttribution") if isinstance(summary.get("costAttribution"), dict) else {"available": False}
+    recs = summary.get("optimizationRecommendations") if isinstance(summary.get("optimizationRecommendations"), dict) else {"available": False}
+
+    def _render_attribution_rows(items: List[Dict[str, Any]]) -> str:
+        if not items:
+            return "<tr><td colspan='6'>No attribution data</td></tr>"
+        return "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('key', 'unknown'))}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{float(x.get('totalTokens', 0.0)):,.0f}</td><td>{int(x.get('count', 0))}</td><td>{_safe_float(x.get('sharePct', 0.0)):.1f}%</td></tr>"
+            for i, x in enumerate(items[:8])
+        ])
+
+    attr_project_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("project", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+    attr_dept_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("department", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+    attr_user_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("user", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+    attr_app_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("application", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+    attr_business_line_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("businessLine", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+
+    rec_rows = "<tr><td colspan='6'>No recommendations</td></tr>"
+    if recs.get("available") and isinstance(recs.get("recommendations"), list) and recs.get("recommendations"):
+        rec_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(r.get('priority'))}</td><td>{esc(r.get('title'))}</td><td>{esc(r.get('rationale'))}</td><td>{_safe_float(r.get('estimatedSavingsPct', 0.0)):.1f}%</td><td>{esc('; '.join(r.get('actions', [])) if isinstance(r.get('actions'), list) else '')}</td></tr>"
+            for i, r in enumerate(recs.get("recommendations", [])[:6])
+        ])
 
     spike_by_date: Dict[str, Dict[str, float]] = {}
     for s in visible_spikes:
@@ -1320,6 +1505,39 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Keyword</th><th>Count</th></tr></thead>
     <tbody>{keyword_rows}</tbody>
+  </table>
+
+  <h3>Cost Attribution & Optimization Recommendations</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Attribute spend by project/department/user/application and provide actionable optimization suggestions. Cloud cost integration hooks are reserved for AWS Cost Explorer/GCP Billing.</div>
+  <h4>Attribution by Project</h4>
+  <table>
+    <thead><tr><th>#</th><th>Project</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_project_rows}</tbody>
+  </table>
+  <h4>Attribution by Department</h4>
+  <table>
+    <thead><tr><th>#</th><th>Department</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_dept_rows}</tbody>
+  </table>
+  <h4>Attribution by User</h4>
+  <table>
+    <thead><tr><th>#</th><th>User</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_user_rows}</tbody>
+  </table>
+  <h4>Attribution by Application</h4>
+  <table>
+    <thead><tr><th>#</th><th>Application</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_app_rows}</tbody>
+  </table>
+  <h4>Attribution by Business Line</h4>
+  <table>
+    <thead><tr><th>#</th><th>Business Line</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_business_line_rows}</tbody>
+  </table>
+  <h4>Optimization Recommendations</h4>
+  <table>
+    <thead><tr><th>#</th><th>Priority</th><th>Recommendation</th><th>Rationale</th><th>Est. Savings</th><th>Actions</th></tr></thead>
+    <tbody>{rec_rows}</tbody>
   </table>
 
 

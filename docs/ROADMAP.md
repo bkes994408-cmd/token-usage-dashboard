@@ -31,10 +31,11 @@
     *   提供不同 LLM 模型在處理特定任務時的效率（如：生成速度、響應時間）與成本效益對比分析，輔助模型選擇。
     *   透過對 prompt 內容的匿名化分析，識別出高頻使用的關鍵詞或主題，從業務層面提供成本優化線索。
 
-*   [ ] 成本歸因與優化建議
+*   [x] 成本歸因與優化建議
     *   支援將 token 成本精確歸因到具體項目、部門、用戶、特定應用或業務線，實現精細化成本管理。
     *   自動提供可行的成本優化建議（如：建議替換為更經濟的模型、優化 prompt 結構、實施批量調用）。
     *   預留接口，支援與企業現有的 Cloud Cost Management 工具（如 AWS Cost Explorer、Google Cloud Billing）集成，提供統一的成本視圖。
+    *   目前已實作：call-level 成本歸因（project/department/user/application/business line）、規則式優化建議、Cloud cost integration hooks placeholder。
 
 *   [ ] 報表自動化生成與排程
     *   允許用戶根據業務需求，自定義報表內容（選擇圖表、數據表格、關鍵指標）、佈局和格式。

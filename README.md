@@ -15,7 +15,9 @@ Interactive local dashboard for CodexBar usage/cost data.
 
 - New: LLM 使用模式深入分析（prompt/completion 分布、高消耗 hotspot、模型效率、匿名關鍵詞）
 - New: 成本預測與異常消耗預警（7/30 天 forecast、z-score anomaly、可配置預警規則與通知通道）
+- New: 成本歸因與優化建議（project/department/user/application/business line attribution + 規則式節流建議）
 - Note: notification 目前僅做 rule evaluation（在 summary/dashboard 顯示觸發結果與 channels），尚未實作主動 dispatch（email/Slack/Discord）。
+- Note: Cloud cost integration 目前提供 hooks placeholder（AWS Cost Explorer / GCP Billing），尚未串接實際 API。
 
 ## Quick start
 

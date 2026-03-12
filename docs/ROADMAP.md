@@ -37,8 +37,9 @@
     *   預留接口，支援與企業現有的 Cloud Cost Management 工具（如 AWS Cost Explorer、Google Cloud Billing）集成，提供統一的成本視圖。
     *   目前已實作：call-level 成本歸因（project/department/user/application/business line）、規則式優化建議、Cloud cost integration hooks placeholder。
 
-*   [ ] 報表自動化生成與排程
+*   [x] 報表自動化生成與排程
     *   允許用戶根據業務需求，自定義報表內容（選擇圖表、數據表格、關鍵指標）、佈局和格式。
     *   支援設定報表定期（每日、每週、每月、季度）自動生成，並通過郵件、應用內通知或集成到企業協作平台分發給指定收件人列表。
     *   提供一個集中的報表下載中心，用戶可以方便地查看和下載過去生成的報表，並支持報表歷史版本管理。
     *   報表的分發應嚴格遵守用戶或角色的數據訪問權限，確保敏感數據不會發送給未經授權的用戶。
+    *   目前已實作：scheduler job config（daily/weekly/monthly/quarterly）、JSON/CSV 自動產出、report history/download center (`report_history.json` + artifacts)、recipient role guardrail（未授權收件者會被 block 並記錄）。

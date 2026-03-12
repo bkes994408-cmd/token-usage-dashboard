@@ -333,11 +333,8 @@ def _tokenize_prompt_anonymized(text: str) -> List[str]:
     return out
 
 
-def build_llm_pattern_analysis(
-    rows: List[Dict[str, Any]],
-    normalized_records: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+def build_llm_pattern_analysis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    records = _normalize_call_records(rows)
     if not records:
         return {"available": False, "reason": "No call-level payload (llmCalls/apiCalls/requests/events)."}
 
@@ -409,20 +406,14 @@ def build_llm_pattern_analysis(
     }
 
 
-def build_cost_attribution(
-    rows: List[Dict[str, Any]],
-    top_n: int = 8,
-    normalized_records: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
-    day_total = sum(day_total_cost(r) for r in rows)
+def build_cost_attribution(rows: List[Dict[str, Any]], top_n: int = 8) -> Dict[str, Any]:
+    records = _normalize_call_records(rows)
     if not records:
         return {
             "available": False,
             "reason": "No call-level payload (llmCalls/apiCalls/requests/events).",
             "dimensions": {},
-            "unallocatedCostUSD": day_total,
-            "totalAttributedCostUSD": 0.0,
+            "unallocatedCostUSD": sum(day_total_cost(r) for r in rows),
         }
 
     total_cost = sum(_safe_float(r.get("costUSD")) for r in records)
@@ -457,7 +448,7 @@ def build_cost_attribution(
     return {
         "available": True,
         "totalAttributedCostUSD": total_cost,
-        "unallocatedCostUSD": max(0.0, day_total - total_cost),
+        "unallocatedCostUSD": 0.0,
         "dimensions": dimensions,
     }
 
@@ -467,9 +458,8 @@ def build_optimization_recommendations(
     pattern_analysis: Dict[str, Any],
     attribution: Dict[str, Any],
     max_items: int = 6,
-    normalized_records: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    records = _normalize_call_records(rows)
     if not records:
         return {"available": False, "recommendations": []}
 
@@ -1075,10 +1065,9 @@ def build_summary(
     movers.sort(key=lambda x: x["deltaCostUSD"], reverse=True)
 
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
-    normalized_records = _normalize_call_records(rows)
-    pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
-    attribution = build_cost_attribution(rows, normalized_records=normalized_records)
-    recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution, normalized_records=normalized_records)
+    pattern_analysis = build_llm_pattern_analysis(rows)
+    attribution = build_cost_attribution(rows)
+    recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution)
     forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
     forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
     anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
@@ -1299,7 +1288,6 @@ def build_dashboard_html(
     attr_dept_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("department", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
     attr_user_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("user", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
     attr_app_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("application", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
-    attr_business_line_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("businessLine", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
 
     rec_rows = "<tr><td colspan='6'>No recommendations</td></tr>"
     if recs.get("available") and isinstance(recs.get("recommendations"), list) and recs.get("recommendations"):
@@ -1528,11 +1516,6 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Application</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
     <tbody>{attr_app_rows}</tbody>
-  </table>
-  <h4>Attribution by Business Line</h4>
-  <table>
-    <thead><tr><th>#</th><th>Business Line</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_business_line_rows}</tbody>
   </table>
   <h4>Optimization Recommendations</h4>
   <table>

@@ -3,12 +3,16 @@
 from pathlib import Path
 from unittest import TestCase, main
 
+import token_usage_dashboard as dashboard_module
+
 from token_usage_dashboard import (
     apply_access_policy,
     build_dashboard_html,
     build_model_table_rows,
     build_summary,
     build_llm_pattern_analysis,
+    build_cost_attribution,
+    build_optimization_recommendations,
     detect_spikes,
     detect_cost_anomalies,
     evaluate_alert_rules,
@@ -122,6 +126,113 @@ class TestTokenDashboard(TestCase):
         self.assertTrue(len(analysis["efficiency"]) >= 2)
         self.assertTrue(len(analysis["anonymizedPromptKeywords"]) > 0)
 
+    def test_build_cost_attribution_unallocated_and_dimensions(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}],
+                "llmCalls": [
+                    {
+                        "modelName": "gpt-5",
+                        "projectId": "proj-a",
+                        "userId": "alice",
+                        "department": "eng",
+                        "application": "api-gateway",
+                        "businessLine": "consumer",
+                        "totalTokens": 100,
+                        "cost": 1.2,
+                    },
+                    {
+                        "modelName": "o3",
+                        "projectId": "proj-b",
+                        "userId": "bob",
+                        "department": "sales",
+                        "application": "crm",
+                        "businessLine": "enterprise",
+                        "totalTokens": 80,
+                        "cost": 0.8,
+                    },
+                ],
+            }
+        ]
+        attribution = build_cost_attribution(rows)
+        self.assertTrue(attribution["available"])
+        self.assertAlmostEqual(attribution["totalAttributedCostUSD"], 2.0)
+        self.assertAlmostEqual(attribution["unallocatedCostUSD"], 1.0)
+        self.assertIn("businessLine", attribution["dimensions"])
+        self.assertEqual(attribution["dimensions"]["businessLine"][0]["key"], "consumer")
+
+    def test_build_cost_attribution_share_sort_topn_and_unknown_fallback(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "llmCalls": [
+                    {"projectId": "proj-a", "cost": 3.0, "totalTokens": 30},
+                    {"projectId": "proj-b", "cost": 2.0, "totalTokens": 20},
+                    {"projectId": "proj-c", "cost": 1.0, "totalTokens": 10},
+                    {"projectId": "proj-d", "cost": 0.5, "totalTokens": 5},
+                    {"cost": 0.5, "totalTokens": 5},
+                ],
+            }
+        ]
+        attribution = build_cost_attribution(rows, top_n=3)
+        projects = attribution["dimensions"]["project"]
+        self.assertEqual([p["key"] for p in projects], ["proj-a", "proj-b", "proj-c"])
+        share_sum = sum(p["sharePct"] for p in attribution["dimensions"]["project"])
+        self.assertAlmostEqual(share_sum, 85.71428571428571)
+
+        attribution_all = build_cost_attribution(rows, top_n=10)
+        all_projects = attribution_all["dimensions"]["project"]
+        self.assertIn("unknown", [p["key"] for p in all_projects])
+        self.assertAlmostEqual(sum(p["sharePct"] for p in all_projects), 100.0)
+
+    def test_build_optimization_recommendations_trigger_conditions(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "llmCalls": [
+                    {"projectId": "proj-a", "totalTokens": 100, "cost": 0.5},
+                    {"projectId": "proj-a", "totalTokens": 110, "cost": 0.6},
+                ] + [{"projectId": "proj-a", "totalTokens": 100, "cost": 0.2} for _ in range(25)],
+            }
+        ]
+        pattern_analysis = {
+            "efficiency": [
+                {"model": "cheap", "costPer1kTokensUSD": 0.01, "totalTokens": 1000},
+                {"model": "expensive", "costPer1kTokensUSD": 0.03, "totalTokens": 1000},
+            ],
+            "promptTokens": {"p50": 100, "p95": 250},
+        }
+        attribution = {
+            "dimensions": {
+                "project": [
+                    {"key": "proj-a", "sharePct": 55.0},
+                    {"key": "proj-b", "sharePct": 20.0},
+                ]
+            }
+        }
+        recs = build_optimization_recommendations(rows, pattern_analysis, attribution)
+        self.assertTrue(recs["available"])
+        rec_types = {r["type"] for r in recs["recommendations"]}
+        self.assertIn("model_rightsizing", rec_types)
+        self.assertIn("prompt_optimization", rec_types)
+        self.assertIn("batching", rec_types)
+        self.assertIn("budget_guardrail", rec_types)
+
+    def test_build_summary_normalizes_call_records_once(self):
+        from unittest.mock import patch
+
+        rows = [{
+            "date": "2026-03-01",
+            "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}],
+            "llmCalls": [{"modelName": "gpt-5", "totalTokens": 10, "cost": 0.2}],
+        }]
+
+        with patch("token_usage_dashboard._normalize_call_records", wraps=dashboard_module._normalize_call_records) as normalize_spy:
+            summary = build_summary("codex", rows)
+        self.assertIn("costAttribution", summary)
+        self.assertEqual(normalize_spy.call_count, 1)
+
     def test_detect_spikes(self):
         rows = [
             {"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}
@@ -196,7 +307,7 @@ class TestTokenDashboard(TestCase):
             "Prompt tokens", "Completion tokens", "By Model Type", "By Project",
             "Hotspots · Top API Calls", "Hotspots · Top Sessions", "Hotspots · Top Workflows",
             "Anonymized Prompt Keywords", "Cost Attribution & Optimization Recommendations",
-            "Optimization Recommendations", "Attribution by Department"
+            "Optimization Recommendations", "Attribution by Department", "Attribution by Business Line"
         ]:
             self.assertIn(text, html)
 

@@ -14,6 +14,7 @@ import sys
 import webbrowser
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -1172,6 +1173,242 @@ def generate_custom_report(
     return out
 
 
+def _safe_report_job_id(value: Any, fallback: str) -> str:
+    raw = str(value or "").strip().lower()
+    sanitized = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
+    return sanitized or fallback
+
+
+def _normalize_report_jobs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    jobs_raw = config.get("jobs")
+    if not isinstance(jobs_raw, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for idx, job in enumerate(jobs_raw, start=1):
+        if not isinstance(job, dict):
+            continue
+        metrics_raw = job.get("metrics")
+        metrics = [str(x).strip() for x in metrics_raw] if isinstance(metrics_raw, list) else ["total_cost"]
+        models_raw = job.get("models")
+        models = [str(x).strip() for x in models_raw if str(x).strip()] if isinstance(models_raw, list) else []
+        recipients_raw = job.get("recipients")
+        recipients = [x for x in recipients_raw if isinstance(x, dict)] if isinstance(recipients_raw, list) else []
+        out.append({
+            "id": _safe_report_job_id(job.get("id"), f"job-{idx}"),
+            "name": str(job.get("name") or f"Scheduled Report {idx}"),
+            "enabled": bool(job.get("enabled", True)),
+            "frequency": str(job.get("frequency") or "daily").lower(),
+            "granularity": str(job.get("granularity") or "daily").lower(),
+            "metrics": metrics,
+            "models": models,
+            "layout": job.get("layout") if isinstance(job.get("layout"), dict) else {},
+            "orgId": str(job.get("orgId") or "").strip() or None,
+            "user": str(job.get("user") or "").strip() or None,
+            "role": str(job.get("role") or "").strip() or None,
+            "dashboardView": str(job.get("dashboardView") or "").strip() or None,
+            "allowedRoles": [str(x).strip() for x in (job.get("allowedRoles") or []) if str(x).strip()],
+            "recipients": recipients,
+            "formats": [str(x).strip().lower() for x in (job.get("formats") or ["json"]) if str(x).strip()],
+        })
+    return out
+
+
+def _frequency_due(frequency: str, now: datetime, history: Optional[Dict[str, Any]]) -> bool:
+    last_ts = history.get("generatedAt") if isinstance(history, dict) else None
+    if not isinstance(last_ts, str):
+        return True
+    try:
+        last = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+    except Exception:
+        return True
+
+    freq = (frequency or "daily").lower()
+    if freq == "daily":
+        return now.date() > last.date()
+    if freq == "weekly":
+        return now.isocalendar()[:2] != last.isocalendar()[:2]
+    if freq == "monthly":
+        return (now.year, now.month) != (last.year, last.month)
+    if freq == "quarterly":
+        return (now.year, (now.month - 1) // 3) != (last.year, (last.month - 1) // 3)
+    return True
+
+
+def _history_path(output_dir: Path) -> Path:
+    return output_dir / "report_history.json"
+
+
+def _load_report_history(output_dir: Path) -> Dict[str, Any]:
+    path = _history_path(output_dir)
+    if not path.exists():
+        return {"reports": [], "latestByJob": {}}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"reports": [], "latestByJob": {}}
+    if not isinstance(raw, dict):
+        return {"reports": [], "latestByJob": {}}
+    if not isinstance(raw.get("reports"), list):
+        raw["reports"] = []
+    if not isinstance(raw.get("latestByJob"), dict):
+        raw["latestByJob"] = {}
+    return raw
+
+
+def _write_report_history(output_dir: Path, history: Dict[str, Any]) -> None:
+    _history_path(output_dir).write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _export_report_csv(rows: List[Dict[str, Any]], path: Path) -> None:
+    if not rows:
+        path.write_text("period\n", encoding="utf-8")
+        return
+    keys = ["period"] + [k for k in rows[0].keys() if k != "period"]
+    lines = [",".join(keys)]
+    for row in rows:
+        vals = []
+        for k in keys:
+            v = row.get(k, "")
+            text = str(v)
+            if any(ch in text for ch in [",", '"', "\n"]):
+                text = '"' + text.replace('"', '""') + '"'
+            vals.append(text)
+        lines.append(",".join(vals))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _recipient_allowed(recipient: Dict[str, Any], role_name: str, job_allowed_roles: List[str]) -> bool:
+    allowed_roles = [str(x).strip() for x in recipient.get("allowedRoles", []) if str(x).strip()] if isinstance(recipient.get("allowedRoles"), list) else []
+    effective_allowed = allowed_roles or job_allowed_roles
+    if not effective_allowed:
+        return True
+    return role_name in effective_allowed
+
+
+def run_report_scheduler(
+    payload: Dict[str, Any],
+    provider: str,
+    config: Dict[str, Any],
+    output_dir: Path,
+    *,
+    tenant_config_path: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    now_dt = now or datetime.now(ZoneInfo("UTC"))
+    jobs = _normalize_report_jobs(config)
+    history = _load_report_history(output_dir)
+    latest_by_job = history.get("latestByJob") if isinstance(history.get("latestByJob"), dict) else {}
+
+    result = {"now": now_dt.isoformat(), "jobs": [], "generated": 0, "skipped": 0}
+
+    for job in jobs:
+        job_id = str(job["id"])
+        if not job.get("enabled", True):
+            result["jobs"].append({"jobId": job_id, "status": "skipped", "reason": "disabled"})
+            result["skipped"] += 1
+            continue
+        if not _frequency_due(str(job.get("frequency", "daily")), now_dt, latest_by_job.get(job_id)):
+            result["jobs"].append({"jobId": job_id, "status": "skipped", "reason": "not_due"})
+            result["skipped"] += 1
+            continue
+
+        if tenant_config_path and job.get("orgId"):
+            rows, role_name, _, tenant_meta = resolve_multi_tenant_context(
+                payload=payload,
+                tenant_config_path=tenant_config_path,
+                org_id=str(job.get("orgId")),
+                role=job.get("role"),
+                user=job.get("user"),
+                requested_dashboard=job.get("dashboardView"),
+                allow_role_override=False,
+            )
+        else:
+            rows = parse_daily(payload)
+            role_name = str(job.get("role") or "admin")
+            tenant_meta = {}
+
+        report_rows = generate_custom_report(
+            rows,
+            metrics=job.get("metrics") or ["total_cost"],
+            models=job.get("models") or [],
+            granularity=str(job.get("granularity") or "daily"),
+        )
+        ts = now_dt.strftime("%Y%m%dT%H%M%SZ")
+        job_dir = output_dir / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        base = f"{job_id}_{ts}"
+        artifact_paths: Dict[str, str] = {}
+
+        summary = build_summary(provider, rows)
+        report_payload = {
+            "job": {
+                "id": job_id,
+                "name": job.get("name"),
+                "frequency": job.get("frequency"),
+                "granularity": job.get("granularity"),
+                "layout": job.get("layout") or {},
+            },
+            "generatedAt": now_dt.isoformat(),
+            "provider": provider,
+            "role": role_name,
+            "tenant": tenant_meta or None,
+            "summary": summary,
+            "reportRows": report_rows,
+        }
+
+        formats = job.get("formats") if isinstance(job.get("formats"), list) else ["json"]
+        if "json" in formats:
+            json_path = job_dir / f"{base}.json"
+            json_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            artifact_paths["json"] = str(json_path)
+        if "csv" in formats:
+            csv_path = job_dir / f"{base}.csv"
+            _export_report_csv(report_rows, csv_path)
+            artifact_paths["csv"] = str(csv_path)
+
+        deliveries = []
+        for recipient in job.get("recipients") or []:
+            if not isinstance(recipient, dict):
+                continue
+            if not _recipient_allowed(recipient, role_name, job.get("allowedRoles") or []):
+                deliveries.append({
+                    "target": recipient.get("target"),
+                    "channel": recipient.get("channel"),
+                    "status": "blocked",
+                    "reason": "role_not_allowed",
+                })
+                continue
+            deliveries.append({
+                "target": recipient.get("target"),
+                "channel": recipient.get("channel"),
+                "status": "queued",
+            })
+
+        history_item = {
+            "jobId": job_id,
+            "jobName": job.get("name"),
+            "generatedAt": now_dt.isoformat(),
+            "frequency": job.get("frequency"),
+            "granularity": job.get("granularity"),
+            "artifacts": artifact_paths,
+            "deliveries": deliveries,
+            "layout": job.get("layout") or {},
+            "tenant": tenant_meta or None,
+        }
+        history["reports"].append(history_item)
+        latest_by_job[job_id] = {"generatedAt": now_dt.isoformat(), "artifacts": artifact_paths}
+
+        result["jobs"].append({"jobId": job_id, "status": "generated", "artifacts": artifact_paths, "deliveries": deliveries})
+        result["generated"] += 1
+
+    history["latestByJob"] = latest_by_job
+    _write_report_history(output_dir, history)
+    return result
+
+
 def build_dashboard_html(
     provider: str,
     rows: List[Dict[str, Any]],
@@ -2249,6 +2486,10 @@ def main() -> int:
     parser.add_argument("--view-models", help="Comma-separated allowed model names for view create/update")
     parser.add_argument("--view-max-days", type=positive_int, help="Max days filter for view create/update")
     parser.add_argument("--view-group", help="Group name for view assign/unassign")
+    parser.add_argument("--report-scheduler-config", help="Path to report scheduler JSON config")
+    parser.add_argument("--run-report-scheduler", action="store_true", help="Run report automation jobs and update report history center")
+    parser.add_argument("--report-output-dir", default="report_center", help="Directory for generated scheduled reports/history")
+    parser.add_argument("--scheduler-now", help="Override scheduler time (ISO8601, UTC recommended)")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
 
@@ -2281,6 +2522,27 @@ def main() -> int:
     except Exception as exc:
         eprint(str(exc))
         return 1
+
+    if args.run_report_scheduler:
+        if not args.report_scheduler_config:
+            eprint("--report-scheduler-config is required with --run-report-scheduler")
+            return 8
+        try:
+            scheduler_config = json.loads(Path(args.report_scheduler_config).read_text(encoding="utf-8"))
+            now_dt = datetime.fromisoformat(args.scheduler_now.replace("Z", "+00:00")) if args.scheduler_now else None
+            scheduler_result = run_report_scheduler(
+                payload=payload,
+                provider=args.provider,
+                config=scheduler_config if isinstance(scheduler_config, dict) else {},
+                output_dir=Path(args.report_output_dir),
+                tenant_config_path=args.tenant_config,
+                now=now_dt,
+            )
+        except Exception as exc:
+            eprint(f"Failed to run report scheduler: {exc}")
+            return 9
+        print(json.dumps(scheduler_result, ensure_ascii=False, indent=2))
+        return 0
 
     tenant_meta: Dict[str, Any] = {}
     if args.tenant_config:

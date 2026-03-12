@@ -25,6 +25,7 @@ from token_usage_dashboard import (
     prepare_chart_series,
     resolve_access_policy,
     resolve_multi_tenant_context,
+    run_report_scheduler,
 )
 
 
@@ -636,6 +637,86 @@ class TestTokenDashboard(TestCase):
                 manage_tenant_config(path, "org-a", None, None, None, None, "assign", "missing-view", None, None, "analytics")
         finally:
             os.unlink(path)
+
+    def test_run_report_scheduler_generates_artifacts_and_history(self):
+        import json, os, tempfile
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        payload = {
+            "provider": "codex",
+            "daily": [
+                {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.5}]},
+                {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 2.0}]},
+            ],
+        }
+        config = {
+            "jobs": [
+                {
+                    "id": "finance-weekly",
+                    "name": "Finance Weekly",
+                    "frequency": "weekly",
+                    "granularity": "weekly",
+                    "metrics": ["total_cost", "active_models"],
+                    "formats": ["json", "csv"],
+                    "recipients": [{"channel": "email", "target": "finance@example.com"}],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(result["generated"], 1)
+            history_path = Path(tmpdir) / "report_history.json"
+            self.assertTrue(history_path.exists())
+            history = json.loads(history_path.read_text())
+            self.assertEqual(len(history["reports"]), 1)
+            artifacts = history["reports"][0]["artifacts"]
+            self.assertTrue(Path(artifacts["json"]).exists())
+            self.assertTrue(Path(artifacts["csv"]).exists())
+
+    def test_run_report_scheduler_blocks_unauthorized_recipient(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import tempfile
+
+        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]}
+        config = {
+            "jobs": [
+                {
+                    "id": "viewer-only",
+                    "frequency": "daily",
+                    "role": "viewer",
+                    "allowedRoles": ["admin"],
+                    "recipients": [{"channel": "email", "target": "ops@example.com"}],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            deliveries = result["jobs"][0]["deliveries"]
+            self.assertEqual(deliveries[0]["status"], "blocked")
+            self.assertEqual(deliveries[0]["reason"], "role_not_allowed")
+
+    def test_scheduler_cli_requires_config(self):
+        import sys
+        from unittest.mock import patch
+
+        argv = ["token_usage_dashboard.py", "--run-report-scheduler"]
+        with patch.object(sys, "argv", argv), patch("token_usage_dashboard.load_payload", return_value={"daily": []}):
+            rc = dashboard_main()
+        self.assertEqual(rc, 8)
 
     def test_alert_config_parsing_tolerates_invalid_numbers(self):
         rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]

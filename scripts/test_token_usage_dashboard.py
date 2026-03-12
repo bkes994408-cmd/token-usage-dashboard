@@ -56,6 +56,10 @@ class TestTokenDashboard(TestCase):
         summary = build_summary("codex", rows)
         self.assertIn("llmPatternAnalysis", summary)
         self.assertTrue(summary["llmPatternAnalysis"]["available"])
+        self.assertIn("costAttribution", summary)
+        self.assertTrue(summary["costAttribution"]["available"])
+        self.assertIn("optimizationRecommendations", summary)
+        self.assertTrue(summary["optimizationRecommendations"]["available"])
 
     def test_summary_includes_7d_delta(self):
         rows = [
@@ -191,7 +195,8 @@ class TestTokenDashboard(TestCase):
         for text in [
             "Prompt tokens", "Completion tokens", "By Model Type", "By Project",
             "Hotspots · Top API Calls", "Hotspots · Top Sessions", "Hotspots · Top Workflows",
-            "Anonymized Prompt Keywords"
+            "Anonymized Prompt Keywords", "Cost Attribution & Optimization Recommendations",
+            "Optimization Recommendations", "Attribution by Department"
         ]:
             self.assertIn(text, html)
 

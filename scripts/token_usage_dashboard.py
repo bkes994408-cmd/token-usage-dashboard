@@ -581,6 +581,16 @@ def _load_alert_config(path: Optional[str]) -> Dict[str, Any]:
     return parsed
 
 
+def _load_cost_control_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Cost control config must be a JSON object.")
+    return parsed
+
+
 def resolve_access_policy(role: Optional[str], user: Optional[str], rbac_config_path: Optional[str]) -> Tuple[str, Dict[str, Any]]:
     cfg = _load_rbac_config(rbac_config_path)
     users = cfg.get("users") if isinstance(cfg.get("users"), dict) else {}
@@ -966,6 +976,96 @@ def evaluate_alert_rules(
     }
 
 
+def evaluate_realtime_cost_controls(
+    rows: List[Dict[str, Any]],
+    forecast_7d: Dict[str, Any],
+    anomalies: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+    normalized_records: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    cfg = config or {}
+    layers = cfg.get("layers") if isinstance(cfg.get("layers"), list) else []
+    if not layers:
+        return {"available": False, "layers": [], "triggeredActions": []}
+
+    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    total_cost = sum(day_total_cost(r) for r in rows)
+    anomaly_count = len(anomalies)
+
+    dim_cost: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for r in records:
+        c = _safe_float(r.get("costUSD"))
+        for dim in ("project", "department", "user", "application", "businessLine", "model"):
+            dim_cost[dim][str(r.get(dim) or "unknown")] += c
+
+    evaluated_layers: List[Dict[str, Any]] = []
+    actions: List[Dict[str, Any]] = []
+
+    for idx, layer in enumerate(layers, start=1):
+        if not isinstance(layer, dict):
+            continue
+        layer_id = str(layer.get("id") or f"layer-{idx}")
+        metric = str(layer.get("metric") or "forecast_7d_total_cost")
+        action = str(layer.get("action") or "degrade")
+        threshold = _safe_float(layer.get("threshold"), default=0.0)
+        if threshold <= 0:
+            evaluated_layers.append({"id": layer_id, "triggered": False, "reason": "invalid_threshold"})
+            continue
+
+        value = 0.0
+        scope_label = "global"
+        if metric == "forecast_7d_total_cost":
+            value = _safe_float(forecast_7d.get("predictedTotalCostUSD"))
+        elif metric == "actual_total_cost":
+            value = total_cost
+        elif metric == "anomaly_count":
+            value = float(anomaly_count)
+        elif metric == "dimension_cost":
+            dimension = str(layer.get("dimension") or "project")
+            key = str(layer.get("key") or "")
+            if key:
+                value = _safe_float(dim_cost.get(dimension, {}).get(key, 0.0))
+                scope_label = f"{dimension}:{key}"
+            else:
+                bucket = dim_cost.get(dimension, {})
+                if bucket:
+                    top_key, top_value = sorted(bucket.items(), key=lambda kv: kv[1], reverse=True)[0]
+                    value = _safe_float(top_value)
+                    scope_label = f"{dimension}:{top_key}"
+        else:
+            evaluated_layers.append({"id": layer_id, "triggered": False, "reason": f"unsupported_metric:{metric}"})
+            continue
+
+        triggered = value >= threshold
+        layer_result = {
+            "id": layer_id,
+            "metric": metric,
+            "value": value,
+            "threshold": threshold,
+            "triggered": triggered,
+            "scope": scope_label,
+            "action": action,
+        }
+        evaluated_layers.append(layer_result)
+        if triggered:
+            actions.append(
+                {
+                    "layerId": layer_id,
+                    "scope": scope_label,
+                    "action": action,
+                    "message": str(layer.get("message") or f"{action} triggered on {scope_label}: {value:.2f} >= {threshold:.2f}"),
+                    "routeToModel": layer.get("routeToModel"),
+                    "stopReason": layer.get("stopReason"),
+                }
+            )
+
+    return {
+        "available": True,
+        "layers": evaluated_layers,
+        "triggeredActions": actions,
+    }
+
+
 def prepare_chart_series(rows: List[Dict[str, Any]], top_models: int) -> Tuple[List[str], Dict[str, List[float]], List[float]]:
     totals = model_totals(rows)
     top = [m for m, _ in sorted(totals.items(), key=lambda x: x[1], reverse=True)[:top_models]]
@@ -1048,6 +1148,7 @@ def build_summary(
     spike_lookback_days: int = 7,
     spike_threshold_mult: float = 2.0,
     alert_config: Optional[Dict[str, Any]] = None,
+    cost_control_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -1084,6 +1185,13 @@ def build_summary(
     forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
     anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
     alerts = evaluate_alert_rules(rows, forecast7, anomalies, config=alert_config)
+    cost_controls = evaluate_realtime_cost_controls(
+        rows,
+        forecast7,
+        anomalies,
+        config=cost_control_config,
+        normalized_records=normalized_records,
+    )
 
     return {
         "provider": provider,
@@ -1105,6 +1213,7 @@ def build_summary(
         },
         "costAnomalies": anomalies,
         "alerts": alerts,
+        "realTimeCostControls": cost_controls,
         "llmPatternAnalysis": pattern_analysis,
         "costAttribution": attribution,
         "optimizationRecommendations": recommendations,
@@ -1420,6 +1529,7 @@ def build_dashboard_html(
     role_name: str = "admin",
     policy: Optional[Dict[str, Any]] = None,
     alert_config: Optional[Dict[str, Any]] = None,
+    cost_control_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -1443,6 +1553,7 @@ def build_dashboard_html(
         spike_lookback_days=spike_lookback_days,
         spike_threshold_mult=spike_threshold_mult,
         alert_config=alert_config,
+        cost_control_config=cost_control_config,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -1476,6 +1587,23 @@ def build_dashboard_html(
         f"<tr><td>{i+1}</td><td>{esc(a.get('date'))}</td><td>{usd(float(a.get('costUSD', 0.0)))}</td><td>{_safe_float(a.get('zScore', 0.0)):.2f}</td><td>{esc(a.get('severity'))}</td></tr>"
         for i, a in enumerate(anomalies[:10])
     ]) or "<tr><td colspan='5'>No anomaly detected</td></tr>"
+
+    cost_controls = summary.get("realTimeCostControls") if isinstance(summary.get("realTimeCostControls"), dict) else {"available": False}
+    cost_control_layer_rows = "<tr><td colspan='7'>No real-time cost control policy configured</td></tr>"
+    if cost_controls.get("available") and isinstance(cost_controls.get("layers"), list):
+        items = cost_controls.get("layers", [])
+        if items:
+            cost_control_layer_rows = "\n".join([
+                f"<tr><td>{i+1}</td><td>{esc(x.get('id'))}</td><td>{esc(x.get('scope'))}</td><td>{esc(x.get('metric'))}</td><td>{float(x.get('value', 0.0)):.2f}</td><td>{float(x.get('threshold', 0.0)):.2f}</td><td>{'yes' if x.get('triggered') else 'no'}</td></tr>"
+                for i, x in enumerate(items[:12])
+            ])
+
+    cost_control_action_rows = "<tr><td colspan='6'>No control action triggered</td></tr>"
+    if cost_controls.get("available") and isinstance(cost_controls.get("triggeredActions"), list) and cost_controls.get("triggeredActions"):
+        cost_control_action_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('layerId'))}</td><td>{esc(x.get('scope'))}</td><td>{esc(x.get('action'))}</td><td>{esc(x.get('routeToModel') or '—')}</td><td>{esc(x.get('message'))}</td></tr>"
+            for i, x in enumerate(cost_controls.get("triggeredActions", [])[:12])
+        ])
 
     pattern = summary.get("llmPatternAnalysis") if isinstance(summary.get("llmPatternAnalysis"), dict) else {"available": False}
     def _render_pattern_rows(items: List[Dict[str, Any]], key_name: str = "key") -> str:
@@ -1683,6 +1811,18 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Rule</th><th>Severity</th><th>Message</th></tr></thead>
     <tbody>{alert_rows}</tbody>
+  </table>
+
+  <h3>Real-time Cost Control Strategy</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Multi-layer budget guardrails. Triggered actions can instruct router to degrade/switch/stop calls.</div>
+  <table>
+    <thead><tr><th>#</th><th>Layer</th><th>Scope</th><th>Metric</th><th>Value</th><th>Threshold</th><th>Triggered</th></tr></thead>
+    <tbody>{cost_control_layer_rows}</tbody>
+  </table>
+  <h4>Triggered Control Actions</h4>
+  <table>
+    <thead><tr><th>#</th><th>Layer</th><th>Scope</th><th>Action</th><th>Route Model</th><th>Message</th></tr></thead>
+    <tbody>{cost_control_action_rows}</tbody>
   </table>
 
   <h3>LLM Usage Pattern Deep Analysis</h3>
@@ -2470,6 +2610,7 @@ def main() -> int:
     parser.add_argument("--max-table-rows", type=positive_int, default=120, help="Render at most N model rows in summary tables")
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
     parser.add_argument("--alert-config", help="Path to alert rules/notification channels JSON")
+    parser.add_argument("--cost-control-config", help="Path to real-time cost control policy JSON")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -2580,6 +2721,12 @@ def main() -> int:
         eprint(f"Failed to load alert config: {exc}")
         return 7
 
+    try:
+        cost_control_config = _load_cost_control_config(args.cost_control_config)
+    except Exception as exc:
+        eprint(f"Failed to load cost control config: {exc}")
+        return 10
+
     html = build_dashboard_html(
         args.provider,
         rows,
@@ -2591,6 +2738,7 @@ def main() -> int:
         role_name=role_name,
         policy=policy,
         alert_config=alert_config,
+        cost_control_config=cost_control_config,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -2602,6 +2750,7 @@ def main() -> int:
             spike_lookback_days=args.spike_lookback_days,
             spike_threshold_mult=args.spike_threshold_mult,
             alert_config=alert_config,
+            cost_control_config=cost_control_config,
         )
         summary["role"] = role_name
         summary["policy"] = policy

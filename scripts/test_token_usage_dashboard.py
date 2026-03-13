@@ -16,6 +16,7 @@ from token_usage_dashboard import (
     detect_spikes,
     detect_cost_anomalies,
     evaluate_alert_rules,
+    evaluate_realtime_cost_controls,
     forecast_cost,
     downsample_rows,
     generate_custom_report,
@@ -291,6 +292,52 @@ class TestTokenDashboard(TestCase):
         self.assertIn("costAnomalies", summary)
         self.assertIn("alerts", summary)
         self.assertIn("next7Days", summary["forecast"])
+
+    def test_evaluate_realtime_cost_controls_triggers_multi_layers(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "modelBreakdowns": [{"modelName": "gpt-5", "cost": 6.0}],
+                "llmCalls": [
+                    {"projectId": "proj-a", "cost": 4.0, "totalTokens": 100},
+                    {"projectId": "proj-b", "cost": 1.0, "totalTokens": 30},
+                ],
+            }
+        ]
+        controls = evaluate_realtime_cost_controls(
+            rows,
+            forecast_7d={"predictedTotalCostUSD": 20.0},
+            anomalies=[{"date": "2026-03-01", "zScore": 3.1}],
+            config={
+                "layers": [
+                    {"id": "global-forecast", "metric": "forecast_7d_total_cost", "threshold": 10, "action": "degrade", "routeToModel": "o3-mini"},
+                    {"id": "project-cap", "metric": "dimension_cost", "dimension": "project", "key": "proj-a", "threshold": 3.0, "action": "switch_model", "routeToModel": "gpt-4.1-mini"},
+                    {"id": "anomaly-circuit", "metric": "anomaly_count", "threshold": 1, "action": "stop_calls", "stopReason": "anomaly_spike"},
+                ]
+            },
+        )
+        self.assertTrue(controls["available"])
+        self.assertEqual(len(controls["layers"]), 3)
+        self.assertEqual(len(controls["triggeredActions"]), 3)
+        self.assertIn("project:proj-a", [x["scope"] for x in controls["triggeredActions"]])
+
+    def test_summary_and_dashboard_include_realtime_cost_control_section(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}], "llmCalls": [{"projectId": "proj-a", "cost": 2.0, "totalTokens": 50}]}]
+        summary = build_summary(
+            "codex",
+            rows,
+            cost_control_config={
+                "layers": [
+                    {"id": "global-cap", "metric": "actual_total_cost", "threshold": 2.5, "action": "degrade", "routeToModel": "o3-mini"}
+                ]
+            },
+        )
+        self.assertIn("realTimeCostControls", summary)
+        self.assertTrue(summary["realTimeCostControls"]["available"])
+
+        html = build_dashboard_html("codex", rows, top_models=2, cost_control_config={"layers": [{"id": "global-cap", "metric": "actual_total_cost", "threshold": 2.5, "action": "degrade"}]})
+        self.assertIn("Real-time Cost Control Strategy", html)
+        self.assertIn("Triggered Control Actions", html)
 
 
     def test_dashboard_html_contains_all_pattern_sections(self):

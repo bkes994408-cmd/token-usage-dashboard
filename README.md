@@ -18,6 +18,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: 成本歸因與優化建議（project/department/user/application/business line attribution + 規則式節流建議）
 - New: 報表自動化排程（daily/weekly/monthly/quarterly jobs）、JSON/CSV 自動產出、report history/download center（`report_history.json`）
 - New: 報表分發權限守門（recipient role guardrail，未授權收件者自動 block 並留下審計記錄）
+- New: 實時成本控制策略（multi-layer budget policy，可觸發 degrade / switch_model / stop_calls 動作）
 - Note: notification 目前僅做 rule evaluation（在 summary/dashboard 顯示觸發結果與 channels），尚未實作主動 dispatch（email/Slack/Discord）。
 - Note: Cloud cost integration 目前提供 hooks placeholder（AWS Cost Explorer / GCP Billing），尚未串接實際 API。
 
@@ -51,6 +52,7 @@ python3 scripts/token_usage_dashboard.py \
   --spike-lookback-days 7 \
   --spike-threshold-mult 2.0 \
   --alert-config docs/ALERT_CONFIG_EXAMPLE.json \
+  --cost-control-config docs/COST_CONTROL_CONFIG_EXAMPLE.json \
   --output /tmp/token_usage_dashboard.html \
   --summary-json /tmp/token_usage_summary.json \
   --custom-report-json /tmp/custom_report.json \
@@ -107,6 +109,8 @@ Tenant payload format should include per-org daily data, e.g.:
 ```
 
 See `docs/TENANT_CONFIG_EXAMPLE.json` for org/user/group/role/view config schema.
+
+Real-time cost control policy example: `docs/COST_CONTROL_CONFIG_EXAMPLE.json`.
 
 Dashboard view management (create/update/delete/list/assign/unassign):
 

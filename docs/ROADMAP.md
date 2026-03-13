@@ -43,3 +43,10 @@
     *   提供一個集中的報表下載中心，用戶可以方便地查看和下載過去生成的報表，並支持報表歷史版本管理。
     *   報表的分發應嚴格遵守用戶或角色的數據訪問權限，確保敏感數據不會發送給未經授權的用戶。
     *   目前已實作：scheduler job config（daily/weekly/monthly/quarterly）、JSON/CSV 自動產出、report history/download center (`report_history.json` + artifacts)、recipient role guardrail（未授權收件者會被 block 並記錄）。
+
+### Iteration-1 (MVP-3: 成本控制與智能優化)
+- [x] 實時成本控制策略：設置多層級預算限制，當成本達到閾值時，自動觸發降級、切換模型或停止調用。
+  - 已實作：`realTimeCostControls` 引擎（多層 policy layers，支援 global forecast / actual total / anomaly count / dimension cost），可輸出動作建議 `degrade` / `switch_model` / `stop_calls`，並在 dashboard 顯示 layer 評估結果與觸發動作。
+- [ ] Prompt 優化建議引擎：自動分析高消耗 prompt，提供優化建議（如壓縮、替換模型），並支持 A/B 測試。
+- [ ] 多雲/多模型成本聚合：統一管理來自不同雲服務提供商和 LLM 模型的成本數據，提供統一視圖。
+- [ ] 預算分配與使用權限管理：更精細地控制各部門/用戶的 LLM 資源預算分配，並設定使用權限。

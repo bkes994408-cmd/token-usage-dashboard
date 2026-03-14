@@ -2969,6 +2969,10 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
+    if args.run_report_scheduler and not args.report_scheduler_config:
+        eprint("--report-scheduler-config is required with --run-report-scheduler")
+        return 8
+
     try:
         aggregate_providers = parse_provider_list(args.aggregate_providers, default=[])
         load_providers = [args.provider] + [p for p in aggregate_providers if p != args.provider]
@@ -2979,9 +2983,6 @@ def main() -> int:
         return 1
 
     if args.run_report_scheduler:
-        if not args.report_scheduler_config:
-            eprint("--report-scheduler-config is required with --run-report-scheduler")
-            return 8
         try:
             scheduler_config = json.loads(Path(args.report_scheduler_config).read_text(encoding="utf-8"))
             now_dt = datetime.fromisoformat(args.scheduler_now.replace("Z", "+00:00")) if args.scheduler_now else None

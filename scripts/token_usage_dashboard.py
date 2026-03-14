@@ -463,6 +463,163 @@ def build_cost_attribution(
     }
 
 
+def _prompt_template_signature(prompt: str) -> str:
+    tokens = _tokenize_prompt_anonymized(prompt)
+    if not tokens:
+        return "empty_prompt"
+    return " ".join(tokens[:24])
+
+
+def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_tokens: float) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    if sample_prompt_tokens >= 700:
+        actions.append(
+            {
+                "type": "compression",
+                "title": "Compress long instructions and remove repeated context",
+                "expectedPromptTokenReductionPct": 20.0,
+                "actions": [
+                    "Extract stable policy text into a reusable system preset.",
+                    "Summarize long conversation history before sending to model.",
+                ],
+            }
+        )
+    if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * 1.5:
+        actions.append(
+            {
+                "type": "context_refactor",
+                "title": "Move verbose context into retrieval/cache",
+                "expectedPromptTokenReductionPct": 15.0,
+                "actions": [
+                    "Replace full inline docs with retrieval IDs or snippets.",
+                    "Use semantic cache for repeated context blocks.",
+                ],
+            }
+        )
+    actions.append(
+        {
+            "type": "model_rightsizing",
+            "title": "A/B test lower-cost model on this prompt family",
+            "expectedCostReductionPct": 10.0,
+            "actions": [
+                "Route 20% traffic to candidate model and track quality score.",
+                "Promote candidate only if quality drop <= 2%.",
+            ],
+        }
+    )
+    return actions
+
+
+def build_prompt_optimization_engine(
+    rows: List[Dict[str, Any]],
+    pattern_analysis: Dict[str, Any],
+    *,
+    normalized_records: Optional[List[Dict[str, Any]]] = None,
+    max_prompt_families: int = 8,
+) -> Dict[str, Any]:
+    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    if not records:
+        return {"available": False, "highConsumptionPrompts": [], "abTests": []}
+
+    families: Dict[str, Dict[str, Any]] = {}
+    for r in records:
+        prompt = str(r.get("prompt") or "")
+        sig = _prompt_template_signature(prompt)
+        node = families.setdefault(
+            sig,
+            {
+                "templateSignature": sig,
+                "samplePrompt": prompt[:240],
+                "calls": 0,
+                "totalCostUSD": 0.0,
+                "totalPromptTokens": 0.0,
+                "totalCompletionTokens": 0.0,
+                "models": defaultdict(int),
+                "projects": defaultdict(int),
+            },
+        )
+        node["calls"] += 1
+        node["totalCostUSD"] += _safe_float(r.get("costUSD"))
+        node["totalPromptTokens"] += _safe_float(r.get("promptTokens"))
+        node["totalCompletionTokens"] += _safe_float(r.get("completionTokens"))
+        node["models"][str(r.get("model") or "unknown")] += 1
+        node["projects"][str(r.get("project") or "unknown")] += 1
+
+    ranked = sorted(
+        families.values(),
+        key=lambda x: (x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
+        reverse=True,
+    )[:max_prompt_families]
+
+    by_model = pattern_analysis.get("dimensions", {}).get("byModel", []) if isinstance(pattern_analysis, dict) else []
+    cheap_model = None
+    if isinstance(by_model, list) and by_model:
+        by_cost_per_token = sorted(
+            [x for x in by_model if _safe_float(x.get("totalTokens")) > 0],
+            key=lambda x: (_safe_float(x.get("costUSD")) / max(1.0, _safe_float(x.get("totalTokens")))),
+        )
+        if by_cost_per_token:
+            cheap_model = str(by_cost_per_token[0].get("key") or "")
+
+    prompt_families: List[Dict[str, Any]] = []
+    ab_tests: List[Dict[str, Any]] = []
+    for idx, item in enumerate(ranked, start=1):
+        calls = int(item["calls"])
+        avg_prompt_tokens = item["totalPromptTokens"] / max(1, calls)
+        avg_completion_tokens = item["totalCompletionTokens"] / max(1, calls)
+        top_model = sorted(item["models"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["models"] else "unknown"
+        top_project = sorted(item["projects"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["projects"] else "unknown"
+        suggestions = _prompt_suggestion_actions(avg_prompt_tokens, avg_completion_tokens)
+        prompt_families.append(
+            {
+                "rank": idx,
+                "templateSignature": item["templateSignature"],
+                "samplePrompt": item["samplePrompt"],
+                "calls": calls,
+                "totalCostUSD": item["totalCostUSD"],
+                "avgPromptTokens": avg_prompt_tokens,
+                "avgCompletionTokens": avg_completion_tokens,
+                "promptToCompletionRatio": (avg_prompt_tokens / avg_completion_tokens) if avg_completion_tokens > 0 else None,
+                "topModel": top_model,
+                "topProject": top_project,
+                "suggestions": suggestions,
+            }
+        )
+
+        variant_b = {
+            "name": "B-compressed",
+            "strategy": "compress_prompt",
+            "targetPromptTokenReductionPct": 20.0 if avg_prompt_tokens >= 700 else 10.0,
+        }
+        if cheap_model and cheap_model != top_model:
+            variant_b["candidateModel"] = cheap_model
+
+        ab_tests.append(
+            {
+                "testId": f"prompt-ab-{idx:02d}",
+                "scope": item["templateSignature"],
+                "goal": "reduce_cost_with_quality_guardrail",
+                "trafficSplit": {"A": 0.5, "B": 0.5},
+                "variants": [
+                    {"name": "A-control", "strategy": "status_quo", "model": top_model},
+                    variant_b,
+                ],
+                "successCriteria": {
+                    "costReductionPctMin": 10.0,
+                    "qualityDropPctMax": 2.0,
+                    "latencyIncreasePctMax": 10.0,
+                },
+                "metrics": ["avgCostPerCallUSD", "qualityScore", "avgLatencyMs", "promptTokens"],
+            }
+        )
+
+    return {
+        "available": True,
+        "highConsumptionPrompts": prompt_families,
+        "abTests": ab_tests,
+    }
+
+
 def build_optimization_recommendations(
     rows: List[Dict[str, Any]],
     pattern_analysis: Dict[str, Any],
@@ -1181,6 +1338,7 @@ def build_summary(
     pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
     attribution = build_cost_attribution(rows, normalized_records=normalized_records)
     recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution, normalized_records=normalized_records)
+    prompt_optimization_engine = build_prompt_optimization_engine(rows, pattern_analysis, normalized_records=normalized_records)
     forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
     forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
     anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
@@ -1217,6 +1375,7 @@ def build_summary(
         "llmPatternAnalysis": pattern_analysis,
         "costAttribution": attribution,
         "optimizationRecommendations": recommendations,
+        "promptOptimizationEngine": prompt_optimization_engine,
     }
 
 
@@ -1673,6 +1832,21 @@ def build_dashboard_html(
             for i, r in enumerate(recs.get("recommendations", [])[:6])
         ])
 
+    prompt_engine = summary.get("promptOptimizationEngine") if isinstance(summary.get("promptOptimizationEngine"), dict) else {"available": False}
+    prompt_family_rows = "<tr><td colspan='8'>No prompt-level optimization data</td></tr>"
+    if prompt_engine.get("available") and isinstance(prompt_engine.get("highConsumptionPrompts"), list) and prompt_engine.get("highConsumptionPrompts"):
+        prompt_family_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('templateSignature'))}</td><td>{esc(x.get('topProject'))}</td><td>{esc(x.get('topModel'))}</td><td>{int(x.get('calls', 0))}</td><td>{usd(float(x.get('totalCostUSD', 0.0)))}</td><td>{float(x.get('avgPromptTokens', 0.0)):.1f}</td><td>{esc('; '.join([s.get('title', '') for s in x.get('suggestions', []) if isinstance(s, dict)]))}</td></tr>"
+            for i, x in enumerate(prompt_engine.get("highConsumptionPrompts", [])[:8])
+        ])
+
+    ab_test_rows = "<tr><td colspan='6'>No A/B test plan generated</td></tr>"
+    if prompt_engine.get("available") and isinstance(prompt_engine.get("abTests"), list) and prompt_engine.get("abTests"):
+        ab_test_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('testId'))}</td><td>{esc(x.get('scope'))}</td><td>{esc('/'.join([v.get('name', '') for v in x.get('variants', []) if isinstance(v, dict)]))}</td><td>{esc(', '.join(x.get('metrics', [])) if isinstance(x.get('metrics'), list) else '')}</td><td>{esc(str(x.get('successCriteria')))}</td></tr>"
+            for i, x in enumerate(prompt_engine.get("abTests", [])[:8])
+        ])
+
     spike_by_date: Dict[str, Dict[str, float]] = {}
     for s in visible_spikes:
         d = s.get("date")
@@ -1917,6 +2091,16 @@ def build_dashboard_html(
     <tbody>{rec_rows}</tbody>
   </table>
 
+  <h4>Prompt 優化建議引擎 · High-Consumption Prompt Families</h4>
+  <table>
+    <thead><tr><th>#</th><th>Template Signature</th><th>Top Project</th><th>Top Model</th><th>Calls</th><th>Total Cost</th><th>Avg Prompt Tokens</th><th>Suggestions</th></tr></thead>
+    <tbody>{prompt_family_rows}</tbody>
+  </table>
+  <h4>Prompt 優化建議引擎 · A/B Testing Plans</h4>
+  <table>
+    <thead><tr><th>#</th><th>Test ID</th><th>Scope</th><th>Variants</th><th>Metrics</th><th>Success Criteria</th></tr></thead>
+    <tbody>{ab_test_rows}</tbody>
+  </table>
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
   <div id="selectedDayMeta" style="font-size:12px;color:#4b5563;margin:-4px 0 8px;"></div>

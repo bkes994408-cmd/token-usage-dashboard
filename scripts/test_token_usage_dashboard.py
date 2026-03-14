@@ -13,6 +13,7 @@ from token_usage_dashboard import (
     build_llm_pattern_analysis,
     build_cost_attribution,
     build_optimization_recommendations,
+    build_prompt_optimization_engine,
     detect_spikes,
     detect_cost_anomalies,
     evaluate_alert_rules,
@@ -221,6 +222,41 @@ class TestTokenDashboard(TestCase):
         self.assertIn("batching", rec_types)
         self.assertIn("budget_guardrail", rec_types)
 
+    def test_build_prompt_optimization_engine_and_ab_plan(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "llmCalls": [
+                    {
+                        "modelName": "gpt-5",
+                        "projectId": "proj-a",
+                        "promptTokens": 1000,
+                        "completionTokens": 120,
+                        "totalTokens": 1120,
+                        "cost": 1.3,
+                        "prompt": "請幫我分析這一整段歷史 log 並整理出重點與風險，附上完整上下文。",
+                    },
+                    {
+                        "modelName": "gpt-5",
+                        "projectId": "proj-a",
+                        "promptTokens": 900,
+                        "completionTokens": 130,
+                        "totalTokens": 1030,
+                        "cost": 1.1,
+                        "prompt": "請幫我分析這一整段歷史 log 並整理出重點與風險，附上完整上下文。",
+                    },
+                ],
+            }
+        ]
+        pattern = build_llm_pattern_analysis(rows)
+        engine = build_prompt_optimization_engine(rows, pattern)
+        self.assertTrue(engine["available"])
+        self.assertGreaterEqual(len(engine["highConsumptionPrompts"]), 1)
+        self.assertGreaterEqual(len(engine["abTests"]), 1)
+        first = engine["highConsumptionPrompts"][0]
+        self.assertIn("suggestions", first)
+        self.assertTrue(any(s["type"] == "model_rightsizing" for s in first["suggestions"]))
+
     def test_build_summary_normalizes_call_records_once(self):
         from unittest.mock import patch
 
@@ -233,6 +269,7 @@ class TestTokenDashboard(TestCase):
         with patch("token_usage_dashboard._normalize_call_records", wraps=dashboard_module._normalize_call_records) as normalize_spy:
             summary = build_summary("codex", rows)
         self.assertIn("costAttribution", summary)
+        self.assertIn("promptOptimizationEngine", summary)
         self.assertEqual(normalize_spy.call_count, 1)
 
     def test_detect_spikes(self):
@@ -355,7 +392,8 @@ class TestTokenDashboard(TestCase):
             "Prompt tokens", "Completion tokens", "By Model Type", "By Project",
             "Hotspots · Top API Calls", "Hotspots · Top Sessions", "Hotspots · Top Workflows",
             "Anonymized Prompt Keywords", "Cost Attribution & Optimization Recommendations",
-            "Optimization Recommendations", "Attribution by Department", "Attribution by Business Line"
+            "Optimization Recommendations", "Attribution by Department", "Attribution by Business Line",
+            "Prompt 優化建議引擎 · High-Consumption Prompt Families", "Prompt 優化建議引擎 · A/B Testing Plans"
         ]:
             self.assertIn(text, html)
 

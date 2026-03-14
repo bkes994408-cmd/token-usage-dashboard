@@ -20,6 +20,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: 報表自動化排程（daily/weekly/monthly/quarterly jobs）、JSON/CSV 自動產出、report history/download center（`report_history.json`）
 - New: 報表分發權限守門（recipient role guardrail，未授權收件者自動 block 並留下審計記錄）
 - New: 實時成本控制策略（multi-layer budget policy，可觸發 degrade / switch_model / stop_calls 動作）
+- New: 多雲/多模型成本聚合（`--aggregate-providers codex,claude`）：統一聚合 provider/model/day 成本並在 dashboard 顯示 Unified View
 - Note: notification 目前僅做 rule evaluation（在 summary/dashboard 顯示觸發結果與 channels），尚未實作主動 dispatch（email/Slack/Discord）。
 - Note: Cloud cost integration 目前提供 hooks placeholder（AWS Cost Explorer / GCP Billing），尚未串接實際 API。
 
@@ -42,6 +43,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 ./run_dashboard.sh --provider codex --days 30
 ./run_dashboard.sh --provider claude --days 14 --no-open
 ./run_dashboard.sh --input /tmp/cost.json --spike-threshold-mult 1.8 --max-table-rows 150 --chart-max-points 1000
+./run_dashboard.sh --provider codex --input /tmp/cost_multi_provider.json --aggregate-providers codex,claude
 ```
 
 ### Direct Python command
@@ -49,6 +51,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 ```bash
 python3 scripts/token_usage_dashboard.py \
   --provider codex \
+  --aggregate-providers codex,claude \
   --days 30 \
   --spike-lookback-days 7 \
   --spike-threshold-mult 2.0 \

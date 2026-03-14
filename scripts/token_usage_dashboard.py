@@ -113,6 +113,40 @@ def load_payload(input_path: Optional[str], provider: str) -> Dict[str, Any]:
     return normalize_provider_payload(parsed, provider)
 
 
+def parse_provider_list(value: Optional[str], default: Optional[List[str]] = None) -> List[str]:
+    if value is None:
+        return list(default or [])
+    raw = [x.strip().lower() for x in value.split(",") if x.strip()]
+    allowed = {"codex", "claude"}
+    out: List[str] = []
+    for p in raw:
+        if p not in allowed:
+            raise RuntimeError(f"Unsupported provider '{p}'. Allowed: codex, claude")
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def load_payload_bundle(input_path: Optional[str], providers: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not providers:
+        return {}
+
+    if not input_path:
+        return {p: run_codexbar_cost(p) for p in providers}
+
+    if input_path == "-":
+        raw = sys.stdin.read()
+    else:
+        raw = Path(input_path).read_text(encoding="utf-8")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse input JSON: {exc}")
+
+    return {p: normalize_provider_payload(parsed, p) for p in providers}
+
+
 def parse_date(value: str) -> Optional[date]:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
@@ -1379,6 +1413,69 @@ def build_summary(
     }
 
 
+def build_multi_provider_aggregation(provider_rows: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    if not provider_rows:
+        return {"available": False, "providers": [], "daily": [], "totals": {}}
+
+    provider_totals: Dict[str, float] = {}
+    provider_models: Dict[str, Dict[str, float]] = {}
+    combined_model_totals: Dict[str, float] = defaultdict(float)
+    by_provider_model_totals: Dict[str, float] = defaultdict(float)
+    daily_map: Dict[str, Dict[str, Any]] = {}
+
+    for provider, rows in provider_rows.items():
+        pt = model_totals(rows)
+        provider_models[provider] = pt
+        provider_totals[provider] = sum(day_total_cost(r) for r in rows)
+        for model_name, cost in pt.items():
+            combined_model_totals[model_name] += float(cost)
+            by_provider_model_totals[f"{provider}:{model_name}"] += float(cost)
+
+        for row in rows:
+            day = str(row.get("date") or "")
+            if not day:
+                continue
+            node = daily_map.setdefault(day, {"date": day, "totalCostUSD": 0.0, "providers": {}, "models": defaultdict(float)})
+            row_total = day_total_cost(row)
+            node["providers"][provider] = node["providers"].get(provider, 0.0) + row_total
+            node["totalCostUSD"] += row_total
+
+            for b in row.get("modelBreakdowns") or []:
+                if isinstance(b, dict) and isinstance(b.get("modelName"), str) and isinstance(b.get("cost"), (int, float)):
+                    node["models"][b["modelName"]] += float(b["cost"])
+
+    daily = []
+    for day in sorted(daily_map.keys()):
+        node = daily_map[day]
+        models_sorted = sorted(node["models"].items(), key=lambda kv: kv[1], reverse=True)
+        daily.append(
+            {
+                "date": day,
+                "totalCostUSD": node["totalCostUSD"],
+                "providers": node["providers"],
+                "models": [{"model": m, "costUSD": c} for m, c in models_sorted],
+            }
+        )
+
+    provider_ranked = sorted(provider_totals.items(), key=lambda kv: kv[1], reverse=True)
+    model_ranked = sorted(combined_model_totals.items(), key=lambda kv: kv[1], reverse=True)
+    provider_model_ranked = sorted(by_provider_model_totals.items(), key=lambda kv: kv[1], reverse=True)
+
+    return {
+        "available": True,
+        "providers": [{"provider": p, "totalCostUSD": c} for p, c in provider_ranked],
+        "totals": {
+            "grandTotalCostUSD": sum(provider_totals.values()),
+            "providers": provider_totals,
+            "models": dict(combined_model_totals),
+            "providerModels": dict(by_provider_model_totals),
+        },
+        "topModels": [{"model": m, "totalCostUSD": c} for m, c in model_ranked[:12]],
+        "topProviderModels": [{"providerModel": pm, "totalCostUSD": c} for pm, c in provider_model_ranked[:12]],
+        "daily": daily,
+    }
+
+
 def _bucket_for_granularity(day: date, granularity: str) -> str:
     g = (granularity or "daily").lower()
     if g == "weekly":
@@ -1689,6 +1786,7 @@ def build_dashboard_html(
     policy: Optional[Dict[str, Any]] = None,
     alert_config: Optional[Dict[str, Any]] = None,
     cost_control_config: Optional[Dict[str, Any]] = None,
+    multi_provider_agg: Optional[Dict[str, Any]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -1732,6 +1830,22 @@ def build_dashboard_html(
             f"<tr id='spike-row-{esc(date_key)}'><td>{idx}</td><td>{esc(x['date'])}</td><td>{usd(float(x['costUSD']))}</td><td>{usd(float(x['baselineUSD']))}</td><td>{x['ratio']:.2f}x</td></tr>"
         )
     spikes_rows = "\n".join(spikes_rows_parts) if spikes_rows_parts else "<tr><td colspan='5'>No spikes detected</td></tr>"
+
+    multi_provider_rows = "<tr><td colspan='3'>Single-provider mode (no aggregation enabled)</td></tr>"
+    multi_provider_models_rows = "<tr><td colspan='3'>Single-provider mode (no aggregation enabled)</td></tr>"
+    multi_provider_header = ""
+    if isinstance(multi_provider_agg, dict) and multi_provider_agg.get("available"):
+        mp_grand_total = _safe_float(multi_provider_agg.get("totals", {}).get("grandTotalCostUSD"))
+        multi_provider_header = f"<div style=\"font-size:12px;color:#6b7280;margin:-6px 0 8px;\">Aggregated providers total: {usd(mp_grand_total)}</div>"
+        p_rows = []
+        for idx, p in enumerate(multi_provider_agg.get("providers", [])[:8], start=1):
+            p_rows.append(f"<tr><td>{idx}</td><td>{esc(p.get('provider'))}</td><td>{usd(float(p.get('totalCostUSD', 0.0)))}</td></tr>")
+        multi_provider_rows = "\n".join(p_rows) or "<tr><td colspan='3'>No provider aggregation data</td></tr>"
+
+        m_rows = []
+        for idx, m in enumerate(multi_provider_agg.get("topModels", [])[:10], start=1):
+            m_rows.append(f"<tr><td>{idx}</td><td>{esc(m.get('model'))}</td><td>{usd(float(m.get('totalCostUSD', 0.0)))}</td></tr>")
+        multi_provider_models_rows = "\n".join(m_rows) or "<tr><td colspan='3'>No model aggregation data</td></tr>"
 
     forecast = summary.get("forecast") if isinstance(summary.get("forecast"), dict) else {}
     f7 = forecast.get("next7Days") if isinstance(forecast.get("next7Days"), dict) else {}
@@ -1946,6 +2060,18 @@ def build_dashboard_html(
     <canvas id=\"costChart\"></canvas>
     <div id=\"tooltip\"></div>
   </div>
+
+  <h3>Multi-Provider Unified View</h3>
+  {multi_provider_header}
+  <table>
+    <thead><tr><th>#</th><th>Provider</th><th>Total Cost</th></tr></thead>
+    <tbody>{multi_provider_rows}</tbody>
+  </table>
+  <h4>Unified Top Models (cross-provider)</h4>
+  <table>
+    <thead><tr><th>#</th><th>Model</th><th>Total Cost</th></tr></thead>
+    <tbody>{multi_provider_models_rows}</tbody>
+  </table>
 
   <h3>Model Breakdown</h3>
   <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Showing up to top {max_table_rows} models for faster rendering. Chart points: {len(chart_rows)}/{len(rows)}.</div>
@@ -2780,6 +2906,7 @@ def build_dashboard_html(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate local token usage dashboard from CodexBar JSON.")
     parser.add_argument("--provider", choices=["codex", "claude"], default="codex")
+    parser.add_argument("--aggregate-providers", help="Comma-separated providers for unified aggregation view (e.g. codex,claude)")
     parser.add_argument("--input", help="Path to codexbar JSON (or '-' for stdin)")
     parser.add_argument("--days", type=positive_int, help="Limit to last N days")
     parser.add_argument("--top-models", type=positive_int, default=6, help="Top models to chart")
@@ -2842,16 +2969,20 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
+    if args.run_report_scheduler and not args.report_scheduler_config:
+        eprint("--report-scheduler-config is required with --run-report-scheduler")
+        return 8
+
     try:
-        payload = load_payload(args.input, args.provider)
+        aggregate_providers = parse_provider_list(args.aggregate_providers, default=[])
+        load_providers = [args.provider] + [p for p in aggregate_providers if p != args.provider]
+        payload_bundle = load_payload_bundle(args.input, load_providers)
+        payload = payload_bundle[args.provider]
     except Exception as exc:
         eprint(str(exc))
         return 1
 
     if args.run_report_scheduler:
-        if not args.report_scheduler_config:
-            eprint("--report-scheduler-config is required with --run-report-scheduler")
-            return 8
         try:
             scheduler_config = json.loads(Path(args.report_scheduler_config).read_text(encoding="utf-8"))
             now_dt = datetime.fromisoformat(args.scheduler_now.replace("Z", "+00:00")) if args.scheduler_now else None
@@ -2911,6 +3042,16 @@ def main() -> int:
         eprint(f"Failed to load cost control config: {exc}")
         return 10
 
+    multi_provider_agg: Optional[Dict[str, Any]] = None
+    if aggregate_providers:
+        agg_rows: Dict[str, List[Dict[str, Any]]] = {}
+        for p in aggregate_providers:
+            provider_payload = payload_bundle.get(p)
+            if not isinstance(provider_payload, dict):
+                continue
+            agg_rows[p] = filter_days(parse_daily(provider_payload), args.days)
+        multi_provider_agg = build_multi_provider_aggregation(agg_rows)
+
     html = build_dashboard_html(
         args.provider,
         rows,
@@ -2923,6 +3064,7 @@ def main() -> int:
         policy=policy,
         alert_config=alert_config,
         cost_control_config=cost_control_config,
+        multi_provider_agg=multi_provider_agg,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -2940,6 +3082,8 @@ def main() -> int:
         summary["policy"] = policy
         if tenant_meta:
             summary["tenant"] = tenant_meta
+        if multi_provider_agg:
+            summary["multiProviderAggregation"] = multi_provider_agg
         Path(args.summary_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.custom_report_json:

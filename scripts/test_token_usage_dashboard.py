@@ -19,6 +19,8 @@ from token_usage_dashboard import (
     evaluate_alert_rules,
     evaluate_realtime_cost_controls,
     forecast_cost,
+    parse_provider_list,
+    build_multi_provider_aggregation,
     downsample_rows,
     generate_custom_report,
     main as dashboard_main,
@@ -51,6 +53,42 @@ class TestTokenDashboard(TestCase):
         totals = model_totals(rows)
         self.assertAlmostEqual(totals["gpt-5"], 2.0)
         self.assertAlmostEqual(totals["o3"], 0.5)
+
+    def test_parse_provider_list_dedup_and_validation(self):
+        self.assertEqual(parse_provider_list("codex,claude,codex"), ["codex", "claude"])
+        with self.assertRaises(RuntimeError):
+            parse_provider_list("codex,unknown")
+
+    def test_build_multi_provider_aggregation_normalized_unified_totals(self):
+        provider_rows = {
+            "codex": [
+                {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.0}]},
+                {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 1.0}]},
+            ],
+            "claude": [
+                {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "sonnet", "cost": 3.0}]},
+                {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.5}]},
+            ],
+        }
+        agg = build_multi_provider_aggregation(provider_rows)
+        self.assertTrue(agg["available"])
+        self.assertAlmostEqual(agg["totals"]["grandTotalCostUSD"], 7.5)
+        self.assertEqual(agg["providers"][0]["provider"], "claude")
+        self.assertAlmostEqual(agg["totals"]["models"]["gpt-5"], 3.5)
+        self.assertEqual(len(agg["daily"]), 2)
+
+    def test_dashboard_html_contains_multi_provider_unified_section(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]
+        agg = {
+            "available": True,
+            "providers": [{"provider": "codex", "totalCostUSD": 4.0}, {"provider": "claude", "totalCostUSD": 3.0}],
+            "totals": {"grandTotalCostUSD": 7.0},
+            "topModels": [{"model": "gpt-5", "totalCostUSD": 2.5}],
+        }
+        html = build_dashboard_html("codex", rows, top_models=2, multi_provider_agg=agg)
+        self.assertIn("Multi-Provider Unified View", html)
+        self.assertIn("Unified Top Models (cross-provider)", html)
+        self.assertIn("Aggregated providers total", html)
 
     def test_summary_includes_pattern_analysis(self):
         rows = [

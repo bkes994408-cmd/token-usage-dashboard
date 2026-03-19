@@ -1,0 +1,43 @@
+{
+  "allocations": [
+    {
+      "id": "eng-proj-a",
+      "dimension": "project",
+      "key": "proj-a",
+      "budgetUSD": 200
+    },
+    {
+      "id": "dept-eng",
+      "dimension": "department",
+      "key": "eng",
+      "budgetUSD": 500
+    }
+  ],
+  "permissions": {
+    "roles": {
+      "analyst": { "allowedModels": ["gpt-5", "o3"] },
+      "viewer": { "allowedModels": ["o3-mini"] }
+    },
+    "users": {
+      "alice": { "allowedModels": ["gpt-5"] }
+    }
+  },
+  "overagePolicies": [
+    {
+      "thresholdPct": 100,
+      "action": "degrade",
+      "message": "Budget exceeded, degrade quality profile"
+    },
+    {
+      "thresholdPct": 120,
+      "action": "switch_model",
+      "routeToModel": "o3-mini",
+      "message": "Switch to lower-cost model"
+    },
+    {
+      "thresholdPct": 150,
+      "action": "stop_calls",
+      "message": "Hard stop: critical budget breach"
+    }
+  ]
+}

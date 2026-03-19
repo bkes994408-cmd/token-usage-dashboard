@@ -150,6 +150,137 @@ def load_payload_bundle(input_path: Optional[str], providers: List[str]) -> Dict
     return {p: normalize_provider_payload(parsed, p) for p in providers}
 
 
+def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
+    """Normalize cloud-cost records from simple normalized JSON / AWS CE / GCP billing-like payloads.
+
+    Normalized output item:
+    {
+      "date": "YYYY-MM-DD",
+      "provider": "aws|gcp|...",
+      "service": "ec2|bigquery|...",
+      "project": "optional project/account",
+      "costUSD": 12.34,
+      "currency": "USD",
+      "source": "aws_cost_explorer|gcp_billing_export|normalized"
+    }
+    """
+    out: List[Dict[str, Any]] = []
+
+    def push(
+        d: Any,
+        provider: Any,
+        service: Any,
+        cost: Any,
+        *,
+        project: Any = None,
+        currency: Any = "USD",
+        source: str = "normalized",
+    ) -> None:
+        ds = str(d or "").strip()
+        if not parse_date(ds):
+            return
+        c = _safe_float(cost, default=-1.0)
+        if c < 0:
+            return
+        out.append(
+            {
+                "date": ds,
+                "provider": str(provider or "unknown").lower(),
+                "service": str(service or "all"),
+                "project": str(project or ""),
+                "costUSD": c,
+                "currency": str(currency or "USD"),
+                "source": source,
+            }
+        )
+
+    # Format A: already normalized list
+    if isinstance(parsed, list):
+        for row in parsed:
+            if not isinstance(row, dict):
+                continue
+            push(
+                row.get("date"),
+                row.get("provider"),
+                row.get("service"),
+                row.get("costUSD") if row.get("costUSD") is not None else row.get("cost"),
+                project=row.get("project"),
+                currency=row.get("currency", "USD"),
+                source=str(row.get("source") or "normalized"),
+            )
+        return sorted(out, key=lambda x: (x["date"], x["provider"], x["service"], x["project"]))
+
+    if not isinstance(parsed, dict):
+        return []
+
+    # Format B: wrapper with records
+    if isinstance(parsed.get("records"), list):
+        return _normalize_cloud_cost_payload(parsed.get("records"))
+
+    # Format C: AWS Cost Explorer-like payload
+    if isinstance(parsed.get("ResultsByTime"), list):
+        for bucket in parsed.get("ResultsByTime", []):
+            if not isinstance(bucket, dict):
+                continue
+            d = (bucket.get("TimePeriod") or {}).get("Start") if isinstance(bucket.get("TimePeriod"), dict) else bucket.get("date")
+            groups = bucket.get("Groups") if isinstance(bucket.get("Groups"), list) else []
+            if groups:
+                for g in groups:
+                    if not isinstance(g, dict):
+                        continue
+                    keys = g.get("Keys") if isinstance(g.get("Keys"), list) else []
+                    service = str(keys[0]) if keys else "all"
+                    metrics = g.get("Metrics") if isinstance(g.get("Metrics"), dict) else {}
+                    amount_node = (metrics.get("UnblendedCost") if isinstance(metrics.get("UnblendedCost"), dict) else {})
+                    push(
+                        d,
+                        "aws",
+                        service,
+                        amount_node.get("Amount"),
+                        currency=amount_node.get("Unit") or "USD",
+                        source="aws_cost_explorer",
+                    )
+            else:
+                total = bucket.get("Total") if isinstance(bucket.get("Total"), dict) else {}
+                amount_node = total.get("UnblendedCost") if isinstance(total.get("UnblendedCost"), dict) else {}
+                push(
+                    d,
+                    "aws",
+                    "all",
+                    amount_node.get("Amount"),
+                    currency=amount_node.get("Unit") or "USD",
+                    source="aws_cost_explorer",
+                )
+
+    # Format D: GCP billing export-like daily rows
+    daily = parsed.get("daily") if isinstance(parsed.get("daily"), list) else []
+    for row in daily:
+        if not isinstance(row, dict):
+            continue
+        push(
+            row.get("date"),
+            row.get("provider") or "gcp",
+            row.get("service") or row.get("serviceName") or row.get("sku") or "all",
+            row.get("costUSD") if row.get("costUSD") is not None else row.get("cost"),
+            project=row.get("project") or row.get("projectId"),
+            currency=row.get("currency") or "USD",
+            source=str(row.get("source") or "gcp_billing_export"),
+        )
+
+    return sorted(out, key=lambda x: (x["date"], x["provider"], x["service"], x["project"]))
+
+
+def load_cloud_cost_rows(path: Optional[str]) -> List[Dict[str, Any]]:
+    if not path:
+        return []
+    raw = Path(path).read_text(encoding="utf-8")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse cloud cost JSON: {exc}")
+    return _normalize_cloud_cost_payload(parsed)
+
+
 def parse_date(value: str) -> Optional[date]:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
@@ -684,10 +815,18 @@ def build_optimization_recommendations(
     attribution: Dict[str, Any],
     max_items: int = 6,
     normalized_records: Optional[List[Dict[str, Any]]] = None,
+    cloud_cost_view: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    cloud_enabled = bool(isinstance(cloud_cost_view, dict) and cloud_cost_view.get("cloudIntegrationEnabled"))
+    hooks = {
+        "cloudCostManagement": {
+            "awsCostExplorer": {"supported": True, "status": "connected" if cloud_enabled else "ready"},
+            "gcpBilling": {"supported": True, "status": "connected" if cloud_enabled else "ready"},
+        }
+    }
     if not records:
-        return {"available": False, "recommendations": []}
+        return {"available": False, "recommendations": [], "integrationHooks": hooks}
 
     recs: List[Dict[str, Any]] = []
 
@@ -767,12 +906,7 @@ def build_optimization_recommendations(
     return {
         "available": True,
         "recommendations": recs[:max_items],
-        "integrationHooks": {
-            "cloudCostManagement": {
-                "awsCostExplorer": {"supported": False, "status": "placeholder"},
-                "gcpBilling": {"supported": False, "status": "placeholder"},
-            }
-        },
+        "integrationHooks": hooks,
     }
 
 
@@ -1609,6 +1743,7 @@ def build_summary(
     cost_control_config: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
     prompt_optimization_config: Optional[Dict[str, Any]] = None,
+    cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -1640,7 +1775,14 @@ def build_summary(
     normalized_records = _normalize_call_records(rows)
     pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
     attribution = build_cost_attribution(rows, normalized_records=normalized_records)
-    recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution, normalized_records=normalized_records)
+    unified_cloud_cost = build_unified_cloud_cost_view(rows, cloud_rows=cloud_cost_rows)
+    recommendations = build_optimization_recommendations(
+        rows,
+        pattern_analysis,
+        attribution,
+        normalized_records=normalized_records,
+        cloud_cost_view=unified_cloud_cost,
+    )
     prompt_optimization_engine = build_prompt_optimization_engine(
         rows,
         pattern_analysis,
@@ -1685,9 +1827,63 @@ def build_summary(
         "llmPatternAnalysis": pattern_analysis,
         "costAttribution": attribution,
         "optimizationRecommendations": recommendations,
+        "unifiedCloudCostView": unified_cloud_cost,
         "promptOptimizationEngine": prompt_optimization_engine,
         "budgetAllocation": budget_eval,
         "overageBehaviors": overage,
+    }
+
+
+def build_unified_cloud_cost_view(rows: List[Dict[str, Any]], cloud_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    cloud = cloud_rows or []
+    llm_daily: Dict[str, float] = defaultdict(float)
+    for r in rows:
+        d = str(r.get("date") or "")
+        if d:
+            llm_daily[d] += day_total_cost(r)
+
+    cloud_daily: Dict[str, float] = defaultdict(float)
+    cloud_provider_totals: Dict[str, float] = defaultdict(float)
+    cloud_service_totals: Dict[str, float] = defaultdict(float)
+    for r in cloud:
+        d = str(r.get("date") or "")
+        if not d:
+            continue
+        c = _safe_float(r.get("costUSD"))
+        p = str(r.get("provider") or "unknown").lower()
+        s = str(r.get("service") or "all")
+        cloud_daily[d] += c
+        cloud_provider_totals[p] += c
+        cloud_service_totals[f"{p}:{s}"] += c
+
+    all_days = sorted(set(llm_daily.keys()) | set(cloud_daily.keys()))
+    daily = [
+        {
+            "date": d,
+            "llmCostUSD": llm_daily.get(d, 0.0),
+            "cloudInfraCostUSD": cloud_daily.get(d, 0.0),
+            "totalUnifiedCostUSD": llm_daily.get(d, 0.0) + cloud_daily.get(d, 0.0),
+        }
+        for d in all_days
+    ]
+
+    return {
+        "available": True,
+        "cloudIntegrationEnabled": bool(cloud),
+        "totals": {
+            "llmCostUSD": sum(llm_daily.values()),
+            "cloudInfraCostUSD": sum(cloud_daily.values()),
+            "totalUnifiedCostUSD": sum(llm_daily.values()) + sum(cloud_daily.values()),
+        },
+        "cloudProviders": [
+            {"provider": k, "totalCostUSD": v}
+            for k, v in sorted(cloud_provider_totals.items(), key=lambda kv: kv[1], reverse=True)
+        ],
+        "cloudServices": [
+            {"providerService": k, "totalCostUSD": v}
+            for k, v in sorted(cloud_service_totals.items(), key=lambda kv: kv[1], reverse=True)[:15]
+        ],
+        "daily": daily,
     }
 
 
@@ -2257,6 +2453,7 @@ def build_dashboard_html(
     multi_provider_agg: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
     prompt_optimization_config: Optional[Dict[str, Any]] = None,
+    cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -2283,6 +2480,7 @@ def build_dashboard_html(
         cost_control_config=cost_control_config,
         budget_config=budget_config,
         prompt_optimization_config=prompt_optimization_config,
+        cloud_cost_rows=cloud_cost_rows,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -2396,6 +2594,23 @@ def build_dashboard_html(
 
     attribution = summary.get("costAttribution") if isinstance(summary.get("costAttribution"), dict) else {"available": False}
     recs = summary.get("optimizationRecommendations") if isinstance(summary.get("optimizationRecommendations"), dict) else {"available": False}
+    unified_cloud_view = summary.get("unifiedCloudCostView") if isinstance(summary.get("unifiedCloudCostView"), dict) else {"available": False}
+
+    cloud_provider_rows = "<tr><td colspan='3'>No cloud provider cost data</td></tr>"
+    if isinstance(unified_cloud_view.get("cloudProviders"), list) and unified_cloud_view.get("cloudProviders"):
+        cloud_provider_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('provider'))}</td><td>{usd(float(x.get('totalCostUSD', 0.0)))}</td></tr>"
+            for i, x in enumerate(unified_cloud_view.get("cloudProviders", [])[:8])
+        ])
+
+    cloud_service_rows = "<tr><td colspan='3'>No cloud service cost data</td></tr>"
+    if isinstance(unified_cloud_view.get("cloudServices"), list) and unified_cloud_view.get("cloudServices"):
+        cloud_service_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('providerService'))}</td><td>{usd(float(x.get('totalCostUSD', 0.0)))}</td></tr>"
+            for i, x in enumerate(unified_cloud_view.get("cloudServices", [])[:10])
+        ])
+
+    unified_totals = unified_cloud_view.get("totals") if isinstance(unified_cloud_view.get("totals"), dict) else {}
 
     def _render_attribution_rows(items: List[Dict[str, Any]]) -> str:
         if not items:
@@ -2581,6 +2796,18 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Model</th><th>Total Cost</th></tr></thead>
     <tbody>{multi_provider_models_rows}</tbody>
+  </table>
+
+  <h3>Unified Cloud Cost View (LLM + AWS/GCP)</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Cloud integration: {esc('enabled' if unified_cloud_view.get('cloudIntegrationEnabled') else 'disabled')} · LLM {usd(float(unified_totals.get('llmCostUSD', 0.0)))} + Cloud Infra {usd(float(unified_totals.get('cloudInfraCostUSD', 0.0)))} = Unified {usd(float(unified_totals.get('totalUnifiedCostUSD', 0.0)))}</div>
+  <table>
+    <thead><tr><th>#</th><th>Cloud Provider</th><th>Total Cost</th></tr></thead>
+    <tbody>{cloud_provider_rows}</tbody>
+  </table>
+  <h4>Top Cloud Services</h4>
+  <table>
+    <thead><tr><th>#</th><th>Provider:Service</th><th>Total Cost</th></tr></thead>
+    <tbody>{cloud_service_rows}</tbody>
   </table>
 
   <h3>Model Breakdown</h3>
@@ -3461,6 +3688,7 @@ def main() -> int:
     parser.add_argument("--cost-control-config", help="Path to real-time cost control policy JSON")
     parser.add_argument("--budget-config", help="Path to budget allocation / permission / overage policy JSON")
     parser.add_argument("--prompt-optimization-config", help="Path to prompt optimization engine JSON config")
+    parser.add_argument("--cloud-cost-input", help="Path to cloud cost JSON (normalized records / AWS Cost Explorer / GCP billing export)")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -3595,6 +3823,12 @@ def main() -> int:
         eprint(f"Failed to load prompt optimization config: {exc}")
         return 12
 
+    try:
+        cloud_cost_rows = load_cloud_cost_rows(args.cloud_cost_input)
+    except Exception as exc:
+        eprint(f"Failed to load cloud cost input: {exc}")
+        return 13
+
     multi_provider_agg: Optional[Dict[str, Any]] = None
     if aggregate_providers:
         agg_rows: Dict[str, List[Dict[str, Any]]] = {}
@@ -3615,6 +3849,7 @@ def main() -> int:
             cost_control_config=cost_control_config,
             budget_config=budget_config,
             prompt_optimization_config=prompt_optimization_config,
+            cloud_cost_rows=cloud_cost_rows,
         )
         dispatch_cfg = alert_config.get("dispatch") if isinstance(alert_config.get("dispatch"), dict) else {}
         dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
@@ -3659,6 +3894,7 @@ def main() -> int:
         multi_provider_agg=multi_provider_agg,
         budget_config=budget_config,
         prompt_optimization_config=prompt_optimization_config,
+        cloud_cost_rows=cloud_cost_rows,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -3673,6 +3909,7 @@ def main() -> int:
             cost_control_config=cost_control_config,
             budget_config=budget_config,
             prompt_optimization_config=prompt_optimization_config,
+            cloud_cost_rows=cloud_cost_rows,
         )
         summary["role"] = role_name
         summary["policy"] = policy

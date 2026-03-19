@@ -35,7 +35,7 @@
     *   支援將 token 成本精確歸因到具體項目、部門、用戶、特定應用或業務線，實現精細化成本管理。
     *   自動提供可行的成本優化建議（如：建議替換為更經濟的模型、優化 prompt 結構、實施批量調用）。
     *   預留接口，支援與企業現有的 Cloud Cost Management 工具（如 AWS Cost Explorer、Google Cloud Billing）集成，提供統一的成本視圖。
-    *   目前已實作：call-level 成本歸因（project/department/user/application/business line）、規則式優化建議、Cloud cost integration hooks placeholder。
+    *   目前已實作：call-level 成本歸因（project/department/user/application/business line）、規則式優化建議、Cloud Cost Management integration（AWS Cost Explorer / GCP Billing 匯入）與 Unified Cloud Cost View。
 
 *   [x] 報表自動化生成與排程
     *   允許用戶根據業務需求，自定義報表內容（選擇圖表、數據表格、關鍵指標）、佈局和格式。

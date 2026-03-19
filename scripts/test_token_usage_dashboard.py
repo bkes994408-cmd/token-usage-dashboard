@@ -20,6 +20,7 @@ from token_usage_dashboard import (
     evaluate_realtime_cost_controls,
     evaluate_budget_allocation_and_permissions,
     evaluate_overage_behaviors,
+    build_quota_policies,
     forecast_cost,
     parse_provider_list,
     build_multi_provider_aggregation,
@@ -354,6 +355,25 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(overage["events"][0]["action"], "switch_model")
         self.assertEqual(overage["events"][0]["routeToModel"], "o3-mini")
 
+    def test_build_quota_policies_and_auto_enforcement_summary(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [{"projectId": "proj-a", "userId": "alice", "modelName": "gpt-5", "cost": 2.5, "totalTokens": 300}],
+        }]
+        cfg = {
+            "allocations": [{"id": "alloc-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0}],
+            "permissions": {"roles": {"viewer": {"allowedModels": ["o3-mini"]}}, "users": {"alice": {"role": "viewer"}}},
+            "overagePolicies": [{"thresholdPct": 100, "action": "stop_calls", "message": "hard stop"}],
+        }
+        budget = evaluate_budget_allocation_and_permissions(rows, config=cfg)
+        overage = evaluate_overage_behaviors(budget)
+        quotas = build_quota_policies(budget, overage)
+
+        self.assertTrue(quotas["available"])
+        self.assertEqual(quotas["summary"]["allocationPolicies"], 1)
+        self.assertEqual(quotas["summary"]["autoHandledEvents"], 1)
+        self.assertEqual(quotas["enforcements"][0]["action"], "stop_calls")
+
     def test_build_prompt_optimization_engine_and_ab_plan(self):
         rows = [
             {
@@ -383,6 +403,7 @@ class TestTokenDashboard(TestCase):
         pattern = build_llm_pattern_analysis(rows)
         engine = build_prompt_optimization_engine(rows, pattern)
         self.assertTrue(engine["available"])
+        self.assertEqual(engine["engineVersion"], "1.0")
         self.assertGreaterEqual(len(engine["highConsumptionPrompts"]), 1)
         self.assertGreaterEqual(len(engine["abTests"]), 1)
         first = engine["highConsumptionPrompts"][0]
@@ -1087,6 +1108,7 @@ class TestTokenDashboard(TestCase):
         }
         summary = build_summary("codex", rows, budget_config=budget_cfg)
         self.assertIn("budgetAllocation", summary)
+        self.assertIn("quotaPolicies", summary)
         self.assertIn("overageBehaviors", summary)
         self.assertEqual(summary["overageBehaviors"]["events"][0]["action"], "stop_calls")
 
@@ -1095,6 +1117,8 @@ class TestTokenDashboard(TestCase):
         self.assertIn("Role Permission Matrix", html)
         self.assertIn("Permission Violations (Detected from call logs)", html)
         self.assertIn("Overage Handling", html)
+        self.assertIn("Dashboard Policy View", html)
+        self.assertIn("Auto Enforcement Actions", html)
         self.assertIn("proj-a", html)
 
     def test_dashboard_html_escapes_alert_fields(self):

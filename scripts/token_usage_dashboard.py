@@ -800,6 +800,11 @@ def build_prompt_optimization_engine(
 
     return {
         "available": True,
+        "engineVersion": "1.0",
+        "spec": {
+            "recommendationTypes": ["compression", "context_refactor", "model_rightsizing"],
+            "ranking": "totalCostUSD,totalPromptTokens,calls",
+        },
         "config": {
             "maxPromptFamilies": family_limit,
             "abTesting": criteria,
@@ -1650,11 +1655,62 @@ def evaluate_overage_behaviors(
             "action": action,
             "message": str((matched or {}).get("message") or f"{alloc.get('dimension')}:{alloc.get('key')} exceeded budget at {usage_pct:.1f}%"),
             "routeToModel": (matched or {}).get("routeToModel"),
+            "autoHandled": action in {"degrade", "switch_model", "stop_calls"},
         })
 
     return {
         "available": True,
         "events": events,
+    }
+
+
+def build_quota_policies(
+    budget_eval: Dict[str, Any],
+    overage_eval: Dict[str, Any],
+) -> Dict[str, Any]:
+    allocations = budget_eval.get("allocations") if isinstance(budget_eval.get("allocations"), list) else []
+    permissions = budget_eval.get("permissions") if isinstance(budget_eval.get("permissions"), dict) else {}
+    overage_policies = budget_eval.get("overagePolicies") if isinstance(budget_eval.get("overagePolicies"), list) else []
+    overage_events = overage_eval.get("events") if isinstance(overage_eval.get("events"), list) else []
+
+    enforced = [x for x in overage_events if isinstance(x, dict) and bool(x.get("autoHandled"))]
+
+    allocation_policies: List[Dict[str, Any]] = []
+    for item in allocations:
+        if not isinstance(item, dict):
+            continue
+        allocation_policies.append({
+            "policyId": str(item.get("id") or ""),
+            "scope": f"{item.get('dimension')}:{item.get('key')}",
+            "budgetUSD": _safe_float(item.get("budgetUSD")),
+            "usedUSD": _safe_float(item.get("actualCostUSD")),
+            "remainingUSD": _safe_float(item.get("remainingUSD")),
+            "usagePct": _safe_float(item.get("usagePct")),
+            "status": str(item.get("status") or "unknown"),
+        })
+
+    default_role = str(permissions.get("defaultRole") or "viewer")
+    role_count = len(permissions.get("roles", {})) if isinstance(permissions.get("roles"), dict) else 0
+    user_override_count = len(permissions.get("users", {})) if isinstance(permissions.get("users"), dict) else 0
+    violation_count = len(permissions.get("violations", [])) if isinstance(permissions.get("violations"), list) else 0
+
+    return {
+        "available": bool(allocation_policies or overage_policies or role_count or user_override_count),
+        "summary": {
+            "allocationPolicies": len(allocation_policies),
+            "overagePolicies": len(overage_policies),
+            "autoHandledEvents": len(enforced),
+            "permissionViolations": violation_count,
+        },
+        "allocations": allocation_policies,
+        "permissions": {
+            "defaultRole": default_role,
+            "roleCount": role_count,
+            "userOverrideCount": user_override_count,
+            "violationCount": violation_count,
+        },
+        "overagePolicies": overage_policies,
+        "enforcements": enforced,
     }
 
 
@@ -1802,6 +1858,7 @@ def build_summary(
     )
     budget_eval = evaluate_budget_allocation_and_permissions(rows, config=budget_config, normalized_records=normalized_records)
     overage = evaluate_overage_behaviors(budget_eval)
+    quota_policies = build_quota_policies(budget_eval, overage)
 
     return {
         "provider": provider,
@@ -1830,6 +1887,7 @@ def build_summary(
         "unifiedCloudCostView": unified_cloud_cost,
         "promptOptimizationEngine": prompt_optimization_engine,
         "budgetAllocation": budget_eval,
+        "quotaPolicies": quota_policies,
         "overageBehaviors": overage,
     }
 
@@ -2686,6 +2744,22 @@ def build_dashboard_html(
             for i, x in enumerate(overage.get("events", [])[:12])
         ])
 
+    quota_policies = summary.get("quotaPolicies") if isinstance(summary.get("quotaPolicies"), dict) else {"available": False}
+    quota_summary = quota_policies.get("summary") if isinstance(quota_policies.get("summary"), dict) else {}
+    quota_alloc_rows = "<tr><td colspan='7'>No quota allocation policy</td></tr>"
+    if quota_policies.get("available") and isinstance(quota_policies.get("allocations"), list) and quota_policies.get("allocations"):
+        quota_alloc_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('policyId'))}</td><td>{esc(x.get('scope'))}</td><td>{usd(float(x.get('budgetUSD', 0.0)))}</td><td>{usd(float(x.get('usedUSD', 0.0)))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{esc(x.get('status'))}</td></tr>"
+            for i, x in enumerate(quota_policies.get("allocations", [])[:12])
+        ])
+
+    quota_enforcement_rows = "<tr><td colspan='6'>No auto-enforcement events</td></tr>"
+    if quota_policies.get("available") and isinstance(quota_policies.get("enforcements"), list) and quota_policies.get("enforcements"):
+        quota_enforcement_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('allocationId'))}</td><td>{esc(x.get('dimension'))}:{esc(x.get('key'))}</td><td>{esc(x.get('action'))}</td><td>{esc(x.get('routeToModel') or '—')}</td><td>{esc(x.get('message'))}</td></tr>"
+            for i, x in enumerate(quota_policies.get("enforcements", [])[:12])
+        ])
+
     spike_by_date: Dict[str, Dict[str, float]] = {}
     for s in visible_spikes:
         d = s.get("date")
@@ -2990,6 +3064,18 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Dimension</th><th>Key</th><th>Usage</th><th>Action</th><th>Route To Model</th><th>Message</th></tr></thead>
     <tbody>{overage_rows}</tbody>
+  </table>
+
+  <h3>Dashboard Policy View</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Quota policies={int(quota_summary.get('allocationPolicies', 0))} · Overage policies={int(quota_summary.get('overagePolicies', 0))} · Auto-enforced={int(quota_summary.get('autoHandledEvents', 0))} · Permission violations={int(quota_summary.get('permissionViolations', 0))}</div>
+  <table>
+    <thead><tr><th>#</th><th>Policy ID</th><th>Scope</th><th>Budget</th><th>Used</th><th>Usage</th><th>Status</th></tr></thead>
+    <tbody>{quota_alloc_rows}</tbody>
+  </table>
+  <h4>Auto Enforcement Actions</h4>
+  <table>
+    <thead><tr><th>#</th><th>Allocation</th><th>Scope</th><th>Action</th><th>Route To Model</th><th>Message</th></tr></thead>
+    <tbody>{quota_enforcement_rows}</tbody>
   </table>
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>

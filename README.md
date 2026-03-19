@@ -16,7 +16,9 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: LLM 使用模式深入分析（prompt/completion 分布、高消耗 hotspot、模型效率、匿名關鍵詞）
 - New: 成本預測與異常消耗預警（7/30 天 forecast、z-score anomaly、可配置預警規則與通知通道）
 - New: 成本歸因與優化建議（project/department/user/application/business line attribution + 規則式節流建議）
-- New: Prompt 優化建議引擎（自動辨識高消耗 prompt family、提供壓縮/上下文重構/模型替換建議、內建 A/B 測試方案）
+- New: Prompt 優化建議引擎（正式化輸出：engineVersion/spec、可配置高消耗 family 排序與 A/B success criteria）
+- New: Quota Policies（預算分配 + 角色/使用者權限矩陣 + 自動化超額處置彙總）
+- New: Dashboard Policy View（quota 摘要、allocation policy 狀態、auto-enforcement actions）
 - New: 報表自動化排程（daily/weekly/monthly/quarterly jobs）、JSON/CSV 自動產出、report history/download center（`report_history.json`）
 - New: 報表分發權限守門（recipient role guardrail，未授權收件者自動 block 並留下審計記錄）
 - New: 實時成本控制策略（multi-layer budget policy，可觸發 degrade / switch_model / stop_calls 動作）

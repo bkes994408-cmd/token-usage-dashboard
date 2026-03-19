@@ -803,6 +803,84 @@ def _load_cost_control_config(path: Optional[str]) -> Dict[str, Any]:
     return parsed
 
 
+def _normalize_budget_config(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_dimensions = {"project", "department", "user", "application", "businessLine", "model"}
+    allowed_actions = {"warn", "degrade", "switch_model", "stop_calls"}
+
+    allocations: List[Dict[str, Any]] = []
+    for idx, item in enumerate(parsed.get("allocations") if isinstance(parsed.get("allocations"), list) else [], start=1):
+        if not isinstance(item, dict):
+            continue
+        dimension = str(item.get("dimension") or "project")
+        if dimension not in allowed_dimensions:
+            continue
+        key = str(item.get("key") or "unknown")
+        budget = _safe_float(item.get("budgetUSD"), default=0.0)
+        if budget <= 0:
+            continue
+        allocations.append({
+            "id": str(item.get("id") or f"alloc-{idx}"),
+            "dimension": dimension,
+            "key": key,
+            "budgetUSD": budget,
+        })
+
+    permissions_in = parsed.get("permissions") if isinstance(parsed.get("permissions"), dict) else {}
+    default_role = str(permissions_in.get("defaultRole") or "viewer")
+
+    roles: Dict[str, Dict[str, Any]] = {}
+    for role, policy in (permissions_in.get("roles") if isinstance(permissions_in.get("roles"), dict) else {}).items():
+        if not isinstance(policy, dict):
+            continue
+        node: Dict[str, Any] = {}
+        allowed_models = policy.get("allowedModels") if isinstance(policy.get("allowedModels"), list) else None
+        if isinstance(allowed_models, list):
+            node["allowedModels"] = sorted({str(x) for x in allowed_models if str(x).strip()})
+        if isinstance(policy.get("maxCostPerCallUSD"), (int, float)):
+            node["maxCostPerCallUSD"] = max(0.0, float(policy.get("maxCostPerCallUSD")))
+        roles[str(role)] = node
+
+    users: Dict[str, Dict[str, Any]] = {}
+    for user, policy in (permissions_in.get("users") if isinstance(permissions_in.get("users"), dict) else {}).items():
+        if not isinstance(policy, dict):
+            continue
+        node: Dict[str, Any] = {}
+        if policy.get("role") is not None:
+            node["role"] = str(policy.get("role"))
+        allowed_models = policy.get("allowedModels") if isinstance(policy.get("allowedModels"), list) else None
+        if isinstance(allowed_models, list):
+            node["allowedModels"] = sorted({str(x) for x in allowed_models if str(x).strip()})
+        if isinstance(policy.get("maxCostPerCallUSD"), (int, float)):
+            node["maxCostPerCallUSD"] = max(0.0, float(policy.get("maxCostPerCallUSD")))
+        users[str(user)] = node
+
+    overage_policies: List[Dict[str, Any]] = []
+    for item in parsed.get("overagePolicies") if isinstance(parsed.get("overagePolicies"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        threshold = max(0.0, _safe_float(item.get("thresholdPct"), default=100.0))
+        action = str(item.get("action") or "warn")
+        if action not in allowed_actions:
+            action = "warn"
+        overage_policies.append({
+            "thresholdPct": threshold,
+            "action": action,
+            "routeToModel": item.get("routeToModel"),
+            "message": str(item.get("message") or "").strip(),
+        })
+    overage_policies.sort(key=lambda x: _safe_float(x.get("thresholdPct")))
+
+    return {
+        "allocations": allocations,
+        "permissions": {
+            "defaultRole": default_role,
+            "roles": roles,
+            "users": users,
+        },
+        "overagePolicies": overage_policies,
+    }
+
+
 def _load_budget_config(path: Optional[str]) -> Dict[str, Any]:
     if not path:
         return {}
@@ -810,7 +888,29 @@ def _load_budget_config(path: Optional[str]) -> Dict[str, Any]:
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("Budget config must be a JSON object.")
-    return parsed
+    return _normalize_budget_config(parsed)
+
+
+def _normalize_prompt_optimization_config(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if parsed.get("maxPromptFamilies") is not None:
+        out["maxPromptFamilies"] = max(1, int(_safe_float(parsed.get("maxPromptFamilies"), default=8.0)))
+
+    for key in ("compressionThresholdPromptTokens", "contextRefactorRatio", "targetPromptTokenReductionPct", "expectedCostReductionPct"):
+        if isinstance(parsed.get(key), (int, float)):
+            out[key] = float(parsed.get(key))
+
+    ab_in = parsed.get("abTesting") if isinstance(parsed.get("abTesting"), dict) else {}
+    if ab_in:
+        ab_out: Dict[str, Any] = {}
+        if isinstance(ab_in.get("trafficSplitB"), (int, float)):
+            ab_out["trafficSplitB"] = min(0.9, max(0.05, float(ab_in.get("trafficSplitB"))))
+        for key in ("costReductionPctMin", "qualityDropPctMax", "latencyIncreasePctMax"):
+            if isinstance(ab_in.get(key), (int, float)):
+                ab_out[key] = float(ab_in.get(key))
+        out["abTesting"] = ab_out
+
+    return out
 
 
 def _load_prompt_optimization_config(path: Optional[str]) -> Dict[str, Any]:
@@ -820,7 +920,7 @@ def _load_prompt_optimization_config(path: Optional[str]) -> Dict[str, Any]:
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("Prompt optimization config must be a JSON object.")
-    return parsed
+    return _normalize_prompt_optimization_config(parsed)
 
 
 def resolve_access_policy(role: Optional[str], user: Optional[str], rbac_config_path: Optional[str]) -> Tuple[str, Dict[str, Any]]:

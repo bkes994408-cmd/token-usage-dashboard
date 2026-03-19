@@ -1010,6 +1010,67 @@ class TestTokenDashboard(TestCase):
         html = build_dashboard_html("codex", rows, top_models=2, alert_config={"rules": alerts["rules"], "notificationChannels": alerts["notificationChannels"]})
         self.assertIn("&lt;/td&gt;&lt;script&gt;alert(4)&lt;/script&gt;", html)
 
+    def test_load_budget_config_normalizes_and_filters_invalid_entries(self):
+        import json
+        import tempfile
+
+        cfg = {
+            "allocations": [
+                {"id": "ok", "dimension": "project", "key": "proj-a", "budgetUSD": 20},
+                {"id": "bad-dim", "dimension": "bad", "key": "proj-x", "budgetUSD": 20},
+                {"id": "bad-budget", "dimension": "project", "key": "proj-y", "budgetUSD": 0},
+            ],
+            "permissions": {
+                "defaultRole": "viewer",
+                "roles": {
+                    "analyst": {"allowedModels": ["gpt-5", "", "gpt-5"], "maxCostPerCallUSD": -1},
+                },
+                "users": {
+                    "alice": {"role": "analyst", "allowedModels": ["o3", "o3"], "maxCostPerCallUSD": 0.8},
+                },
+            },
+            "overagePolicies": [
+                {"thresholdPct": 150, "action": "stop_calls"},
+                {"thresholdPct": 120, "action": "switch_model", "routeToModel": "o3-mini"},
+                {"thresholdPct": 100, "action": "unknown-action"},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "budget.json"
+            p.write_text(json.dumps(cfg), encoding="utf-8")
+            parsed = dashboard_module._load_budget_config(str(p))
+
+        self.assertEqual(len(parsed["allocations"]), 1)
+        self.assertEqual(parsed["allocations"][0]["id"], "ok")
+        self.assertEqual(parsed["permissions"]["roles"]["analyst"]["allowedModels"], ["gpt-5"])
+        self.assertEqual(parsed["permissions"]["roles"]["analyst"]["maxCostPerCallUSD"], 0.0)
+        self.assertEqual(parsed["permissions"]["users"]["alice"]["allowedModels"], ["o3"])
+        self.assertEqual(parsed["overagePolicies"][0]["thresholdPct"], 100.0)
+        self.assertEqual(parsed["overagePolicies"][0]["action"], "warn")
+
+    def test_load_prompt_optimization_config_normalizes_ranges(self):
+        import json
+        import tempfile
+
+        cfg = {
+            "maxPromptFamilies": 0,
+            "compressionThresholdPromptTokens": 700,
+            "abTesting": {
+                "trafficSplitB": 3,
+                "costReductionPctMin": 11,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "prompt.json"
+            p.write_text(json.dumps(cfg), encoding="utf-8")
+            parsed = dashboard_module._load_prompt_optimization_config(str(p))
+
+        self.assertEqual(parsed["maxPromptFamilies"], 1)
+        self.assertEqual(parsed["compressionThresholdPromptTokens"], 700.0)
+        self.assertEqual(parsed["abTesting"]["trafficSplitB"], 0.9)
+        self.assertEqual(parsed["abTesting"]["costReductionPctMin"], 11.0)
+
 
 if __name__ == "__main__":
     main()

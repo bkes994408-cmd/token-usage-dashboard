@@ -47,7 +47,9 @@
 ### Iteration-1 (MVP-3: 成本控制與智能優化)
 - [x] 實時成本控制策略：設置多層級預算限制，當成本達到閾值時，自動觸發降級、切換模型或停止調用。
   - 已實作：`realTimeCostControls` 引擎（多層 policy layers，支援 global forecast / actual total / anomaly count / dimension cost），可輸出動作建議 `degrade` / `switch_model` / `stop_calls`，並在 dashboard 顯示 layer 評估結果與觸發動作。
-- [ ] Prompt 優化建議引擎：自動分析高消耗 prompt，提供優化建議（如壓縮、替換模型），並支持 A/B 測試。
+- [x] Prompt 優化建議引擎：自動分析高消耗 prompt，提供優化建議（如壓縮、替換模型），並支持 A/B 測試。
+  - 已實作：高消耗 prompt family 排序、可配置壓縮/上下文重構建議、A/B 測試方案（流量切分與成功門檻可由 config 調整）。
 - [x] 多雲/多模型成本聚合：統一管理來自不同雲服務提供商和 LLM 模型的成本數據，提供統一視圖。
   - 已實作（首個 production-ready increment）：normalized multi-provider aggregation model（provider/model/day 統一聚合）+ dashboard 統一視圖（providers totals + cross-provider top models）+ summary JSON 輸出 `multiProviderAggregation`。
-- [ ] 預算分配與使用權限管理：更精細地控制各部門/用戶的 LLM 資源預算分配，並設定使用權限。
+- [x] 預算分配與使用權限管理：更精細地控制各部門/用戶的 LLM 資源預算分配，並設定使用權限。
+  - 已實作：dimension 預算配置（project/department/user/application/businessLine/model）、角色/使用者權限矩陣、call log 權限違規偵測（模型白名單與單次成本上限），並於 Dashboard 顯示 allocation/violation 視圖。

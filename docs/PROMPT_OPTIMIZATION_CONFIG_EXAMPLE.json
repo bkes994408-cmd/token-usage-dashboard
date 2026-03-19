@@ -1,0 +1,13 @@
+{
+  "maxPromptFamilies": 10,
+  "compressionThresholdPromptTokens": 650,
+  "contextRefactorRatio": 1.4,
+  "targetPromptTokenReductionPct": 18,
+  "expectedCostReductionPct": 12,
+  "abTesting": {
+    "trafficSplitB": 0.25,
+    "costReductionPctMin": 12,
+    "qualityDropPctMax": 1.5,
+    "latencyIncreasePctMax": 8
+  }
+}

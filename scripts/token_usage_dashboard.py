@@ -504,26 +504,35 @@ def _prompt_template_signature(prompt: str) -> str:
     return " ".join(tokens[:24])
 
 
-def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_tokens: float) -> List[Dict[str, Any]]:
+def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_tokens: float, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    cfg = config if isinstance(config, dict) else {}
+    compression_threshold = _safe_float(cfg.get("compressionThresholdPromptTokens"), default=700.0)
+    context_refactor_ratio = _safe_float(cfg.get("contextRefactorRatio"), default=1.5)
+    target_reduction_pct = _safe_float(cfg.get("targetPromptTokenReductionPct"), default=20.0)
+    expected_cost_reduction_pct = _safe_float(cfg.get("expectedCostReductionPct"), default=10.0)
+    ab_cfg = cfg.get("abTesting") if isinstance(cfg.get("abTesting"), dict) else {}
+    variant_b_ratio = _safe_float(ab_cfg.get("trafficSplitB"), default=0.2)
+    variant_b_ratio = min(0.9, max(0.05, variant_b_ratio))
+
     actions: List[Dict[str, Any]] = []
-    if sample_prompt_tokens >= 700:
+    if sample_prompt_tokens >= compression_threshold:
         actions.append(
             {
                 "type": "compression",
                 "title": "Compress long instructions and remove repeated context",
-                "expectedPromptTokenReductionPct": 20.0,
+                "expectedPromptTokenReductionPct": target_reduction_pct,
                 "actions": [
                     "Extract stable policy text into a reusable system preset.",
                     "Summarize long conversation history before sending to model.",
                 ],
             }
         )
-    if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * 1.5:
+    if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * context_refactor_ratio:
         actions.append(
             {
                 "type": "context_refactor",
                 "title": "Move verbose context into retrieval/cache",
-                "expectedPromptTokenReductionPct": 15.0,
+                "expectedPromptTokenReductionPct": max(8.0, target_reduction_pct * 0.75),
                 "actions": [
                     "Replace full inline docs with retrieval IDs or snippets.",
                     "Use semantic cache for repeated context blocks.",
@@ -534,9 +543,9 @@ def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_to
         {
             "type": "model_rightsizing",
             "title": "A/B test lower-cost model on this prompt family",
-            "expectedCostReductionPct": 10.0,
+            "expectedCostReductionPct": expected_cost_reduction_pct,
             "actions": [
-                "Route 20% traffic to candidate model and track quality score.",
+                f"Route {int(variant_b_ratio * 100)}% traffic to candidate model and track quality score.",
                 "Promote candidate only if quality drop <= 2%.",
             ],
         }
@@ -550,10 +559,22 @@ def build_prompt_optimization_engine(
     *,
     normalized_records: Optional[List[Dict[str, Any]]] = None,
     max_prompt_families: int = 8,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    cfg = config if isinstance(config, dict) else {}
+    family_limit = int(cfg.get("maxPromptFamilies") or max_prompt_families or 8)
+    family_limit = max(1, family_limit)
+    ab_cfg = cfg.get("abTesting") if isinstance(cfg.get("abTesting"), dict) else {}
+    traffic_split_b = min(0.9, max(0.05, _safe_float(ab_cfg.get("trafficSplitB"), default=0.5)))
+    criteria = {
+        "costReductionPctMin": _safe_float(ab_cfg.get("costReductionPctMin"), default=10.0),
+        "qualityDropPctMax": _safe_float(ab_cfg.get("qualityDropPctMax"), default=2.0),
+        "latencyIncreasePctMax": _safe_float(ab_cfg.get("latencyIncreasePctMax"), default=10.0),
+    }
+
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
     if not records:
-        return {"available": False, "highConsumptionPrompts": [], "abTests": []}
+        return {"available": False, "highConsumptionPrompts": [], "abTests": [], "config": {"maxPromptFamilies": family_limit, "abTesting": criteria}}
 
     families: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -583,7 +604,7 @@ def build_prompt_optimization_engine(
         families.values(),
         key=lambda x: (x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
         reverse=True,
-    )[:max_prompt_families]
+    )[:family_limit]
 
     by_model = pattern_analysis.get("dimensions", {}).get("byModel", []) if isinstance(pattern_analysis, dict) else []
     cheap_model = None
@@ -603,7 +624,7 @@ def build_prompt_optimization_engine(
         avg_completion_tokens = item["totalCompletionTokens"] / max(1, calls)
         top_model = sorted(item["models"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["models"] else "unknown"
         top_project = sorted(item["projects"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["projects"] else "unknown"
-        suggestions = _prompt_suggestion_actions(avg_prompt_tokens, avg_completion_tokens)
+        suggestions = _prompt_suggestion_actions(avg_prompt_tokens, avg_completion_tokens, config=cfg)
         prompt_families.append(
             {
                 "rank": idx,
@@ -633,22 +654,22 @@ def build_prompt_optimization_engine(
                 "testId": f"prompt-ab-{idx:02d}",
                 "scope": item["templateSignature"],
                 "goal": "reduce_cost_with_quality_guardrail",
-                "trafficSplit": {"A": 0.5, "B": 0.5},
+                "trafficSplit": {"A": round(1.0 - traffic_split_b, 3), "B": round(traffic_split_b, 3)},
                 "variants": [
                     {"name": "A-control", "strategy": "status_quo", "model": top_model},
                     variant_b,
                 ],
-                "successCriteria": {
-                    "costReductionPctMin": 10.0,
-                    "qualityDropPctMax": 2.0,
-                    "latencyIncreasePctMax": 10.0,
-                },
+                "successCriteria": criteria,
                 "metrics": ["avgCostPerCallUSD", "qualityScore", "avgLatencyMs", "promptTokens"],
             }
         )
 
     return {
         "available": True,
+        "config": {
+            "maxPromptFamilies": family_limit,
+            "abTesting": criteria,
+        },
         "highConsumptionPrompts": prompt_families,
         "abTests": ab_tests,
     }
@@ -789,6 +810,16 @@ def _load_budget_config(path: Optional[str]) -> Dict[str, Any]:
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("Budget config must be a JSON object.")
+    return parsed
+
+
+def _load_prompt_optimization_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Prompt optimization config must be a JSON object.")
     return parsed
 
 
@@ -1307,13 +1338,43 @@ def evaluate_budget_allocation_and_permissions(
 
     role_permissions = permission_cfg.get("roles") if isinstance(permission_cfg.get("roles"), dict) else {}
     user_permissions = permission_cfg.get("users") if isinstance(permission_cfg.get("users"), dict) else {}
+    default_role = str(permission_cfg.get("defaultRole") or "viewer")
+
+    violations: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for r in records:
+        user = str(r.get("user") or "unknown")
+        model = str(r.get("model") or "unknown")
+        cost = _safe_float(r.get("costUSD"))
+
+        raw_user_policy = user_permissions.get(user) if isinstance(user_permissions.get(user), dict) else {}
+        assigned_role = str(raw_user_policy.get("role") or default_role)
+        role_policy = role_permissions.get(assigned_role) if isinstance(role_permissions.get(assigned_role), dict) else {}
+
+        allowed_models = raw_user_policy.get("allowedModels") if isinstance(raw_user_policy.get("allowedModels"), list) else role_policy.get("allowedModels")
+        max_cost = raw_user_policy.get("maxCostPerCallUSD") if isinstance(raw_user_policy.get("maxCostPerCallUSD"), (int, float)) else role_policy.get("maxCostPerCallUSD")
+
+        if isinstance(allowed_models, list) and allowed_models and model not in {str(x) for x in allowed_models}:
+            key = (user, model, "model_not_allowed")
+            node = violations.setdefault(key, {"user": user, "role": assigned_role, "model": model, "violation": "model_not_allowed", "calls": 0, "costUSD": 0.0, "message": f"Model '{model}' not allowed for role '{assigned_role}'"})
+            node["calls"] += 1
+            node["costUSD"] += cost
+
+        if isinstance(max_cost, (int, float)) and cost > float(max_cost):
+            key = (user, model, "call_cost_exceeded")
+            node = violations.setdefault(key, {"user": user, "role": assigned_role, "model": model, "violation": "call_cost_exceeded", "calls": 0, "costUSD": 0.0, "message": f"Per-call cost {cost:.4f} > max {float(max_cost):.4f}"})
+            node["calls"] += 1
+            node["costUSD"] += cost
+
+    violation_list = sorted(violations.values(), key=lambda x: (x["costUSD"], x["calls"]), reverse=True)
 
     return {
         "available": bool(allocations or role_permissions or user_permissions or overage_cfg),
         "allocations": allocations,
         "permissions": {
+            "defaultRole": default_role,
             "roles": role_permissions,
             "users": user_permissions,
+            "violations": violation_list,
         },
         "overagePolicies": overage_cfg,
     }
@@ -1444,6 +1505,7 @@ def build_summary(
     alert_config: Optional[Dict[str, Any]] = None,
     cost_control_config: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
+    prompt_optimization_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -1476,7 +1538,12 @@ def build_summary(
     pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
     attribution = build_cost_attribution(rows, normalized_records=normalized_records)
     recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution, normalized_records=normalized_records)
-    prompt_optimization_engine = build_prompt_optimization_engine(rows, pattern_analysis, normalized_records=normalized_records)
+    prompt_optimization_engine = build_prompt_optimization_engine(
+        rows,
+        pattern_analysis,
+        normalized_records=normalized_records,
+        config=prompt_optimization_config,
+    )
     forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
     forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
     anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
@@ -1896,6 +1963,7 @@ def build_dashboard_html(
     cost_control_config: Optional[Dict[str, Any]] = None,
     multi_provider_agg: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
+    prompt_optimization_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -1921,6 +1989,7 @@ def build_dashboard_html(
         alert_config=alert_config,
         cost_control_config=cost_control_config,
         budget_config=budget_config,
+        prompt_optimization_config=prompt_optimization_config,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -2077,6 +2146,28 @@ def build_dashboard_html(
         budget_alloc_rows = "\n".join([
             f"<tr><td>{i+1}</td><td>{esc(x.get('dimension'))}</td><td>{esc(x.get('key'))}</td><td>{usd(float(x.get('budgetUSD', 0.0)))}</td><td>{usd(float(x.get('actualCostUSD', 0.0)))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{usd(float(x.get('remainingUSD', 0.0)))}</td><td>{esc(x.get('status'))}</td></tr>"
             for i, x in enumerate(budget_eval.get("allocations", [])[:12])
+        ])
+
+    perms = budget_eval.get("permissions") if isinstance(budget_eval.get("permissions"), dict) else {}
+    role_rows = "<tr><td colspan='4'>No role permissions configured</td></tr>"
+    if isinstance(perms.get("roles"), dict) and perms.get("roles"):
+        role_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(role)}</td><td>{esc(', '.join([str(m) for m in cfg.get('allowedModels', [])]) if isinstance(cfg.get('allowedModels'), list) and cfg.get('allowedModels') else 'all')}</td><td>{esc(str(cfg.get('maxCostPerCallUSD')) if cfg.get('maxCostPerCallUSD') is not None else '—')}</td></tr>"
+            for i, (role, cfg) in enumerate(sorted([(k, v) for k, v in perms.get("roles", {}).items() if isinstance(v, dict)], key=lambda x: x[0])[:20])
+        ])
+
+    user_perm_rows = "<tr><td colspan='5'>No user permission overrides configured</td></tr>"
+    if isinstance(perms.get("users"), dict) and perms.get("users"):
+        user_perm_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(user_name)}</td><td>{esc(str(cfg.get('role') or perms.get('defaultRole') or 'viewer'))}</td><td>{esc(', '.join([str(m) for m in cfg.get('allowedModels', [])]) if isinstance(cfg.get('allowedModels'), list) and cfg.get('allowedModels') else 'inherit')}</td><td>{esc(str(cfg.get('maxCostPerCallUSD')) if cfg.get('maxCostPerCallUSD') is not None else 'inherit')}</td></tr>"
+            for i, (user_name, cfg) in enumerate(sorted([(k, v) for k, v in perms.get("users", {}).items() if isinstance(v, dict)], key=lambda x: x[0])[:20])
+        ])
+
+    permission_violation_rows = "<tr><td colspan='7'>No permission violations detected</td></tr>"
+    if isinstance(perms.get("violations"), list) and perms.get("violations"):
+        permission_violation_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(v.get('user'))}</td><td>{esc(v.get('role'))}</td><td>{esc(v.get('model'))}</td><td>{esc(v.get('violation'))}</td><td>{int(v.get('calls', 0))}</td><td>{usd(float(v.get('costUSD', 0.0)))}</td></tr>"
+            for i, v in enumerate(perms.get("violations", [])[:20])
         ])
 
     overage = summary.get("overageBehaviors") if isinstance(summary.get("overageBehaviors"), dict) else {"available": False}
@@ -2358,6 +2449,21 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Dimension</th><th>Key</th><th>Budget</th><th>Actual</th><th>Usage</th><th>Remaining</th><th>Status</th></tr></thead>
     <tbody>{budget_alloc_rows}</tbody>
+  </table>
+  <h4>Role Permission Matrix</h4>
+  <table>
+    <thead><tr><th>#</th><th>Role</th><th>Allowed Models</th><th>Max Cost / Call (USD)</th></tr></thead>
+    <tbody>{role_rows}</tbody>
+  </table>
+  <h4>User Permission Overrides</h4>
+  <table>
+    <thead><tr><th>#</th><th>User</th><th>Role</th><th>Allowed Models</th><th>Max Cost / Call (USD)</th></tr></thead>
+    <tbody>{user_perm_rows}</tbody>
+  </table>
+  <h4>Permission Violations (Detected from call logs)</h4>
+  <table>
+    <thead><tr><th>#</th><th>User</th><th>Role</th><th>Model</th><th>Violation</th><th>Calls</th><th>Cost</th></tr></thead>
+    <tbody>{permission_violation_rows}</tbody>
   </table>
 
   <h3>Overage Handling</h3>
@@ -3061,6 +3167,7 @@ def main() -> int:
     parser.add_argument("--alert-config", help="Path to alert rules/notification channels JSON")
     parser.add_argument("--cost-control-config", help="Path to real-time cost control policy JSON")
     parser.add_argument("--budget-config", help="Path to budget allocation / permission / overage policy JSON")
+    parser.add_argument("--prompt-optimization-config", help="Path to prompt optimization engine JSON config")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -3187,6 +3294,12 @@ def main() -> int:
         eprint(f"Failed to load budget config: {exc}")
         return 11
 
+    try:
+        prompt_optimization_config = _load_prompt_optimization_config(args.prompt_optimization_config)
+    except Exception as exc:
+        eprint(f"Failed to load prompt optimization config: {exc}")
+        return 12
+
     multi_provider_agg: Optional[Dict[str, Any]] = None
     if aggregate_providers:
         agg_rows: Dict[str, List[Dict[str, Any]]] = {}
@@ -3211,6 +3324,7 @@ def main() -> int:
         cost_control_config=cost_control_config,
         multi_provider_agg=multi_provider_agg,
         budget_config=budget_config,
+        prompt_optimization_config=prompt_optimization_config,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -3224,6 +3338,7 @@ def main() -> int:
             alert_config=alert_config,
             cost_control_config=cost_control_config,
             budget_config=budget_config,
+            prompt_optimization_config=prompt_optimization_config,
         )
         summary["role"] = role_name
         summary["policy"] = policy

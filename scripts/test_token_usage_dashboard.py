@@ -23,6 +23,7 @@ from token_usage_dashboard import (
     forecast_cost,
     parse_provider_list,
     build_multi_provider_aggregation,
+    build_unified_cloud_cost_view,
     downsample_rows,
     generate_custom_report,
     main as dashboard_main,
@@ -93,6 +94,62 @@ class TestTokenDashboard(TestCase):
         self.assertIn("Multi-Provider Unified View", html)
         self.assertIn("Unified Top Models (cross-provider)", html)
         self.assertIn("Aggregated providers total", html)
+
+    def test_unified_cloud_cost_view_merges_llm_and_cloud(self):
+        rows = [
+            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.0}]},
+            {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 3.0}]},
+        ]
+        cloud_rows = [
+            {"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 5.0},
+            {"date": "2026-03-02", "provider": "gcp", "service": "bigquery", "costUSD": 7.0},
+        ]
+        view = build_unified_cloud_cost_view(rows, cloud_rows)
+        self.assertTrue(view["available"])
+        self.assertTrue(view["cloudIntegrationEnabled"])
+        self.assertAlmostEqual(view["totals"]["llmCostUSD"], 5.0)
+        self.assertAlmostEqual(view["totals"]["cloudInfraCostUSD"], 12.0)
+        self.assertAlmostEqual(view["totals"]["totalUnifiedCostUSD"], 17.0)
+        self.assertEqual(len(view["daily"]), 2)
+
+    def test_summary_cloud_integration_updates_hook_status(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]
+        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 2.0}]
+        summary = build_summary("codex", rows, cloud_cost_rows=cloud_rows)
+        self.assertIn("unifiedCloudCostView", summary)
+        self.assertTrue(summary["unifiedCloudCostView"]["cloudIntegrationEnabled"])
+        hooks = summary["optimizationRecommendations"]["integrationHooks"]["cloudCostManagement"]
+        self.assertEqual(hooks["awsCostExplorer"]["status"], "connected")
+        self.assertEqual(hooks["gcpBilling"]["status"], "connected")
+
+        html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows)
+        self.assertIn("Unified Cloud Cost View (LLM + AWS/GCP)", html)
+        self.assertIn("Cloud Provider", html)
+        self.assertIn("Top Cloud Services", html)
+
+    def test_normalize_cloud_cost_payload_supports_aws_and_gcp_shapes(self):
+        aws_payload = {
+            "ResultsByTime": [
+                {
+                    "TimePeriod": {"Start": "2026-03-01"},
+                    "Groups": [
+                        {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "3.5", "Unit": "USD"}}}
+                    ],
+                }
+            ]
+        }
+        gcp_payload = {
+            "daily": [
+                {"date": "2026-03-01", "service": "BigQuery", "cost": 2.25, "projectId": "acme-prod"}
+            ]
+        }
+
+        aws_rows = dashboard_module._normalize_cloud_cost_payload(aws_payload)
+        gcp_rows = dashboard_module._normalize_cloud_cost_payload(gcp_payload)
+        self.assertEqual(aws_rows[0]["provider"], "aws")
+        self.assertEqual(aws_rows[0]["source"], "aws_cost_explorer")
+        self.assertEqual(gcp_rows[0]["provider"], "gcp")
+        self.assertEqual(gcp_rows[0]["source"], "gcp_billing_export")
 
     def test_summary_includes_pattern_analysis(self):
         rows = [

@@ -1743,7 +1743,10 @@ def build_summary(
     cost_control_config: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
     prompt_optimization_config: Optional[Dict[str, Any]] = None,
+<<<<<<< HEAD
     cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
+=======
+>>>>>>> origin/main
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -1775,6 +1778,7 @@ def build_summary(
     normalized_records = _normalize_call_records(rows)
     pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
     attribution = build_cost_attribution(rows, normalized_records=normalized_records)
+<<<<<<< HEAD
     unified_cloud_cost = build_unified_cloud_cost_view(rows, cloud_rows=cloud_cost_rows)
     recommendations = build_optimization_recommendations(
         rows,
@@ -1783,6 +1787,9 @@ def build_summary(
         normalized_records=normalized_records,
         cloud_cost_view=unified_cloud_cost,
     )
+=======
+    recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution, normalized_records=normalized_records)
+>>>>>>> origin/main
     prompt_optimization_engine = build_prompt_optimization_engine(
         rows,
         pattern_analysis,
@@ -1831,6 +1838,7 @@ def build_summary(
         "promptOptimizationEngine": prompt_optimization_engine,
         "budgetAllocation": budget_eval,
         "overageBehaviors": overage,
+<<<<<<< HEAD
     }
 
 
@@ -1884,6 +1892,8 @@ def build_unified_cloud_cost_view(rows: List[Dict[str, Any]], cloud_rows: Option
             for k, v in sorted(cloud_service_totals.items(), key=lambda kv: kv[1], reverse=True)[:15]
         ],
         "daily": daily,
+=======
+>>>>>>> origin/main
     }
 
 
@@ -2453,7 +2463,10 @@ def build_dashboard_html(
     multi_provider_agg: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
     prompt_optimization_config: Optional[Dict[str, Any]] = None,
+<<<<<<< HEAD
     cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
+=======
+>>>>>>> origin/main
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -2480,7 +2493,10 @@ def build_dashboard_html(
         cost_control_config=cost_control_config,
         budget_config=budget_config,
         prompt_optimization_config=prompt_optimization_config,
+<<<<<<< HEAD
         cloud_cost_rows=cloud_cost_rows,
+=======
+>>>>>>> origin/main
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -3688,7 +3704,10 @@ def main() -> int:
     parser.add_argument("--cost-control-config", help="Path to real-time cost control policy JSON")
     parser.add_argument("--budget-config", help="Path to budget allocation / permission / overage policy JSON")
     parser.add_argument("--prompt-optimization-config", help="Path to prompt optimization engine JSON config")
+<<<<<<< HEAD
     parser.add_argument("--cloud-cost-input", help="Path to cloud cost JSON (normalized records / AWS Cost Explorer / GCP billing export)")
+=======
+>>>>>>> origin/main
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -3823,12 +3842,15 @@ def main() -> int:
         eprint(f"Failed to load prompt optimization config: {exc}")
         return 12
 
+<<<<<<< HEAD
     try:
         cloud_cost_rows = load_cloud_cost_rows(args.cloud_cost_input)
     except Exception as exc:
         eprint(f"Failed to load cloud cost input: {exc}")
         return 13
 
+=======
+>>>>>>> origin/main
     multi_provider_agg: Optional[Dict[str, Any]] = None
     if aggregate_providers:
         agg_rows: Dict[str, List[Dict[str, Any]]] = {}
@@ -3849,7 +3871,10 @@ def main() -> int:
             cost_control_config=cost_control_config,
             budget_config=budget_config,
             prompt_optimization_config=prompt_optimization_config,
+<<<<<<< HEAD
             cloud_cost_rows=cloud_cost_rows,
+=======
+>>>>>>> origin/main
         )
         dispatch_cfg = alert_config.get("dispatch") if isinstance(alert_config.get("dispatch"), dict) else {}
         dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
@@ -3894,7 +3919,10 @@ def main() -> int:
         multi_provider_agg=multi_provider_agg,
         budget_config=budget_config,
         prompt_optimization_config=prompt_optimization_config,
+<<<<<<< HEAD
         cloud_cost_rows=cloud_cost_rows,
+=======
+>>>>>>> origin/main
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -3909,7 +3937,10 @@ def main() -> int:
             cost_control_config=cost_control_config,
             budget_config=budget_config,
             prompt_optimization_config=prompt_optimization_config,
+<<<<<<< HEAD
             cloud_cost_rows=cloud_cost_rows,
+=======
+>>>>>>> origin/main
         )
         summary["role"] = role_name
         summary["policy"] = policy

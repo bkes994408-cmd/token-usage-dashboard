@@ -330,6 +330,60 @@ class TestTokenDashboard(TestCase):
         self.assertIn("suggestions", first)
         self.assertTrue(any(s["type"] == "model_rightsizing" for s in first["suggestions"]))
 
+    def test_prompt_optimization_engine_respects_config(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [{
+                "modelName": "gpt-5",
+                "projectId": "proj-a",
+                "promptTokens": 820,
+                "completionTokens": 100,
+                "totalTokens": 920,
+                "cost": 1.0,
+                "prompt": "長提示詞 A",
+            }]
+        }]
+        pattern = build_llm_pattern_analysis(rows)
+        cfg = {
+            "maxPromptFamilies": 1,
+            "abTesting": {
+                "trafficSplitB": 0.25,
+                "costReductionPctMin": 12,
+                "qualityDropPctMax": 1.5,
+                "latencyIncreasePctMax": 8,
+            }
+        }
+        engine = build_prompt_optimization_engine(rows, pattern, config=cfg)
+        self.assertEqual(engine["config"]["maxPromptFamilies"], 1)
+        self.assertEqual(engine["abTests"][0]["trafficSplit"]["B"], 0.25)
+        self.assertEqual(engine["abTests"][0]["successCriteria"]["costReductionPctMin"], 12.0)
+
+    def test_budget_permissions_detect_violations(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [
+                {"userId": "alice", "modelName": "gpt-5", "cost": 1.2, "totalTokens": 100},
+                {"userId": "alice", "modelName": "gpt-4.1", "cost": 0.4, "totalTokens": 60},
+            ],
+        }]
+        cfg = {
+            "permissions": {
+                "defaultRole": "viewer",
+                "roles": {
+                    "viewer": {"allowedModels": ["gpt-4.1"], "maxCostPerCallUSD": 0.5},
+                },
+                "users": {
+                    "alice": {"role": "viewer"},
+                },
+            }
+        }
+        budget = evaluate_budget_allocation_and_permissions(rows, config=cfg)
+        violations = budget["permissions"].get("violations", [])
+        self.assertGreaterEqual(len(violations), 1)
+        violation_types = {v["violation"] for v in violations}
+        self.assertIn("model_not_allowed", violation_types)
+        self.assertIn("call_cost_exceeded", violation_types)
+
     def test_build_summary_normalizes_call_records_once(self):
         from unittest.mock import patch
 
@@ -926,6 +980,10 @@ class TestTokenDashboard(TestCase):
         }]
         budget_cfg = {
             "allocations": [{"id": "alloc-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0}],
+            "permissions": {
+                "roles": {"viewer": {"allowedModels": ["gpt-4.1"], "maxCostPerCallUSD": 1.0}},
+                "users": {"alice": {"role": "viewer"}},
+            },
             "overagePolicies": [{"thresholdPct": 100, "action": "stop_calls", "message": "hard stop"}],
         }
         summary = build_summary("codex", rows, budget_config=budget_cfg)
@@ -935,6 +993,8 @@ class TestTokenDashboard(TestCase):
 
         html = build_dashboard_html("codex", rows, top_models=2, budget_config=budget_cfg)
         self.assertIn("Budget Allocation & Permission Management", html)
+        self.assertIn("Role Permission Matrix", html)
+        self.assertIn("Permission Violations (Detected from call logs)", html)
         self.assertIn("Overage Handling", html)
         self.assertIn("proj-a", html)
 

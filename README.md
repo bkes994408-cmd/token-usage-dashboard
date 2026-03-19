@@ -58,6 +58,7 @@ python3 scripts/token_usage_dashboard.py \
   --alert-config docs/ALERT_CONFIG_EXAMPLE.json \
   --cost-control-config docs/COST_CONTROL_CONFIG_EXAMPLE.json \
   --budget-config docs/BUDGET_CONFIG_EXAMPLE.json \
+  --prompt-optimization-config docs/PROMPT_OPTIMIZATION_CONFIG_EXAMPLE.json \
   --output /tmp/token_usage_dashboard.html \
   --summary-json /tmp/token_usage_summary.json \
   --custom-report-json /tmp/custom_report.json \
@@ -116,6 +117,7 @@ Tenant payload format should include per-org daily data, e.g.:
 See `docs/TENANT_CONFIG_EXAMPLE.json` for org/user/group/role/view config schema.
 
 Real-time cost control policy example: `docs/COST_CONTROL_CONFIG_EXAMPLE.json`.
+Prompt optimization engine config example: `docs/PROMPT_OPTIMIZATION_CONFIG_EXAMPLE.json`.
 
 Dashboard view management (create/update/delete/list/assign/unassign):
 

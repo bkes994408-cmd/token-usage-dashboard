@@ -57,6 +57,7 @@ python3 scripts/token_usage_dashboard.py \
   --spike-threshold-mult 2.0 \
   --alert-config docs/ALERT_CONFIG_EXAMPLE.json \
   --cost-control-config docs/COST_CONTROL_CONFIG_EXAMPLE.json \
+  --budget-config docs/BUDGET_CONFIG_EXAMPLE.json \
   --output /tmp/token_usage_dashboard.html \
   --summary-json /tmp/token_usage_summary.json \
   --custom-report-json /tmp/custom_report.json \

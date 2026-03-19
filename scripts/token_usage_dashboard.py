@@ -782,6 +782,16 @@ def _load_cost_control_config(path: Optional[str]) -> Dict[str, Any]:
     return parsed
 
 
+def _load_budget_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Budget config must be a JSON object.")
+    return parsed
+
+
 def resolve_access_policy(role: Optional[str], user: Optional[str], rbac_config_path: Optional[str]) -> Tuple[str, Dict[str, Any]]:
     cfg = _load_rbac_config(rbac_config_path)
     users = cfg.get("users") if isinstance(cfg.get("users"), dict) else {}
@@ -1257,6 +1267,99 @@ def evaluate_realtime_cost_controls(
     }
 
 
+def evaluate_budget_allocation_and_permissions(
+    rows: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+    normalized_records: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    cfg = config or {}
+    allocations_cfg = cfg.get("allocations") if isinstance(cfg.get("allocations"), list) else []
+    permission_cfg = cfg.get("permissions") if isinstance(cfg.get("permissions"), dict) else {}
+    overage_cfg = cfg.get("overagePolicies") if isinstance(cfg.get("overagePolicies"), list) else []
+
+    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    dim_cost: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for r in records:
+        c = _safe_float(r.get("costUSD"))
+        for dim in ("project", "department", "user", "application", "businessLine", "model"):
+            dim_cost[dim][str(r.get(dim) or "unknown")] += c
+
+    allocations: List[Dict[str, Any]] = []
+    for idx, item in enumerate(allocations_cfg, start=1):
+        if not isinstance(item, dict):
+            continue
+        dimension = str(item.get("dimension") or "project")
+        key = str(item.get("key") or "unknown")
+        budget = _safe_float(item.get("budgetUSD"), default=0.0)
+        if budget <= 0:
+            continue
+        actual = _safe_float(dim_cost.get(dimension, {}).get(key, 0.0))
+        allocations.append({
+            "id": str(item.get("id") or f"alloc-{idx}"),
+            "dimension": dimension,
+            "key": key,
+            "budgetUSD": budget,
+            "actualCostUSD": actual,
+            "usagePct": (actual / budget * 100.0) if budget > 0 else 0.0,
+            "remainingUSD": budget - actual,
+            "status": "over" if actual > budget else ("warning" if actual >= budget * 0.8 else "healthy"),
+        })
+
+    role_permissions = permission_cfg.get("roles") if isinstance(permission_cfg.get("roles"), dict) else {}
+    user_permissions = permission_cfg.get("users") if isinstance(permission_cfg.get("users"), dict) else {}
+
+    return {
+        "available": bool(allocations or role_permissions or user_permissions or overage_cfg),
+        "allocations": allocations,
+        "permissions": {
+            "roles": role_permissions,
+            "users": user_permissions,
+        },
+        "overagePolicies": overage_cfg,
+    }
+
+
+def evaluate_overage_behaviors(
+    budget_eval: Dict[str, Any],
+) -> Dict[str, Any]:
+    allocations = budget_eval.get("allocations") if isinstance(budget_eval.get("allocations"), list) else []
+    policies = budget_eval.get("overagePolicies") if isinstance(budget_eval.get("overagePolicies"), list) else []
+    if not allocations and not policies:
+        return {"available": False, "events": []}
+
+    events: List[Dict[str, Any]] = []
+    for alloc in allocations:
+        if not isinstance(alloc, dict):
+            continue
+        usage_pct = _safe_float(alloc.get("usagePct"))
+        if usage_pct <= 100.0:
+            continue
+
+        matched = None
+        for p in policies:
+            if not isinstance(p, dict):
+                continue
+            threshold = _safe_float(p.get("thresholdPct"), default=100.0)
+            if usage_pct >= threshold and (matched is None or threshold > _safe_float(matched.get("thresholdPct"), default=100.0)):
+                matched = p
+
+        action = str((matched or {}).get("action") or "warn")
+        events.append({
+            "allocationId": str(alloc.get("id") or ""),
+            "dimension": str(alloc.get("dimension") or ""),
+            "key": str(alloc.get("key") or ""),
+            "usagePct": usage_pct,
+            "action": action,
+            "message": str((matched or {}).get("message") or f"{alloc.get('dimension')}:{alloc.get('key')} exceeded budget at {usage_pct:.1f}%"),
+            "routeToModel": (matched or {}).get("routeToModel"),
+        })
+
+    return {
+        "available": True,
+        "events": events,
+    }
+
+
 def prepare_chart_series(rows: List[Dict[str, Any]], top_models: int) -> Tuple[List[str], Dict[str, List[float]], List[float]]:
     totals = model_totals(rows)
     top = [m for m, _ in sorted(totals.items(), key=lambda x: x[1], reverse=True)[:top_models]]
@@ -1340,6 +1443,7 @@ def build_summary(
     spike_threshold_mult: float = 2.0,
     alert_config: Optional[Dict[str, Any]] = None,
     cost_control_config: Optional[Dict[str, Any]] = None,
+    budget_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -1384,6 +1488,8 @@ def build_summary(
         config=cost_control_config,
         normalized_records=normalized_records,
     )
+    budget_eval = evaluate_budget_allocation_and_permissions(rows, config=budget_config, normalized_records=normalized_records)
+    overage = evaluate_overage_behaviors(budget_eval)
 
     return {
         "provider": provider,
@@ -1410,6 +1516,8 @@ def build_summary(
         "costAttribution": attribution,
         "optimizationRecommendations": recommendations,
         "promptOptimizationEngine": prompt_optimization_engine,
+        "budgetAllocation": budget_eval,
+        "overageBehaviors": overage,
     }
 
 
@@ -1787,6 +1895,7 @@ def build_dashboard_html(
     alert_config: Optional[Dict[str, Any]] = None,
     cost_control_config: Optional[Dict[str, Any]] = None,
     multi_provider_agg: Optional[Dict[str, Any]] = None,
+    budget_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -1811,6 +1920,7 @@ def build_dashboard_html(
         spike_threshold_mult=spike_threshold_mult,
         alert_config=alert_config,
         cost_control_config=cost_control_config,
+        budget_config=budget_config,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -1959,6 +2069,22 @@ def build_dashboard_html(
         ab_test_rows = "\n".join([
             f"<tr><td>{i+1}</td><td>{esc(x.get('testId'))}</td><td>{esc(x.get('scope'))}</td><td>{esc('/'.join([v.get('name', '') for v in x.get('variants', []) if isinstance(v, dict)]))}</td><td>{esc(', '.join(x.get('metrics', [])) if isinstance(x.get('metrics'), list) else '')}</td><td>{esc(str(x.get('successCriteria')))}</td></tr>"
             for i, x in enumerate(prompt_engine.get("abTests", [])[:8])
+        ])
+
+    budget_eval = summary.get("budgetAllocation") if isinstance(summary.get("budgetAllocation"), dict) else {"available": False}
+    budget_alloc_rows = "<tr><td colspan='8'>No budget allocation configured</td></tr>"
+    if budget_eval.get("available") and isinstance(budget_eval.get("allocations"), list) and budget_eval.get("allocations"):
+        budget_alloc_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('dimension'))}</td><td>{esc(x.get('key'))}</td><td>{usd(float(x.get('budgetUSD', 0.0)))}</td><td>{usd(float(x.get('actualCostUSD', 0.0)))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{usd(float(x.get('remainingUSD', 0.0)))}</td><td>{esc(x.get('status'))}</td></tr>"
+            for i, x in enumerate(budget_eval.get("allocations", [])[:12])
+        ])
+
+    overage = summary.get("overageBehaviors") if isinstance(summary.get("overageBehaviors"), dict) else {"available": False}
+    overage_rows = "<tr><td colspan='7'>No overage events</td></tr>"
+    if overage.get("available") and isinstance(overage.get("events"), list) and overage.get("events"):
+        overage_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('dimension'))}</td><td>{esc(x.get('key'))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{esc(x.get('action'))}</td><td>{esc(x.get('routeToModel') or '—')}</td><td>{esc(x.get('message'))}</td></tr>"
+            for i, x in enumerate(overage.get("events", [])[:12])
         ])
 
     spike_by_date: Dict[str, Dict[str, float]] = {}
@@ -2226,6 +2352,18 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Test ID</th><th>Scope</th><th>Variants</th><th>Metrics</th><th>Success Criteria</th></tr></thead>
     <tbody>{ab_test_rows}</tbody>
+  </table>
+
+  <h3>Budget Allocation & Permission Management</h3>
+  <table>
+    <thead><tr><th>#</th><th>Dimension</th><th>Key</th><th>Budget</th><th>Actual</th><th>Usage</th><th>Remaining</th><th>Status</th></tr></thead>
+    <tbody>{budget_alloc_rows}</tbody>
+  </table>
+
+  <h3>Overage Handling</h3>
+  <table>
+    <thead><tr><th>#</th><th>Dimension</th><th>Key</th><th>Usage</th><th>Action</th><th>Route To Model</th><th>Message</th></tr></thead>
+    <tbody>{overage_rows}</tbody>
   </table>
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
@@ -2922,6 +3060,7 @@ def main() -> int:
     parser.add_argument("--chart-max-points", type=positive_int, default=1200, help="Downsample chart to at most N points for large datasets")
     parser.add_argument("--alert-config", help="Path to alert rules/notification channels JSON")
     parser.add_argument("--cost-control-config", help="Path to real-time cost control policy JSON")
+    parser.add_argument("--budget-config", help="Path to budget allocation / permission / overage policy JSON")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -3042,6 +3181,12 @@ def main() -> int:
         eprint(f"Failed to load cost control config: {exc}")
         return 10
 
+    try:
+        budget_config = _load_budget_config(args.budget_config)
+    except Exception as exc:
+        eprint(f"Failed to load budget config: {exc}")
+        return 11
+
     multi_provider_agg: Optional[Dict[str, Any]] = None
     if aggregate_providers:
         agg_rows: Dict[str, List[Dict[str, Any]]] = {}
@@ -3065,6 +3210,7 @@ def main() -> int:
         alert_config=alert_config,
         cost_control_config=cost_control_config,
         multi_provider_agg=multi_provider_agg,
+        budget_config=budget_config,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -3077,6 +3223,7 @@ def main() -> int:
             spike_threshold_mult=args.spike_threshold_mult,
             alert_config=alert_config,
             cost_control_config=cost_control_config,
+            budget_config=budget_config,
         )
         summary["role"] = role_name
         summary["policy"] = policy

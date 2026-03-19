@@ -18,6 +18,8 @@ from token_usage_dashboard import (
     detect_cost_anomalies,
     evaluate_alert_rules,
     evaluate_realtime_cost_controls,
+    evaluate_budget_allocation_and_permissions,
+    evaluate_overage_behaviors,
     forecast_cost,
     parse_provider_list,
     build_multi_provider_aggregation,
@@ -259,6 +261,39 @@ class TestTokenDashboard(TestCase):
         self.assertIn("prompt_optimization", rec_types)
         self.assertIn("batching", rec_types)
         self.assertIn("budget_guardrail", rec_types)
+
+    def test_budget_allocation_and_overage_behaviors(self):
+        rows = [
+            {
+                "date": "2026-03-01",
+                "llmCalls": [
+                    {"projectId": "proj-a", "department": "eng", "userId": "alice", "modelName": "gpt-5", "cost": 1.4, "totalTokens": 100},
+                    {"projectId": "proj-a", "department": "eng", "userId": "alice", "modelName": "gpt-5", "cost": 1.1, "totalTokens": 120},
+                ],
+            }
+        ]
+        cfg = {
+            "allocations": [
+                {"id": "eng-proj-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0},
+            ],
+            "permissions": {
+                "roles": {"analyst": {"allowedModels": ["gpt-5"]}},
+                "users": {"alice": {"allowedModels": ["gpt-5"]}},
+            },
+            "overagePolicies": [
+                {"thresholdPct": 100, "action": "degrade", "message": "project over budget"},
+                {"thresholdPct": 120, "action": "switch_model", "routeToModel": "o3-mini", "message": "switch to cheaper model"},
+            ],
+        }
+        budget = evaluate_budget_allocation_and_permissions(rows, config=cfg)
+        self.assertTrue(budget["available"])
+        self.assertEqual(budget["allocations"][0]["id"], "eng-proj-a")
+        self.assertGreater(budget["allocations"][0]["usagePct"], 100.0)
+
+        overage = evaluate_overage_behaviors(budget)
+        self.assertTrue(overage["available"])
+        self.assertEqual(overage["events"][0]["action"], "switch_model")
+        self.assertEqual(overage["events"][0]["routeToModel"], "o3-mini")
 
     def test_build_prompt_optimization_engine_and_ab_plan(self):
         rows = [
@@ -880,6 +915,28 @@ class TestTokenDashboard(TestCase):
         self.assertNotIn("<td><img src=x onerror=alert(1)>", html)
         self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
         self.assertIn("escapeHtml", html)
+
+    def test_summary_and_dashboard_include_budget_and_overage_sections(self):
+        rows = [{
+            "date": "2026-03-01",
+            "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.5}],
+            "llmCalls": [
+                {"projectId": "proj-a", "department": "eng", "userId": "alice", "modelName": "gpt-5", "cost": 2.5, "totalTokens": 300}
+            ],
+        }]
+        budget_cfg = {
+            "allocations": [{"id": "alloc-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0}],
+            "overagePolicies": [{"thresholdPct": 100, "action": "stop_calls", "message": "hard stop"}],
+        }
+        summary = build_summary("codex", rows, budget_config=budget_cfg)
+        self.assertIn("budgetAllocation", summary)
+        self.assertIn("overageBehaviors", summary)
+        self.assertEqual(summary["overageBehaviors"]["events"][0]["action"], "stop_calls")
+
+        html = build_dashboard_html("codex", rows, top_models=2, budget_config=budget_cfg)
+        self.assertIn("Budget Allocation & Permission Management", html)
+        self.assertIn("Overage Handling", html)
+        self.assertIn("proj-a", html)
 
     def test_dashboard_html_escapes_alert_fields(self):
         rows = [{"date": f"2026-03-{d:02d}", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]} for d in range(1, 10)]

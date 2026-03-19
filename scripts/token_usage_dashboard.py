@@ -11,6 +11,9 @@ import json
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 import webbrowser
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -1813,6 +1816,179 @@ def generate_custom_report(
     return out
 
 
+def _build_notification_text(title: str, lines: List[str]) -> str:
+    body = "\n".join([x for x in lines if x])
+    return f"{title}\n{body}" if body else title
+
+
+def _dispatch_webhook(channel: str, webhook_url: str, text: str, timeout_seconds: float = 8.0) -> Dict[str, Any]:
+    if not isinstance(webhook_url, str) or not webhook_url.startswith(("https://", "http://")):
+        return {"status": "failed", "reason": "invalid_webhook_url", "channel": channel}
+
+    payload: Dict[str, Any]
+    ch = channel.lower()
+    if ch == "discord":
+        payload = {"content": text}
+    elif ch == "slack":
+        payload = {"text": text}
+    else:
+        payload = {"text": text}
+
+    req = urllib.request.Request(
+        webhook_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+        if 200 <= status < 300:
+            return {"status": "sent", "channel": channel, "httpStatus": status}
+        return {"status": "failed", "channel": channel, "httpStatus": status}
+    except urllib.error.HTTPError as exc:
+        return {"status": "failed", "channel": channel, "httpStatus": int(exc.code), "reason": str(exc)}
+    except Exception as exc:
+        return {"status": "failed", "channel": channel, "reason": str(exc)}
+
+
+def _parse_channel_target(channel: Optional[str], target: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    ch = (channel or "").strip().lower()
+    tg = (target or "").strip()
+
+    # 支援 alert config 既有格式: slack:webhook:https://..., discord:webhook:https://...
+    if not ch and tg:
+        parts = tg.split(":", 2)
+        if len(parts) == 3 and parts[1] == "webhook":
+            return parts[0].lower(), parts[2]
+
+    if ch in {"slack", "discord"}:
+        return ch, tg
+
+    if ch.startswith("slack:webhook:"):
+        return "slack", ch.split(":", 2)[2]
+    if ch.startswith("discord:webhook:"):
+        return "discord", ch.split(":", 2)[2]
+
+    if ch and tg.startswith(("http://", "https://")):
+        return ch, tg
+
+    return None, None
+
+
+def dispatch_report_delivery(
+    report_payload: Dict[str, Any],
+    recipient: Dict[str, Any],
+    timeout_seconds: float = 8.0,
+    retries: int = 0,
+) -> Dict[str, Any]:
+    channel, webhook_url = _parse_channel_target(recipient.get("channel"), recipient.get("target"))
+    if not channel or not webhook_url:
+        return {
+            "target": recipient.get("target"),
+            "channel": recipient.get("channel"),
+            "status": "blocked",
+            "reason": "unsupported_or_missing_webhook",
+        }
+
+    job = report_payload.get("job", {}) if isinstance(report_payload.get("job"), dict) else {}
+    summary = report_payload.get("summary", {}) if isinstance(report_payload.get("summary"), dict) else {}
+    text = _build_notification_text(
+        f"[token-usage-dashboard] Report Ready: {job.get('name') or job.get('id')}",
+        [
+            f"provider={report_payload.get('provider')}",
+            f"generatedAt={report_payload.get('generatedAt')}",
+            f"range={summary.get('startDate')} ~ {summary.get('endDate')}",
+            f"totalCostUSD={_safe_float(summary.get('totalCostUSD')):.2f}",
+            f"last7dCostUSD={_safe_float(summary.get('last7dCostUSD')):.2f}",
+        ],
+    )
+
+    last_result: Dict[str, Any] = {"status": "failed", "reason": "unknown"}
+    attempts = max(0, retries) + 1
+    for i in range(attempts):
+        last_result = _dispatch_webhook(channel, webhook_url, text, timeout_seconds=timeout_seconds)
+        if last_result.get("status") == "sent":
+            return {
+                "target": recipient.get("target"),
+                "channel": channel,
+                **last_result,
+                "attempt": i + 1,
+            }
+        if i < attempts - 1:
+            time.sleep(0.4 * (i + 1))
+
+    return {
+        "target": recipient.get("target"),
+        "channel": channel,
+        **last_result,
+        "attempt": attempts,
+    }
+
+
+def dispatch_event_alerts(
+    summary: Dict[str, Any],
+    alert_config: Optional[Dict[str, Any]] = None,
+    timeout_seconds: float = 8.0,
+    retries: int = 0,
+) -> Dict[str, Any]:
+    cfg = alert_config if isinstance(alert_config, dict) else {}
+    channels_raw = cfg.get("notificationChannels") if isinstance(cfg.get("notificationChannels"), list) else []
+    alerts = summary.get("alerts") if isinstance(summary.get("alerts"), dict) else {}
+    triggered = alerts.get("triggered") if isinstance(alerts.get("triggered"), list) else []
+    controls = summary.get("realTimeCostControls") if isinstance(summary.get("realTimeCostControls"), dict) else {}
+    control_actions = controls.get("triggeredActions") if isinstance(controls.get("triggeredActions"), list) else []
+    overage = summary.get("overageBehaviors") if isinstance(summary.get("overageBehaviors"), dict) else {}
+    overage_events = overage.get("events") if isinstance(overage.get("events"), list) else []
+
+    if not (triggered or control_actions or overage_events):
+        return {"sent": 0, "failed": 0, "events": 0, "results": [], "reason": "no_triggered_events"}
+
+    lines: List[str] = [
+        f"provider={summary.get('provider')}",
+        f"window={summary.get('startDate')} ~ {summary.get('endDate')}",
+        f"totalCostUSD={_safe_float(summary.get('totalCostUSD')):.2f}",
+    ]
+    for a in triggered[:5]:
+        lines.append(f"ALERT[{a.get('severity')}]: {a.get('message')}")
+    for a in control_actions[:5]:
+        lines.append(f"CONTROL[{a.get('action')}]: {a.get('message')}")
+    for a in overage_events[:5]:
+        lines.append(f"OVERAGE[{a.get('action')}]: {a.get('dimension')}:{a.get('key')} { _safe_float(a.get('usagePct')):.1f}%")
+
+    text = _build_notification_text("[token-usage-dashboard] Event Monitor Alert", lines)
+
+    results: List[Dict[str, Any]] = []
+    for entry in channels_raw:
+        if not isinstance(entry, str):
+            continue
+        channel, webhook_url = _parse_channel_target(None, entry)
+        if not channel or not webhook_url:
+            results.append({"channel": entry, "status": "blocked", "reason": "unsupported_or_missing_webhook"})
+            continue
+
+        attempts = max(0, retries) + 1
+        last: Dict[str, Any] = {"status": "failed"}
+        for i in range(attempts):
+            last = _dispatch_webhook(channel, webhook_url, text, timeout_seconds=timeout_seconds)
+            if last.get("status") == "sent":
+                results.append({"channel": channel, **last, "attempt": i + 1})
+                break
+            if i < attempts - 1:
+                time.sleep(0.4 * (i + 1))
+        else:
+            results.append({"channel": channel, **last, "attempt": attempts})
+
+    sent = len([x for x in results if x.get("status") == "sent"])
+    failed = len(results) - sent
+    return {
+        "sent": sent,
+        "failed": failed,
+        "events": len(triggered) + len(control_actions) + len(overage_events),
+        "results": results,
+    }
+
+
 def _safe_report_job_id(value: Any, fallback: str) -> str:
     raw = str(value or "").strip().lower()
     sanitized = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
@@ -1940,8 +2116,12 @@ def run_report_scheduler(
     jobs = _normalize_report_jobs(config)
     history = _load_report_history(output_dir)
     latest_by_job = history.get("latestByJob") if isinstance(history.get("latestByJob"), dict) else {}
+    dispatch_cfg = config.get("dispatch") if isinstance(config.get("dispatch"), dict) else {}
+    dispatch_enabled = bool(dispatch_cfg.get("enabled", True))
+    dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
+    dispatch_retries = _safe_int(dispatch_cfg.get("retries"), default=0, minimum=0)
 
-    result = {"now": now_dt.isoformat(), "jobs": [], "generated": 0, "skipped": 0}
+    result = {"now": now_dt.isoformat(), "jobs": [], "generated": 0, "skipped": 0, "sent": 0, "failed": 0}
 
     for job in jobs:
         job_id = str(job["id"])
@@ -2021,11 +2201,24 @@ def run_report_scheduler(
                     "reason": "role_not_allowed",
                 })
                 continue
-            deliveries.append({
-                "target": recipient.get("target"),
-                "channel": recipient.get("channel"),
-                "status": "queued",
-            })
+            if dispatch_enabled:
+                dispatch_result = dispatch_report_delivery(
+                    report_payload,
+                    recipient,
+                    timeout_seconds=dispatch_timeout,
+                    retries=dispatch_retries,
+                )
+                deliveries.append(dispatch_result)
+                if dispatch_result.get("status") == "sent":
+                    result["sent"] += 1
+                elif dispatch_result.get("status") != "blocked":
+                    result["failed"] += 1
+            else:
+                deliveries.append({
+                    "target": recipient.get("target"),
+                    "channel": recipient.get("channel"),
+                    "status": "queued",
+                })
 
         history_item = {
             "jobId": job_id,
@@ -3288,6 +3481,8 @@ def main() -> int:
     parser.add_argument("--run-report-scheduler", action="store_true", help="Run report automation jobs and update report history center")
     parser.add_argument("--report-output-dir", default="report_center", help="Directory for generated scheduled reports/history")
     parser.add_argument("--scheduler-now", help="Override scheduler time (ISO8601, UTC recommended)")
+    parser.add_argument("--run-event-monitor", action="store_true", help="Evaluate alerts/cost-controls/overage and dispatch webhook notifications")
+    parser.add_argument("--event-output-json", help="Write event monitor result JSON to this path")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
 
@@ -3409,6 +3604,45 @@ def main() -> int:
                 continue
             agg_rows[p] = filter_days(parse_daily(provider_payload), args.days)
         multi_provider_agg = build_multi_provider_aggregation(agg_rows)
+
+    if args.run_event_monitor:
+        summary = build_summary(
+            args.provider,
+            rows,
+            spike_lookback_days=args.spike_lookback_days,
+            spike_threshold_mult=args.spike_threshold_mult,
+            alert_config=alert_config,
+            cost_control_config=cost_control_config,
+            budget_config=budget_config,
+            prompt_optimization_config=prompt_optimization_config,
+        )
+        dispatch_cfg = alert_config.get("dispatch") if isinstance(alert_config.get("dispatch"), dict) else {}
+        dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
+        dispatch_retries = _safe_int(dispatch_cfg.get("retries"), default=0, minimum=0)
+        event_result = dispatch_event_alerts(
+            summary,
+            alert_config=alert_config,
+            timeout_seconds=dispatch_timeout,
+            retries=dispatch_retries,
+        )
+        payload_out = {
+            "provider": args.provider,
+            "generatedAt": datetime.now(ZoneInfo("UTC")).isoformat(),
+            "summary": {
+                "startDate": summary.get("startDate"),
+                "endDate": summary.get("endDate"),
+                "totalCostUSD": summary.get("totalCostUSD"),
+            },
+            "alerts": summary.get("alerts"),
+            "realTimeCostControls": summary.get("realTimeCostControls"),
+            "overageBehaviors": summary.get("overageBehaviors"),
+            "dispatch": event_result,
+        }
+        if args.event_output_json:
+            Path(args.event_output_json).write_text(json.dumps(payload_out, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(payload_out, ensure_ascii=False, indent=2))
+        return 0
+
 
     html = build_dashboard_html(
         args.provider,

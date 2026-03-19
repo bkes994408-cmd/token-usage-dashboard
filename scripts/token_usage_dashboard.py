@@ -175,6 +175,7 @@ def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
         project: Any = None,
         currency: Any = "USD",
         source: str = "normalized",
+        tags: Any = None,
     ) -> None:
         ds = str(d or "").strip()
         if not parse_date(ds):
@@ -191,6 +192,7 @@ def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
                 "costUSD": c,
                 "currency": str(currency or "USD"),
                 "source": source,
+                "tags": _normalize_cloud_tags(tags),
             }
         )
 
@@ -207,6 +209,7 @@ def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
                 project=row.get("project"),
                 currency=row.get("currency", "USD"),
                 source=str(row.get("source") or "normalized"),
+                tags=row.get("tags") or row.get("labels"),
             )
         return sorted(out, key=lambda x: (x["date"], x["provider"], x["service"], x["project"]))
 
@@ -230,6 +233,14 @@ def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
                         continue
                     keys = g.get("Keys") if isinstance(g.get("Keys"), list) else []
                     service = str(keys[0]) if keys else "all"
+                    tag_items = []
+                    for raw_key in keys[1:]:
+                        txt = str(raw_key)
+                        if '$' in txt:
+                            tk, tv = txt.split('$', 1)
+                            tag_items.append(f"{tk}={tv}")
+                        elif '=' in txt or ':' in txt:
+                            tag_items.append(txt)
                     metrics = g.get("Metrics") if isinstance(g.get("Metrics"), dict) else {}
                     amount_node = (metrics.get("UnblendedCost") if isinstance(metrics.get("UnblendedCost"), dict) else {})
                     push(
@@ -239,6 +250,7 @@ def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
                         amount_node.get("Amount"),
                         currency=amount_node.get("Unit") or "USD",
                         source="aws_cost_explorer",
+                        tags=tag_items,
                     )
             else:
                 total = bucket.get("Total") if isinstance(bucket.get("Total"), dict) else {}
@@ -265,12 +277,28 @@ def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
             project=row.get("project") or row.get("projectId"),
             currency=row.get("currency") or "USD",
             source=str(row.get("source") or "gcp_billing_export"),
+            tags=row.get("tags") or row.get("labels"),
         )
 
     return sorted(out, key=lambda x: (x["date"], x["provider"], x["service"], x["project"]))
 
 
-def load_cloud_cost_rows(path: Optional[str]) -> List[Dict[str, Any]]:
+def _apply_cloud_tag_mapping(rows: List[Dict[str, Any]], mapping: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    if not mapping:
+        return rows
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        tags = _normalize_cloud_tags(row.get("tags"))
+        mapped = dict(row)
+        mapped["tags"] = tags
+        for tag_key, target in mapping.items():
+            if tag_key in tags and tags[tag_key]:
+                mapped[target] = tags[tag_key]
+        out.append(mapped)
+    return out
+
+
+def load_cloud_cost_rows(path: Optional[str], tag_mapping: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     if not path:
         return []
     raw = Path(path).read_text(encoding="utf-8")
@@ -278,8 +306,58 @@ def load_cloud_cost_rows(path: Optional[str]) -> List[Dict[str, Any]]:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Failed to parse cloud cost JSON: {exc}")
-    return _normalize_cloud_cost_payload(parsed)
+    rows = _normalize_cloud_cost_payload(parsed)
+    return _apply_cloud_tag_mapping(rows, tag_mapping)
 
+
+
+
+def _normalize_cloud_tags(raw_tags: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if isinstance(raw_tags, dict):
+        for k, v in raw_tags.items():
+            key = str(k or '').strip().lower()
+            if not key:
+                continue
+            val = str(v or '').strip()
+            if val:
+                out[key] = val
+    elif isinstance(raw_tags, list):
+        for item in raw_tags:
+            if isinstance(item, dict):
+                key = str(item.get('key') or item.get('name') or '').strip().lower()
+                val = str(item.get('value') or '').strip()
+                if key and val:
+                    out[key] = val
+            elif isinstance(item, str):
+                if '=' in item:
+                    k, v = item.split('=', 1)
+                elif ':' in item:
+                    k, v = item.split(':', 1)
+                else:
+                    continue
+                key = k.strip().lower()
+                val = v.strip()
+                if key and val:
+                    out[key] = val
+    return out
+
+
+def _load_cloud_tag_mapping_config(path: Optional[str]) -> Dict[str, str]:
+    if not path:
+        return {}
+    raw = Path(path).read_text(encoding='utf-8')
+    parsed = json.loads(raw)
+    mapping = parsed.get('mapping') if isinstance(parsed, dict) else parsed
+    if not isinstance(mapping, dict):
+        raise RuntimeError('Cloud tag mapping config must be a JSON object or include {"mapping": {...}}.')
+    out: Dict[str, str] = {}
+    for k, v in mapping.items():
+        kk = str(k or '').strip().lower()
+        vv = str(v or '').strip()
+        if kk and vv:
+            out[kk] = vv
+    return out
 
 def parse_date(value: str) -> Optional[date]:
     try:
@@ -582,6 +660,8 @@ def build_cost_attribution(
     rows: List[Dict[str, Any]],
     top_n: int = 8,
     normalized_records: Optional[List[Dict[str, Any]]] = None,
+    cloud_rows: Optional[List[Dict[str, Any]]] = None,
+    granularity: str = "standard",
 ) -> Dict[str, Any]:
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
     day_total = sum(day_total_cost(r) for r in rows)
@@ -623,8 +703,49 @@ def build_cost_attribution(
         "businessLine": _aggregate("businessLine"),
     }
 
+    mode = (granularity or "standard").lower()
+    if mode in {"detailed", "fine", "fine_grained"}:
+        dimensions["model"] = _aggregate("model")
+        dimensions["task"] = _aggregate("task")
+        dimensions["workflow"] = _aggregate("workflow")
+        dimensions["session"] = _aggregate("session")
+
+    cloud = cloud_rows or []
+    if cloud:
+        cloud_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        cloud_service_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        cloud_tag_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        for r in cloud:
+            cost = _safe_float(r.get("costUSD"))
+            p = str(r.get("provider") or "unknown").lower()
+            s = str(r.get("service") or "all")
+            cloud_agg[p]["costUSD"] += cost
+            cloud_agg[p]["count"] += 1
+            key = f"{p}:{s}"
+            cloud_service_agg[key]["costUSD"] += cost
+            cloud_service_agg[key]["count"] += 1
+            tags = _normalize_cloud_tags(r.get("tags"))
+            for tk, tv in tags.items():
+                tkey = f"{tk}={tv}"
+                cloud_tag_agg[tkey]["costUSD"] += cost
+                cloud_tag_agg[tkey]["count"] += 1
+
+        dimensions["cloudProvider"] = [
+            {"key": k, "costUSD": v["costUSD"], "count": int(v["count"])}
+            for k, v in sorted(cloud_agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+        ]
+        dimensions["cloudService"] = [
+            {"key": k, "costUSD": v["costUSD"], "count": int(v["count"])}
+            for k, v in sorted(cloud_service_agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+        ]
+        dimensions["cloudTag"] = [
+            {"key": k, "costUSD": v["costUSD"], "count": int(v["count"])}
+            for k, v in sorted(cloud_tag_agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+        ]
+
     return {
         "available": True,
+        "granularity": mode,
         "totalAttributedCostUSD": total_cost,
         "unallocatedCostUSD": max(0.0, day_total - total_cost),
         "dimensions": dimensions,
@@ -1450,6 +1571,102 @@ def evaluate_alert_rules(
     }
 
 
+
+
+def evaluate_unified_budget_alerts(
+    rows: List[Dict[str, Any]],
+    cloud_rows: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = config if isinstance(config, dict) else {}
+    rules = cfg.get("unifiedBudgetAlerts") if isinstance(cfg.get("unifiedBudgetAlerts"), list) else []
+    cloud = cloud_rows or []
+
+    llm_total = sum(day_total_cost(r) for r in rows)
+    cloud_total = sum(_safe_float(r.get("costUSD")) for r in cloud)
+    unified_total = llm_total + cloud_total
+
+    provider_totals: Dict[str, float] = defaultdict(float)
+    service_totals: Dict[str, float] = defaultdict(float)
+    tag_totals: Dict[str, float] = defaultdict(float)
+    for r in cloud:
+        pvd = str(r.get("provider") or "unknown").lower()
+        svc = str(r.get("service") or "all")
+        c = _safe_float(r.get("costUSD"))
+        provider_totals[pvd] += c
+        service_totals[f"{pvd}:{svc}"] += c
+        for tk, tv in _normalize_cloud_tags(r.get("tags")).items():
+            tag_totals[f"{tk}={tv}"] += c
+
+    events: List[Dict[str, Any]] = []
+    for idx, rule in enumerate(rules, start=1):
+        if not isinstance(rule, dict):
+            continue
+        scope = str(rule.get("scope") or "total").lower()
+        threshold = _safe_float(rule.get("thresholdUSD"), default=0.0)
+        if threshold <= 0:
+            continue
+
+        value = 0.0
+        scope_label = scope
+        if scope == "total":
+            value = unified_total
+        elif scope == "llm":
+            value = llm_total
+        elif scope == "cloud":
+            value = cloud_total
+        elif scope == "provider":
+            provider = str(rule.get("provider") or "").lower()
+            value = _safe_float(provider_totals.get(provider, 0.0))
+            scope_label = f"provider:{provider or 'unknown'}"
+        elif scope == "service":
+            provider = str(rule.get("provider") or "").lower()
+            service = str(rule.get("service") or "all")
+            key = f"{provider}:{service}"
+            value = _safe_float(service_totals.get(key, 0.0))
+            scope_label = f"service:{key}"
+        elif scope == "tag":
+            tag_key = str(rule.get("tagKey") or "").strip().lower()
+            tag_val = str(rule.get("tagValue") or "").strip()
+            key = f"{tag_key}={tag_val}"
+            value = _safe_float(tag_totals.get(key, 0.0))
+            scope_label = f"tag:{key}"
+        else:
+            continue
+
+        if value >= threshold:
+            events.append({
+                "id": str(rule.get("id") or f"unified-budget-{idx}"),
+                "scope": scope_label,
+                "valueUSD": value,
+                "thresholdUSD": threshold,
+                "usagePct": (value / threshold * 100.0) if threshold > 0 else 0.0,
+                "severity": str(rule.get("severity") or ("high" if value >= threshold * 1.2 else "medium")),
+                "message": str(rule.get("message") or f"{scope_label} reached {value:.2f} USD ({value/threshold*100:.1f}% of budget)"),
+            })
+
+    events.sort(key=lambda x: (_safe_float(x.get("usagePct")), _safe_float(x.get("valueUSD"))), reverse=True)
+    by_severity: Dict[str, int] = defaultdict(int)
+    by_scope: Dict[str, int] = defaultdict(int)
+    for e in events:
+        by_severity[str(e.get("severity") or "unknown").lower()] += 1
+        by_scope[str(e.get("scope") or "unknown")] += 1
+
+    return {
+        "available": bool(rules),
+        "totals": {
+            "llmCostUSD": llm_total,
+            "cloudInfraCostUSD": cloud_total,
+            "totalUnifiedCostUSD": unified_total,
+        },
+        "rules": rules,
+        "summary": {
+            "triggered": len(events),
+            "bySeverity": dict(by_severity),
+            "byScope": dict(by_scope),
+        },
+        "events": events,
+    }
 def evaluate_realtime_cost_controls(
     rows: List[Dict[str, Any]],
     forecast_7d: Dict[str, Any],
@@ -1800,6 +2017,7 @@ def build_summary(
     budget_config: Optional[Dict[str, Any]] = None,
     prompt_optimization_config: Optional[Dict[str, Any]] = None,
     cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
+    attribution_granularity: str = "standard",
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -1830,8 +2048,14 @@ def build_summary(
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
     normalized_records = _normalize_call_records(rows)
     pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
-    attribution = build_cost_attribution(rows, normalized_records=normalized_records)
+    attribution = build_cost_attribution(
+        rows,
+        normalized_records=normalized_records,
+        cloud_rows=cloud_cost_rows,
+        granularity=attribution_granularity,
+    )
     unified_cloud_cost = build_unified_cloud_cost_view(rows, cloud_rows=cloud_cost_rows)
+    unified_budget_alerts = evaluate_unified_budget_alerts(rows, cloud_rows=cloud_cost_rows, config=alert_config)
     recommendations = build_optimization_recommendations(
         rows,
         pattern_analysis,
@@ -1885,6 +2109,7 @@ def build_summary(
         "costAttribution": attribution,
         "optimizationRecommendations": recommendations,
         "unifiedCloudCostView": unified_cloud_cost,
+        "unifiedBudgetAlerts": unified_budget_alerts,
         "promptOptimizationEngine": prompt_optimization_engine,
         "budgetAllocation": budget_eval,
         "quotaPolicies": quota_policies,
@@ -1903,6 +2128,7 @@ def build_unified_cloud_cost_view(rows: List[Dict[str, Any]], cloud_rows: Option
     cloud_daily: Dict[str, float] = defaultdict(float)
     cloud_provider_totals: Dict[str, float] = defaultdict(float)
     cloud_service_totals: Dict[str, float] = defaultdict(float)
+    cloud_tag_totals: Dict[str, float] = defaultdict(float)
     for r in cloud:
         d = str(r.get("date") or "")
         if not d:
@@ -1913,6 +2139,8 @@ def build_unified_cloud_cost_view(rows: List[Dict[str, Any]], cloud_rows: Option
         cloud_daily[d] += c
         cloud_provider_totals[p] += c
         cloud_service_totals[f"{p}:{s}"] += c
+        for tk, tv in _normalize_cloud_tags(r.get("tags")).items():
+            cloud_tag_totals[f"{tk}={tv}"] += c
 
     all_days = sorted(set(llm_daily.keys()) | set(cloud_daily.keys()))
     daily = [
@@ -1940,6 +2168,10 @@ def build_unified_cloud_cost_view(rows: List[Dict[str, Any]], cloud_rows: Option
         "cloudServices": [
             {"providerService": k, "totalCostUSD": v}
             for k, v in sorted(cloud_service_totals.items(), key=lambda kv: kv[1], reverse=True)[:15]
+        ],
+        "cloudTags": [
+            {"tag": k, "totalCostUSD": v}
+            for k, v in sorted(cloud_tag_totals.items(), key=lambda kv: kv[1], reverse=True)[:20]
         ],
         "daily": daily,
     }
@@ -2194,8 +2426,10 @@ def dispatch_event_alerts(
     control_actions = controls.get("triggeredActions") if isinstance(controls.get("triggeredActions"), list) else []
     overage = summary.get("overageBehaviors") if isinstance(summary.get("overageBehaviors"), dict) else {}
     overage_events = overage.get("events") if isinstance(overage.get("events"), list) else []
+    unified_budget = summary.get("unifiedBudgetAlerts") if isinstance(summary.get("unifiedBudgetAlerts"), dict) else {}
+    unified_budget_events = unified_budget.get("events") if isinstance(unified_budget.get("events"), list) else []
 
-    if not (triggered or control_actions or overage_events):
+    if not (triggered or control_actions or overage_events or unified_budget_events):
         return {"sent": 0, "failed": 0, "events": 0, "results": [], "reason": "no_triggered_events"}
 
     lines: List[str] = [
@@ -2209,6 +2443,8 @@ def dispatch_event_alerts(
         lines.append(f"CONTROL[{a.get('action')}]: {a.get('message')}")
     for a in overage_events[:5]:
         lines.append(f"OVERAGE[{a.get('action')}]: {a.get('dimension')}:{a.get('key')} { _safe_float(a.get('usagePct')):.1f}%")
+    for a in unified_budget_events[:5]:
+        lines.append(f"UNIFIED_BUDGET[{a.get('severity')}]: {a.get('message')}")
 
     text = _build_notification_text("[token-usage-dashboard] Event Monitor Alert", lines)
 
@@ -2238,7 +2474,7 @@ def dispatch_event_alerts(
     return {
         "sent": sent,
         "failed": failed,
-        "events": len(triggered) + len(control_actions) + len(overage_events),
+        "events": len(triggered) + len(control_actions) + len(overage_events) + len(unified_budget_events),
         "results": results,
     }
 
@@ -2512,6 +2748,7 @@ def build_dashboard_html(
     budget_config: Optional[Dict[str, Any]] = None,
     prompt_optimization_config: Optional[Dict[str, Any]] = None,
     cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
+    attribution_granularity: str = "standard",
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -2539,6 +2776,7 @@ def build_dashboard_html(
         budget_config=budget_config,
         prompt_optimization_config=prompt_optimization_config,
         cloud_cost_rows=cloud_cost_rows,
+        attribution_granularity=attribution_granularity,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -2653,6 +2891,7 @@ def build_dashboard_html(
     attribution = summary.get("costAttribution") if isinstance(summary.get("costAttribution"), dict) else {"available": False}
     recs = summary.get("optimizationRecommendations") if isinstance(summary.get("optimizationRecommendations"), dict) else {"available": False}
     unified_cloud_view = summary.get("unifiedCloudCostView") if isinstance(summary.get("unifiedCloudCostView"), dict) else {"available": False}
+    unified_budget_alerts = summary.get("unifiedBudgetAlerts") if isinstance(summary.get("unifiedBudgetAlerts"), dict) else {"available": False}
 
     cloud_provider_rows = "<tr><td colspan='3'>No cloud provider cost data</td></tr>"
     if isinstance(unified_cloud_view.get("cloudProviders"), list) and unified_cloud_view.get("cloudProviders"):
@@ -2668,7 +2907,21 @@ def build_dashboard_html(
             for i, x in enumerate(unified_cloud_view.get("cloudServices", [])[:10])
         ])
 
+    cloud_tag_rows = "<tr><td colspan='3'>No cloud tag cost data</td></tr>"
+    if isinstance(unified_cloud_view.get("cloudTags"), list) and unified_cloud_view.get("cloudTags"):
+        cloud_tag_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('tag'))}</td><td>{usd(float(x.get('totalCostUSD', 0.0)))}</td></tr>"
+            for i, x in enumerate(unified_cloud_view.get("cloudTags", [])[:10])
+        ])
+
     unified_totals = unified_cloud_view.get("totals") if isinstance(unified_cloud_view.get("totals"), dict) else {}
+
+    unified_budget_rows = "<tr><td colspan='7'>No unified budget alert triggered</td></tr>"
+    if unified_budget_alerts.get("available") and isinstance(unified_budget_alerts.get("events"), list) and unified_budget_alerts.get("events"):
+        unified_budget_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('id'))}</td><td>{esc(x.get('scope'))}</td><td>{usd(float(x.get('valueUSD', 0.0)))}</td><td>{usd(float(x.get('thresholdUSD', 0.0)))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{esc(x.get('message'))}</td></tr>"
+            for i, x in enumerate(unified_budget_alerts.get("events", [])[:12])
+        ])
 
     def _render_attribution_rows(items: List[Dict[str, Any]]) -> str:
         if not items:
@@ -2683,6 +2936,12 @@ def build_dashboard_html(
     attr_user_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("user", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
     attr_app_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("application", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
     attr_business_line_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("businessLine", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+
+    attr_model_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("model", [])) if attribution.get("available") else "<tr><td colspan='6'>No detailed attribution data</td></tr>"
+    attr_workflow_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("workflow", [])) if attribution.get("available") else "<tr><td colspan='6'>No detailed attribution data</td></tr>"
+    attr_cloud_provider_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProvider", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
+    attr_cloud_service_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudService", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
+    attr_cloud_tag_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudTag", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
 
     rec_rows = "<tr><td colspan='6'>No recommendations</td></tr>"
     if recs.get("available") and isinstance(recs.get("recommendations"), list) and recs.get("recommendations"):
@@ -2883,6 +3142,18 @@ def build_dashboard_html(
     <thead><tr><th>#</th><th>Provider:Service</th><th>Total Cost</th></tr></thead>
     <tbody>{cloud_service_rows}</tbody>
   </table>
+  <h4>Top Cloud Cost Tags</h4>
+  <table>
+    <thead><tr><th>#</th><th>Tag</th><th>Total Cost</th></tr></thead>
+    <tbody>{cloud_tag_rows}</tbody>
+  </table>
+
+  <h3>Cross-platform Unified Budget Alerts</h3>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Single ruleset across LLM + cloud infrastructure spend (AWS/GCP/provider/service scope). Triggered: {int((unified_budget_alerts.get('summary') or {}).get('triggered', 0))} · bySeverity={esc(str((unified_budget_alerts.get('summary') or {}).get('bySeverity', {})))}.</div>
+  <table>
+    <thead><tr><th>#</th><th>Rule</th><th>Scope</th><th>Actual</th><th>Threshold</th><th>Usage</th><th>Message</th></tr></thead>
+    <tbody>{unified_budget_rows}</tbody>
+  </table>
 
   <h3>Model Breakdown</h3>
   <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Showing up to top {max_table_rows} models for faster rendering. Chart points: {len(chart_rows)}/{len(rows)}.</div>
@@ -3021,6 +3292,31 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Business Line</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
     <tbody>{attr_business_line_rows}</tbody>
+  </table>
+  <h4>Attribution by Model (Detailed)</h4>
+  <table>
+    <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_model_rows}</tbody>
+  </table>
+  <h4>Attribution by Workflow (Detailed)</h4>
+  <table>
+    <thead><tr><th>#</th><th>Workflow</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_workflow_rows}</tbody>
+  </table>
+  <h4>Cloud Attribution by Provider</h4>
+  <table>
+    <thead><tr><th>#</th><th>Provider</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_cloud_provider_rows}</tbody>
+  </table>
+  <h4>Cloud Attribution by Service</h4>
+  <table>
+    <thead><tr><th>#</th><th>Provider:Service</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_cloud_service_rows}</tbody>
+  </table>
+  <h4>Cloud Attribution by Tag</h4>
+  <table>
+    <thead><tr><th>#</th><th>Tag</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_cloud_tag_rows}</tbody>
   </table>
   <h4>Optimization Recommendations</h4>
   <table>
@@ -3775,6 +4071,8 @@ def main() -> int:
     parser.add_argument("--budget-config", help="Path to budget allocation / permission / overage policy JSON")
     parser.add_argument("--prompt-optimization-config", help="Path to prompt optimization engine JSON config")
     parser.add_argument("--cloud-cost-input", help="Path to cloud cost JSON (normalized records / AWS Cost Explorer / GCP billing export)")
+    parser.add_argument("--cloud-tag-mapping-config", help="Path to cloud tag mapping JSON ({tagName: targetDimension})")
+    parser.add_argument("--attribution-granularity", choices=["standard", "detailed"], default="standard", help="Cost attribution granularity")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -3910,7 +4208,8 @@ def main() -> int:
         return 12
 
     try:
-        cloud_cost_rows = load_cloud_cost_rows(args.cloud_cost_input)
+        cloud_tag_mapping = _load_cloud_tag_mapping_config(args.cloud_tag_mapping_config)
+        cloud_cost_rows = load_cloud_cost_rows(args.cloud_cost_input, tag_mapping=cloud_tag_mapping)
     except Exception as exc:
         eprint(f"Failed to load cloud cost input: {exc}")
         return 13
@@ -3936,6 +4235,7 @@ def main() -> int:
             budget_config=budget_config,
             prompt_optimization_config=prompt_optimization_config,
             cloud_cost_rows=cloud_cost_rows,
+            attribution_granularity=args.attribution_granularity,
         )
         dispatch_cfg = alert_config.get("dispatch") if isinstance(alert_config.get("dispatch"), dict) else {}
         dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
@@ -3957,6 +4257,7 @@ def main() -> int:
             "alerts": summary.get("alerts"),
             "realTimeCostControls": summary.get("realTimeCostControls"),
             "overageBehaviors": summary.get("overageBehaviors"),
+            "unifiedBudgetAlerts": summary.get("unifiedBudgetAlerts"),
             "dispatch": event_result,
         }
         if args.event_output_json:
@@ -3981,6 +4282,7 @@ def main() -> int:
         budget_config=budget_config,
         prompt_optimization_config=prompt_optimization_config,
         cloud_cost_rows=cloud_cost_rows,
+        attribution_granularity=args.attribution_granularity,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -3996,6 +4298,7 @@ def main() -> int:
             budget_config=budget_config,
             prompt_optimization_config=prompt_optimization_config,
             cloud_cost_rows=cloud_cost_rows,
+            attribution_granularity=args.attribution_granularity,
         )
         summary["role"] = role_name
         summary["policy"] = policy

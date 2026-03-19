@@ -25,6 +25,8 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: 多雲/多模型成本聚合（`--aggregate-providers codex,claude`）：統一聚合 provider/model/day 成本並在 dashboard 顯示 Unified View
 - New: Notification Dispatch 系統（Slack/Discord Webhook）已整合於 Scheduler 與 Event Monitor；支援 timeout/retry 設定。
 - New: Cloud Cost Management 整合（AWS Cost Explorer / GCP Billing 匯入）與 Unified Cloud Cost View（LLM + Cloud Infra 成本統一視圖）。
+- New: 跨平台 Unified Budget Alerts（scope: total/llm/cloud/provider/service/tag），可在 Event Monitor 與 Dashboard 看到告警事件。
+- New: 雲端成本 Tags 映射（`--cloud-tag-mapping-config`）與細粒度成本歸因（`--attribution-granularity detailed`）。
 
 ## Quick start
 
@@ -62,6 +64,8 @@ python3 scripts/token_usage_dashboard.py \
   --budget-config docs/BUDGET_CONFIG_EXAMPLE.json \
   --prompt-optimization-config docs/PROMPT_OPTIMIZATION_CONFIG_EXAMPLE.json \
   --cloud-cost-input docs/CLOUD_COST_INPUT_EXAMPLE.json \
+  --cloud-tag-mapping-config docs/CLOUD_TAG_MAPPING_EXAMPLE.json \
+  --attribution-granularity detailed \
   --output /tmp/token_usage_dashboard.html \
   --summary-json /tmp/token_usage_summary.json \
   --custom-report-json /tmp/custom_report.json \

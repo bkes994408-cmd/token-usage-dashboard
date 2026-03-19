@@ -11,5 +11,35 @@
   "notificationChannels": [
     "slack:webhook:https://hooks.slack.com/services/xxx/yyy/zzz",
     "discord:webhook:https://discord.com/api/webhooks/..."
+  ],
+  "unifiedBudgetAlerts": [
+    {
+      "id": "unified-total-monthly",
+      "scope": "total",
+      "thresholdUSD": 2000,
+      "severity": "high",
+      "message": "Unified LLM+Cloud budget exceeded 2,000 USD"
+    },
+    {
+      "id": "aws-provider-cap",
+      "scope": "provider",
+      "provider": "aws",
+      "thresholdUSD": 1200,
+      "severity": "medium"
+    },
+    {
+      "id": "aws-ec2-cap",
+      "scope": "service",
+      "provider": "aws",
+      "service": "AmazonEC2",
+      "thresholdUSD": 700
+    },
+    {
+      "id": "tag-cost-center-finops",
+      "scope": "tag",
+      "tagKey": "cost_center",
+      "tagValue": "finops",
+      "thresholdUSD": 450
+    }
   ]
 }

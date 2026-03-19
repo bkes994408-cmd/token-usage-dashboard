@@ -32,6 +32,8 @@ from token_usage_dashboard import (
     resolve_access_policy,
     resolve_multi_tenant_context,
     run_report_scheduler,
+    dispatch_report_delivery,
+    dispatch_event_alerts,
 )
 
 
@@ -920,6 +922,46 @@ class TestTokenDashboard(TestCase):
             deliveries = result["jobs"][0]["deliveries"]
             self.assertEqual(deliveries[0]["status"], "blocked")
             self.assertEqual(deliveries[0]["reason"], "role_not_allowed")
+
+    def test_dispatch_report_delivery_supports_slack_and_discord(self):
+        from unittest.mock import patch
+
+        payload = {
+            "provider": "codex",
+            "generatedAt": "2026-03-19T10:00:00+00:00",
+            "job": {"id": "daily", "name": "Daily"},
+            "summary": {"startDate": "2026-03-01", "endDate": "2026-03-19", "totalCostUSD": 12.3, "last7dCostUSD": 4.5},
+        }
+
+        with patch("token_usage_dashboard._dispatch_webhook", return_value={"status": "sent", "httpStatus": 200}) as mocked:
+            slack = dispatch_report_delivery(payload, {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"})
+            discord = dispatch_report_delivery(payload, {"channel": "discord", "target": "https://discord.com/api/webhooks/x"})
+
+        self.assertEqual(slack["status"], "sent")
+        self.assertEqual(discord["status"], "sent")
+        self.assertEqual(mocked.call_count, 2)
+
+    def test_dispatch_event_alerts_aggregates_alerts_controls_overage(self):
+        from unittest.mock import patch
+
+        summary = {
+            "provider": "codex",
+            "startDate": "2026-03-01",
+            "endDate": "2026-03-19",
+            "totalCostUSD": 123.0,
+            "alerts": {"triggered": [{"severity": "high", "message": "budget exceeded"}]},
+            "realTimeCostControls": {"triggeredActions": [{"action": "degrade", "message": "route to cheaper model"}]},
+            "overageBehaviors": {"events": [{"action": "switch_model", "dimension": "project", "key": "proj-a", "usagePct": 133.0}]},
+        }
+        cfg = {"notificationChannels": ["slack:webhook:https://hooks.slack.com/services/x/y/z"]}
+
+        with patch("token_usage_dashboard._dispatch_webhook", return_value={"status": "sent", "httpStatus": 200}) as mocked:
+            result = dispatch_event_alerts(summary, alert_config=cfg)
+
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertGreaterEqual(result["events"], 3)
+        self.assertEqual(mocked.call_count, 1)
 
     def test_scheduler_cli_requires_config(self):
         import sys

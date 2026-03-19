@@ -21,7 +21,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: 報表分發權限守門（recipient role guardrail，未授權收件者自動 block 並留下審計記錄）
 - New: 實時成本控制策略（multi-layer budget policy，可觸發 degrade / switch_model / stop_calls 動作）
 - New: 多雲/多模型成本聚合（`--aggregate-providers codex,claude`）：統一聚合 provider/model/day 成本並在 dashboard 顯示 Unified View
-- Note: notification 目前僅做 rule evaluation（在 summary/dashboard 顯示觸發結果與 channels），尚未實作主動 dispatch（email/Slack/Discord）。
+- New: Notification Dispatch 系統（Slack/Discord Webhook）已整合於 Scheduler 與 Event Monitor；支援 timeout/retry 設定。
 - Note: Cloud cost integration 目前提供 hooks placeholder（AWS Cost Explorer / GCP Billing），尚未串接實際 API。
 
 ## Quick start
@@ -79,8 +79,28 @@ python3 scripts/token_usage_dashboard.py \
   --report-output-dir /tmp/report_center
 ```
 
-`/tmp/report_center/report_history.json` 會保存歷史版本與下載檔案路徑（JSON/CSV）。
+`/tmp/report_center/report_history.json` 會保存歷史版本與下載檔案路徑（JSON/CSV），並記錄每個收件 webhook 的 dispatch 結果（sent/failed/blocked）。
 可參考 `docs/REPORT_SCHEDULER_EXAMPLE.json`。
+
+### Event monitor + alert dispatch
+
+```bash
+python3 scripts/token_usage_dashboard.py \
+  --provider codex \
+  --input /tmp/cost.json \
+  --alert-config docs/ALERT_CONFIG_EXAMPLE.json \
+  --cost-control-config docs/COST_CONTROL_CONFIG_EXAMPLE.json \
+  --budget-config docs/BUDGET_CONFIG_EXAMPLE.json \
+  --run-event-monitor \
+  --event-output-json /tmp/event_monitor_result.json
+```
+
+Event monitor 會整合：
+- alert rules triggered
+- real-time cost control triggered actions
+- overage behaviors
+
+並將彙整告警透過 `notificationChannels` 的 webhook 發送（Slack/Discord）。
 
 ### Multi-tenant / organization mode
 

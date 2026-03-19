@@ -1,4 +1,9 @@
 {
+  "dispatch": {
+    "enabled": true,
+    "timeoutSeconds": 8,
+    "retries": 1
+  },
   "jobs": [
     {
       "id": "finance-weekly",
@@ -16,13 +21,12 @@
       },
       "recipients": [
         {
-          "channel": "email",
-          "target": "finance@example.com"
+          "channel": "slack",
+          "target": "https://hooks.slack.com/services/xxx/yyy/zzz"
         },
         {
-          "channel": "slack",
-          "target": "#finops",
-          "allowedRoles": ["admin"]
+          "channel": "discord",
+          "target": "https://discord.com/api/webhooks/..."
         }
       ]
     }

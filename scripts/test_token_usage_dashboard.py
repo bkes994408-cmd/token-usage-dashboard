@@ -330,6 +330,60 @@ class TestTokenDashboard(TestCase):
         self.assertIn("suggestions", first)
         self.assertTrue(any(s["type"] == "model_rightsizing" for s in first["suggestions"]))
 
+    def test_prompt_optimization_engine_respects_config(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [{
+                "modelName": "gpt-5",
+                "projectId": "proj-a",
+                "promptTokens": 820,
+                "completionTokens": 100,
+                "totalTokens": 920,
+                "cost": 1.0,
+                "prompt": "長提示詞 A",
+            }]
+        }]
+        pattern = build_llm_pattern_analysis(rows)
+        cfg = {
+            "maxPromptFamilies": 1,
+            "abTesting": {
+                "trafficSplitB": 0.25,
+                "costReductionPctMin": 12,
+                "qualityDropPctMax": 1.5,
+                "latencyIncreasePctMax": 8,
+            }
+        }
+        engine = build_prompt_optimization_engine(rows, pattern, config=cfg)
+        self.assertEqual(engine["config"]["maxPromptFamilies"], 1)
+        self.assertEqual(engine["abTests"][0]["trafficSplit"]["B"], 0.25)
+        self.assertEqual(engine["abTests"][0]["successCriteria"]["costReductionPctMin"], 12.0)
+
+    def test_budget_permissions_detect_violations(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [
+                {"userId": "alice", "modelName": "gpt-5", "cost": 1.2, "totalTokens": 100},
+                {"userId": "alice", "modelName": "gpt-4.1", "cost": 0.4, "totalTokens": 60},
+            ],
+        }]
+        cfg = {
+            "permissions": {
+                "defaultRole": "viewer",
+                "roles": {
+                    "viewer": {"allowedModels": ["gpt-4.1"], "maxCostPerCallUSD": 0.5},
+                },
+                "users": {
+                    "alice": {"role": "viewer"},
+                },
+            }
+        }
+        budget = evaluate_budget_allocation_and_permissions(rows, config=cfg)
+        violations = budget["permissions"].get("violations", [])
+        self.assertGreaterEqual(len(violations), 1)
+        violation_types = {v["violation"] for v in violations}
+        self.assertIn("model_not_allowed", violation_types)
+        self.assertIn("call_cost_exceeded", violation_types)
+
     def test_build_summary_normalizes_call_records_once(self):
         from unittest.mock import patch
 
@@ -926,6 +980,10 @@ class TestTokenDashboard(TestCase):
         }]
         budget_cfg = {
             "allocations": [{"id": "alloc-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0}],
+            "permissions": {
+                "roles": {"viewer": {"allowedModels": ["gpt-4.1"], "maxCostPerCallUSD": 1.0}},
+                "users": {"alice": {"role": "viewer"}},
+            },
             "overagePolicies": [{"thresholdPct": 100, "action": "stop_calls", "message": "hard stop"}],
         }
         summary = build_summary("codex", rows, budget_config=budget_cfg)
@@ -935,6 +993,8 @@ class TestTokenDashboard(TestCase):
 
         html = build_dashboard_html("codex", rows, top_models=2, budget_config=budget_cfg)
         self.assertIn("Budget Allocation & Permission Management", html)
+        self.assertIn("Role Permission Matrix", html)
+        self.assertIn("Permission Violations (Detected from call logs)", html)
         self.assertIn("Overage Handling", html)
         self.assertIn("proj-a", html)
 
@@ -949,6 +1009,67 @@ class TestTokenDashboard(TestCase):
         )
         html = build_dashboard_html("codex", rows, top_models=2, alert_config={"rules": alerts["rules"], "notificationChannels": alerts["notificationChannels"]})
         self.assertIn("&lt;/td&gt;&lt;script&gt;alert(4)&lt;/script&gt;", html)
+
+    def test_load_budget_config_normalizes_and_filters_invalid_entries(self):
+        import json
+        import tempfile
+
+        cfg = {
+            "allocations": [
+                {"id": "ok", "dimension": "project", "key": "proj-a", "budgetUSD": 20},
+                {"id": "bad-dim", "dimension": "bad", "key": "proj-x", "budgetUSD": 20},
+                {"id": "bad-budget", "dimension": "project", "key": "proj-y", "budgetUSD": 0},
+            ],
+            "permissions": {
+                "defaultRole": "viewer",
+                "roles": {
+                    "analyst": {"allowedModels": ["gpt-5", "", "gpt-5"], "maxCostPerCallUSD": -1},
+                },
+                "users": {
+                    "alice": {"role": "analyst", "allowedModels": ["o3", "o3"], "maxCostPerCallUSD": 0.8},
+                },
+            },
+            "overagePolicies": [
+                {"thresholdPct": 150, "action": "stop_calls"},
+                {"thresholdPct": 120, "action": "switch_model", "routeToModel": "o3-mini"},
+                {"thresholdPct": 100, "action": "unknown-action"},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "budget.json"
+            p.write_text(json.dumps(cfg), encoding="utf-8")
+            parsed = dashboard_module._load_budget_config(str(p))
+
+        self.assertEqual(len(parsed["allocations"]), 1)
+        self.assertEqual(parsed["allocations"][0]["id"], "ok")
+        self.assertEqual(parsed["permissions"]["roles"]["analyst"]["allowedModels"], ["gpt-5"])
+        self.assertEqual(parsed["permissions"]["roles"]["analyst"]["maxCostPerCallUSD"], 0.0)
+        self.assertEqual(parsed["permissions"]["users"]["alice"]["allowedModels"], ["o3"])
+        self.assertEqual(parsed["overagePolicies"][0]["thresholdPct"], 100.0)
+        self.assertEqual(parsed["overagePolicies"][0]["action"], "warn")
+
+    def test_load_prompt_optimization_config_normalizes_ranges(self):
+        import json
+        import tempfile
+
+        cfg = {
+            "maxPromptFamilies": 0,
+            "compressionThresholdPromptTokens": 700,
+            "abTesting": {
+                "trafficSplitB": 3,
+                "costReductionPctMin": 11,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "prompt.json"
+            p.write_text(json.dumps(cfg), encoding="utf-8")
+            parsed = dashboard_module._load_prompt_optimization_config(str(p))
+
+        self.assertEqual(parsed["maxPromptFamilies"], 1)
+        self.assertEqual(parsed["compressionThresholdPromptTokens"], 700.0)
+        self.assertEqual(parsed["abTesting"]["trafficSplitB"], 0.9)
+        self.assertEqual(parsed["abTesting"]["costReductionPctMin"], 11.0)
 
 
 if __name__ == "__main__":

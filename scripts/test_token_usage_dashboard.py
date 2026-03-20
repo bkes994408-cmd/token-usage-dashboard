@@ -446,10 +446,11 @@ class TestTokenDashboard(TestCase):
         pattern = build_llm_pattern_analysis(rows)
         engine = build_prompt_optimization_engine(rows, pattern)
         self.assertTrue(engine["available"])
-        self.assertEqual(engine["engineVersion"], "1.0")
+        self.assertEqual(engine["engineVersion"], "1.1")
         self.assertGreaterEqual(len(engine["highConsumptionPrompts"]), 1)
         self.assertGreaterEqual(len(engine["abTests"]), 1)
         first = engine["highConsumptionPrompts"][0]
+        self.assertIn("rankScore", first)
         self.assertIn("suggestions", first)
         self.assertTrue(any(s["type"] == "model_rightsizing" for s in first["suggestions"]))
 
@@ -469,17 +470,24 @@ class TestTokenDashboard(TestCase):
         pattern = build_llm_pattern_analysis(rows)
         cfg = {
             "maxPromptFamilies": 1,
+            "minFamilyCalls": 1,
+            "rankingWeights": {"costUSD": 1.0, "promptTokens": 0.2, "calls": 0.1, "promptToCompletionRatio": 0.5},
             "abTesting": {
                 "trafficSplitB": 0.25,
                 "costReductionPctMin": 12,
                 "qualityDropPctMax": 1.5,
                 "latencyIncreasePctMax": 8,
+                "evaluationDays": 5,
+                "minimumSampleSize": 60,
+                "rolloutStages": [0.1, 0.2, 0.4],
             }
         }
         engine = build_prompt_optimization_engine(rows, pattern, config=cfg)
         self.assertEqual(engine["config"]["maxPromptFamilies"], 1)
         self.assertEqual(engine["abTests"][0]["trafficSplit"]["B"], 0.25)
         self.assertEqual(engine["abTests"][0]["successCriteria"]["costReductionPctMin"], 12.0)
+        self.assertEqual(engine["abTests"][0]["executionPlan"]["evaluationDays"], 5)
+        self.assertEqual(engine["abTests"][0]["executionPlan"]["minimumSampleSize"], 60)
 
     def test_budget_permissions_detect_violations(self):
         rows = [{
@@ -1236,6 +1244,22 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(parsed["compressionThresholdPromptTokens"], 700.0)
         self.assertEqual(parsed["abTesting"]["trafficSplitB"], 0.9)
         self.assertEqual(parsed["abTesting"]["costReductionPctMin"], 11.0)
+
+    def test_prompt_optimization_engine_filters_min_family_calls(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [
+                {"modelName": "gpt-5", "projectId": "proj-a", "promptTokens": 1000, "completionTokens": 100, "cost": 1.2, "prompt": "family alpha prompt"},
+                {"modelName": "gpt-5", "projectId": "proj-a", "promptTokens": 1000, "completionTokens": 100, "cost": 1.0, "prompt": "family alpha prompt"},
+                {"modelName": "gpt-5", "projectId": "proj-b", "promptTokens": 900, "completionTokens": 120, "cost": 0.9, "prompt": "family beta prompt"},
+            ],
+        }]
+        pattern = build_llm_pattern_analysis(rows)
+        engine = build_prompt_optimization_engine(rows, pattern, config={"minFamilyCalls": 2})
+
+        self.assertTrue(engine["available"])
+        self.assertEqual(len(engine["highConsumptionPrompts"]), 1)
+        self.assertEqual(engine["highConsumptionPrompts"][0]["calls"], 2)
 
     def test_cloud_tag_mapping_and_unified_tag_views(self):
         rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}]}]

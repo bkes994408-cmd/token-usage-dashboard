@@ -868,7 +868,16 @@ def _prompt_template_signature(prompt: str) -> str:
     return " ".join(tokens[:24])
 
 
-def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_tokens: float, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def _prompt_suggestion_actions(
+    sample_prompt_tokens: float,
+    sample_completion_tokens: float,
+    *,
+    current_model: str,
+    candidate_model: Optional[str],
+    calls: int,
+    total_cost_usd: float,
+    config: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     cfg = config if isinstance(config, dict) else {}
     compression_threshold = _safe_float(cfg.get("compressionThresholdPromptTokens"), default=700.0)
     context_refactor_ratio = _safe_float(cfg.get("contextRefactorRatio"), default=1.5)
@@ -878,13 +887,16 @@ def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_to
     variant_b_ratio = _safe_float(ab_cfg.get("trafficSplitB"), default=0.2)
     variant_b_ratio = min(0.9, max(0.05, variant_b_ratio))
 
+    savings_from_prompt = total_cost_usd * (target_reduction_pct / 100.0)
     actions: List[Dict[str, Any]] = []
     if sample_prompt_tokens >= compression_threshold:
         actions.append(
             {
                 "type": "compression",
+                "priority": "high" if sample_prompt_tokens >= compression_threshold * 1.2 else "medium",
                 "title": "Compress long instructions and remove repeated context",
                 "expectedPromptTokenReductionPct": target_reduction_pct,
+                "estimatedMonthlySavingsUSD": round(savings_from_prompt, 4),
                 "actions": [
                     "Extract stable policy text into a reusable system preset.",
                     "Summarize long conversation history before sending to model.",
@@ -895,25 +907,43 @@ def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_to
         actions.append(
             {
                 "type": "context_refactor",
+                "priority": "high" if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * (context_refactor_ratio + 0.4) else "medium",
                 "title": "Move verbose context into retrieval/cache",
                 "expectedPromptTokenReductionPct": max(8.0, target_reduction_pct * 0.75),
+                "estimatedMonthlySavingsUSD": round(total_cost_usd * max(8.0, target_reduction_pct * 0.75) / 100.0, 4),
                 "actions": [
                     "Replace full inline docs with retrieval IDs or snippets.",
                     "Use semantic cache for repeated context blocks.",
                 ],
             }
         )
-    actions.append(
-        {
-            "type": "model_rightsizing",
-            "title": "A/B test lower-cost model on this prompt family",
-            "expectedCostReductionPct": expected_cost_reduction_pct,
-            "actions": [
-                f"Route {int(variant_b_ratio * 100)}% traffic to candidate model and track quality score.",
-                "Promote candidate only if quality drop <= 2%.",
-            ],
-        }
-    )
+
+    model_action = {
+        "type": "model_rightsizing",
+        "priority": "medium",
+        "title": "A/B test lower-cost model on this prompt family",
+        "expectedCostReductionPct": expected_cost_reduction_pct,
+        "actions": [
+            f"Route {int(variant_b_ratio * 100)}% traffic to candidate model and track quality score.",
+            "Promote candidate only if quality drop <= 2%.",
+        ],
+    }
+    if candidate_model and candidate_model != current_model:
+        model_action["candidateModel"] = candidate_model
+    actions.append(model_action)
+
+    if calls >= 30 and sample_prompt_tokens >= max(1.0, compression_threshold * 0.7):
+        actions.append(
+            {
+                "type": "template_standardization",
+                "priority": "medium",
+                "title": "Standardize this prompt family with versioned templates",
+                "actions": [
+                    "Define canonical template sections (goal, constraints, output schema).",
+                    "Add lint checks for prompt max tokens and required fields.",
+                ],
+            }
+        )
     return actions
 
 
@@ -928,6 +958,15 @@ def build_prompt_optimization_engine(
     cfg = config if isinstance(config, dict) else {}
     family_limit = int(cfg.get("maxPromptFamilies") or max_prompt_families or 8)
     family_limit = max(1, family_limit)
+    min_family_calls = max(1, int(_safe_float(cfg.get("minFamilyCalls"), default=1.0)))
+    min_family_cost = max(0.0, _safe_float(cfg.get("minFamilyCostUSD"), default=0.0))
+
+    ranking_weights = cfg.get("rankingWeights") if isinstance(cfg.get("rankingWeights"), dict) else {}
+    weight_cost = max(0.0, _safe_float(ranking_weights.get("costUSD"), default=1.0))
+    weight_prompt = max(0.0, _safe_float(ranking_weights.get("promptTokens"), default=0.35))
+    weight_calls = max(0.0, _safe_float(ranking_weights.get("calls"), default=0.2))
+    weight_ratio = max(0.0, _safe_float(ranking_weights.get("promptToCompletionRatio"), default=0.25))
+
     ab_cfg = cfg.get("abTesting") if isinstance(cfg.get("abTesting"), dict) else {}
     traffic_split_b = min(0.9, max(0.05, _safe_float(ab_cfg.get("trafficSplitB"), default=0.5)))
     criteria = {
@@ -935,10 +974,30 @@ def build_prompt_optimization_engine(
         "qualityDropPctMax": _safe_float(ab_cfg.get("qualityDropPctMax"), default=2.0),
         "latencyIncreasePctMax": _safe_float(ab_cfg.get("latencyIncreasePctMax"), default=10.0),
     }
+    evaluation_days = max(1, int(_safe_float(ab_cfg.get("evaluationDays"), default=7.0)))
+    min_sample_size = max(20, int(_safe_float(ab_cfg.get("minimumSampleSize"), default=100.0)))
+    rollout_stages_raw = ab_cfg.get("rolloutStages") if isinstance(ab_cfg.get("rolloutStages"), list) else [0.1, 0.25, 0.5]
+    rollout_stages: List[float] = []
+    for item in rollout_stages_raw:
+        if isinstance(item, (int, float)):
+            v = min(1.0, max(0.01, float(item)))
+            rollout_stages.append(v)
+    if not rollout_stages:
+        rollout_stages = [0.1, 0.25, 0.5]
 
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
     if not records:
-        return {"available": False, "highConsumptionPrompts": [], "abTests": [], "config": {"maxPromptFamilies": family_limit, "abTesting": criteria}}
+        return {
+            "available": False,
+            "highConsumptionPrompts": [],
+            "abTests": [],
+            "config": {
+                "maxPromptFamilies": family_limit,
+                "minFamilyCalls": min_family_calls,
+                "minFamilyCostUSD": min_family_cost,
+                "abTesting": criteria,
+            },
+        }
 
     families: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -964,9 +1023,25 @@ def build_prompt_optimization_engine(
         node["models"][str(r.get("model") or "unknown")] += 1
         node["projects"][str(r.get("project") or "unknown")] += 1
 
+    scored_families: List[Dict[str, Any]] = []
+    for item in families.values():
+        calls = int(item["calls"])
+        if calls < min_family_calls or _safe_float(item["totalCostUSD"]) < min_family_cost:
+            continue
+        avg_completion_tokens = _safe_float(item["totalCompletionTokens"]) / max(1, calls)
+        avg_prompt_tokens = _safe_float(item["totalPromptTokens"]) / max(1, calls)
+        ratio = (avg_prompt_tokens / avg_completion_tokens) if avg_completion_tokens > 0 else 0.0
+        item["_rankScore"] = (
+            weight_cost * _safe_float(item["totalCostUSD"])
+            + weight_prompt * _safe_float(item["totalPromptTokens"])
+            + weight_calls * calls
+            + weight_ratio * ratio
+        )
+        scored_families.append(item)
+
     ranked = sorted(
-        families.values(),
-        key=lambda x: (x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
+        scored_families,
+        key=lambda x: (_safe_float(x.get("_rankScore")), x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
         reverse=True,
     )[:family_limit]
 
@@ -988,10 +1063,19 @@ def build_prompt_optimization_engine(
         avg_completion_tokens = item["totalCompletionTokens"] / max(1, calls)
         top_model = sorted(item["models"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["models"] else "unknown"
         top_project = sorted(item["projects"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["projects"] else "unknown"
-        suggestions = _prompt_suggestion_actions(avg_prompt_tokens, avg_completion_tokens, config=cfg)
+        suggestions = _prompt_suggestion_actions(
+            avg_prompt_tokens,
+            avg_completion_tokens,
+            current_model=top_model,
+            candidate_model=cheap_model,
+            calls=calls,
+            total_cost_usd=_safe_float(item["totalCostUSD"]),
+            config=cfg,
+        )
         prompt_families.append(
             {
                 "rank": idx,
+                "rankScore": _safe_float(item.get("_rankScore")),
                 "templateSignature": item["templateSignature"],
                 "samplePrompt": item["samplePrompt"],
                 "calls": calls,
@@ -1025,19 +1109,37 @@ def build_prompt_optimization_engine(
                 ],
                 "successCriteria": criteria,
                 "metrics": ["avgCostPerCallUSD", "qualityScore", "avgLatencyMs", "promptTokens"],
+                "executionPlan": {
+                    "evaluationDays": evaluation_days,
+                    "minimumSampleSize": min_sample_size,
+                    "rolloutStages": [round(x, 3) for x in rollout_stages],
+                },
             }
         )
 
     return {
         "available": True,
-        "engineVersion": "1.0",
+        "engineVersion": "1.1",
         "spec": {
-            "recommendationTypes": ["compression", "context_refactor", "model_rightsizing"],
-            "ranking": "totalCostUSD,totalPromptTokens,calls",
+            "recommendationTypes": ["compression", "context_refactor", "model_rightsizing", "template_standardization"],
+            "ranking": "weighted(costUSD,promptTokens,calls,promptToCompletionRatio)",
         },
         "config": {
             "maxPromptFamilies": family_limit,
-            "abTesting": criteria,
+            "minFamilyCalls": min_family_calls,
+            "minFamilyCostUSD": min_family_cost,
+            "rankingWeights": {
+                "costUSD": weight_cost,
+                "promptTokens": weight_prompt,
+                "calls": weight_calls,
+                "promptToCompletionRatio": weight_ratio,
+            },
+            "abTesting": {
+                **criteria,
+                "evaluationDays": evaluation_days,
+                "minimumSampleSize": min_sample_size,
+                "rolloutStages": [round(x, 3) for x in rollout_stages],
+            },
         },
         "highConsumptionPrompts": prompt_families,
         "abTests": ab_tests,
@@ -1267,10 +1369,23 @@ def _normalize_prompt_optimization_config(parsed: Dict[str, Any]) -> Dict[str, A
     out: Dict[str, Any] = {}
     if parsed.get("maxPromptFamilies") is not None:
         out["maxPromptFamilies"] = max(1, int(_safe_float(parsed.get("maxPromptFamilies"), default=8.0)))
+    if parsed.get("minFamilyCalls") is not None:
+        out["minFamilyCalls"] = max(1, int(_safe_float(parsed.get("minFamilyCalls"), default=1.0)))
+    if isinstance(parsed.get("minFamilyCostUSD"), (int, float)):
+        out["minFamilyCostUSD"] = max(0.0, float(parsed.get("minFamilyCostUSD")))
 
     for key in ("compressionThresholdPromptTokens", "contextRefactorRatio", "targetPromptTokenReductionPct", "expectedCostReductionPct"):
         if isinstance(parsed.get(key), (int, float)):
             out[key] = float(parsed.get(key))
+
+    rw_in = parsed.get("rankingWeights") if isinstance(parsed.get("rankingWeights"), dict) else {}
+    if rw_in:
+        rw_out: Dict[str, float] = {}
+        for key in ("costUSD", "promptTokens", "calls", "promptToCompletionRatio"):
+            if isinstance(rw_in.get(key), (int, float)):
+                rw_out[key] = max(0.0, float(rw_in.get(key)))
+        if rw_out:
+            out["rankingWeights"] = rw_out
 
     ab_in = parsed.get("abTesting") if isinstance(parsed.get("abTesting"), dict) else {}
     if ab_in:
@@ -1280,6 +1395,17 @@ def _normalize_prompt_optimization_config(parsed: Dict[str, Any]) -> Dict[str, A
         for key in ("costReductionPctMin", "qualityDropPctMax", "latencyIncreasePctMax"):
             if isinstance(ab_in.get(key), (int, float)):
                 ab_out[key] = float(ab_in.get(key))
+        if isinstance(ab_in.get("evaluationDays"), (int, float)):
+            ab_out["evaluationDays"] = max(1, int(_safe_float(ab_in.get("evaluationDays"), default=7.0)))
+        if isinstance(ab_in.get("minimumSampleSize"), (int, float)):
+            ab_out["minimumSampleSize"] = max(20, int(_safe_float(ab_in.get("minimumSampleSize"), default=100.0)))
+        if isinstance(ab_in.get("rolloutStages"), list):
+            stages: List[float] = []
+            for item in ab_in.get("rolloutStages", []):
+                if isinstance(item, (int, float)):
+                    stages.append(min(1.0, max(0.01, float(item))))
+            if stages:
+                ab_out["rolloutStages"] = stages
         out["abTesting"] = ab_out
 
     return out

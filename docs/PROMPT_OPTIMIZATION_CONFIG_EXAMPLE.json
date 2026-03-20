@@ -1,5 +1,13 @@
 {
   "maxPromptFamilies": 10,
+  "minFamilyCalls": 2,
+  "minFamilyCostUSD": 0.5,
+  "rankingWeights": {
+    "costUSD": 1.0,
+    "promptTokens": 0.35,
+    "calls": 0.2,
+    "promptToCompletionRatio": 0.25
+  },
   "compressionThresholdPromptTokens": 650,
   "contextRefactorRatio": 1.4,
   "targetPromptTokenReductionPct": 18,
@@ -8,6 +16,9 @@
     "trafficSplitB": 0.25,
     "costReductionPctMin": 12,
     "qualityDropPctMax": 1.5,
-    "latencyIncreasePctMax": 8
+    "latencyIncreasePctMax": 8,
+    "evaluationDays": 7,
+    "minimumSampleSize": 120,
+    "rolloutStages": [0.1, 0.25, 0.5]
   }
 }

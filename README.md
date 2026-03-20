@@ -146,7 +146,7 @@ Tenant payload format should include per-org daily data, e.g.:
 See `docs/TENANT_CONFIG_EXAMPLE.json` for org/user/group/role/view config schema.
 
 Real-time cost control policy example: `docs/COST_CONTROL_CONFIG_EXAMPLE.json`.
-Prompt optimization engine config example: `docs/PROMPT_OPTIMIZATION_CONFIG_EXAMPLE.json`.
+Prompt optimization engine config example: `docs/PROMPT_OPTIMIZATION_CONFIG_EXAMPLE.json`（含 `minFamilyCalls`/`minFamilyCostUSD`、可調整 ranking weights、A/B rollout stages 與 sample size）。
 Cloud cost input example (AWS/GCP normalized records): `docs/CLOUD_COST_INPUT_EXAMPLE.json`.
 
 `--cloud-cost-input` 支援三種資料形狀：

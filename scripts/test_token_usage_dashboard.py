@@ -1354,6 +1354,90 @@ class TestTokenDashboard(TestCase):
             self.assertTrue(history["latestByJob"]["finance"]["fingerprint"])
 
 
+    def test_cost_attribution_includes_dynamic_cloud_mapped_dimensions(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}], "llmCalls": [{"modelName": "gpt-5", "cost": 1.0, "totalTokens": 100}]}]
+        cloud_rows = [
+            {"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 3.0, "businessUnit": "retail", "ownerTeam": "platform"},
+            {"date": "2026-03-01", "provider": "aws", "service": "s3", "costUSD": 2.0, "businessUnit": "retail", "ownerTeam": "data"},
+        ]
+        attr = build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
+        self.assertIn("cloudMapped:businessUnit", attr["dimensions"])
+        self.assertIn("cloudMapped:ownerTeam", attr["dimensions"])
+        html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows, attribution_granularity="detailed")
+        self.assertIn("Cloud Attribution by Mapped Dimension · businessUnit", html)
+        self.assertIn("Cloud Attribution by Mapped Dimension · ownerTeam", html)
+
+    def test_scheduler_deduplicates_duplicate_recipients(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import tempfile
+
+        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]}
+        config = {
+            "dispatch": {"enabled": False},
+            "jobs": [
+                {
+                    "id": "dup-recipients",
+                    "frequency": "daily",
+                    "recipients": [
+                        {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"},
+                        {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"},
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+        deliveries = result["jobs"][0]["deliveries"]
+        self.assertEqual(deliveries[0]["status"], "queued")
+        self.assertEqual(deliveries[1]["status"], "skipped")
+        self.assertEqual(deliveries[1]["reason"], "duplicate_recipient")
+
+    def test_scheduler_min_total_cost_change_pct_skips_small_changes(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import tempfile
+
+        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}]}
+        config = {
+            "jobs": [
+                {
+                    "id": "change-threshold",
+                    "frequency": "daily",
+                    "formats": ["json"],
+                    "onlyOnChange": False,
+                    "minTotalCostChangePct": 5,
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(first["generated"], 1)
+
+            payload_small_change = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.2}]}]}
+            second = run_report_scheduler(
+                payload=payload_small_change,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 13, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(second["generated"], 0)
+            self.assertEqual(second["jobs"][0]["reason"], "change_below_threshold")
+
+
 
 if __name__ == "__main__":
     main()

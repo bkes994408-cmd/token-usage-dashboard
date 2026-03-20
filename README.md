@@ -26,7 +26,8 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: Notification Dispatch 系統（Slack/Discord Webhook）已整合於 Scheduler 與 Event Monitor；支援 timeout/retry 設定。
 - New: Cloud Cost Management 整合（AWS Cost Explorer / GCP Billing 匯入）與 Unified Cloud Cost View（LLM + Cloud Infra 成本統一視圖）。
 - New: 跨平台 Unified Budget Alerts（scope: total/llm/cloud/provider/service/tag），可在 Event Monitor 與 Dashboard 看到告警事件。
-- New: 雲端成本 Tags 映射（`--cloud-tag-mapping-config`，支援 mapping + rules/valueMap/aliases/default）與細粒度成本歸因（`--attribution-granularity detailed`）。
+- New: 雲端成本 Tags 映射（`--cloud-tag-mapping-config`，支援 mapping + rules/valueMap/aliases/default）與細粒度成本歸因（`--attribution-granularity detailed`），可自動擴充 cloudMapped:* 維度。
+- New: 報表排程調優：重複收件人去重、`minTotalCostChangePct`（低變化量跳過產報），降低噪音與 webhook 壓力。
 
 ## Quick start
 

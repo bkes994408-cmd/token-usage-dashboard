@@ -366,6 +366,20 @@ def _apply_cloud_tag_mapping(rows: List[Dict[str, Any]], mapping: Optional[Dict[
     return out
 
 
+def _extract_cloud_mapped_dimensions(row: Dict[str, Any]) -> Dict[str, str]:
+    reserved = {"date", "provider", "service", "project", "costUSD", "currency", "source", "tags"}
+    out: Dict[str, str] = {}
+    for k, v in row.items():
+        key = str(k or "").strip()
+        if not key or key in reserved:
+            continue
+        if isinstance(v, (str, int, float)):
+            value = str(v).strip()
+            if value:
+                out[key] = value
+    return out
+
+
 def load_cloud_cost_rows(path: Optional[str], tag_mapping: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     if not path:
         return []
@@ -796,6 +810,7 @@ def build_cost_attribution(
         cloud_project_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
         cloud_source_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
         cloud_env_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        mapped_dimension_aggs: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"costUSD": 0.0, "count": 0.0}))
         for r in cloud:
             cost = _safe_float(r.get("costUSD"))
             p = str(r.get("provider") or "unknown").lower()
@@ -821,6 +836,11 @@ def build_cost_attribution(
                 cloud_tag_agg[tkey]["costUSD"] += cost
                 cloud_tag_agg[tkey]["count"] += 1
 
+            mapped_dims = _extract_cloud_mapped_dimensions(r)
+            for mk, mv in mapped_dims.items():
+                mapped_dimension_aggs[mk][mv]["costUSD"] += cost
+                mapped_dimension_aggs[mk][mv]["count"] += 1
+
         dimensions["cloudProvider"] = _rank_cloud(cloud_agg)
         dimensions["cloudService"] = _rank_cloud(cloud_service_agg)
         dimensions["cloudTag"] = _rank_cloud(cloud_tag_agg)
@@ -828,6 +848,9 @@ def build_cost_attribution(
         dimensions["cloudSource"] = _rank_cloud(cloud_source_agg)
         if cloud_env_agg:
             dimensions["cloudEnvironment"] = _rank_cloud(cloud_env_agg)
+        for mk in sorted(mapped_dimension_aggs.keys()):
+            dim_key = f"cloudMapped:{mk}"
+            dimensions[dim_key] = _rank_cloud(mapped_dimension_aggs[mk])
 
     return {
         "available": True,
@@ -2603,6 +2626,7 @@ def _normalize_report_jobs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "recipients": recipients,
             "formats": [str(x).strip().lower() for x in (job.get("formats") or ["json"]) if str(x).strip()],
             "onlyOnChange": bool(job.get("onlyOnChange", False)),
+            "minTotalCostChangePct": _safe_float(job.get("minTotalCostChangePct"), default=0.0),
         })
     return out
 
@@ -2783,6 +2807,17 @@ def run_report_scheduler(
             result["skipped"] += 1
             continue
 
+        min_change_pct = _safe_float(job.get("minTotalCostChangePct"), default=0.0)
+        if min_change_pct > 0 and isinstance(previous, dict) and isinstance(previous.get("summary"), dict):
+            prev_total = _safe_float(previous.get("summary", {}).get("totalCostUSD"), default=-1.0)
+            curr_total = _safe_float(report_payload.get("summary", {}).get("totalCostUSD"), default=-1.0)
+            if prev_total > 0 and curr_total >= 0:
+                delta_pct = abs((curr_total - prev_total) / prev_total * 100.0)
+                if delta_pct < min_change_pct:
+                    result["jobs"].append({"jobId": job_id, "status": "skipped", "reason": "change_below_threshold", "deltaPct": delta_pct})
+                    result["skipped"] += 1
+                    continue
+
         formats = job.get("formats") if isinstance(job.get("formats"), list) else ["json"]
         if "json" in formats:
             json_path = job_dir / f"{base}.json"
@@ -2794,9 +2829,20 @@ def run_report_scheduler(
             artifact_paths["csv"] = str(csv_path)
 
         deliveries = []
+        seen_targets = set()
         for recipient in job.get("recipients") or []:
             if not isinstance(recipient, dict):
                 continue
+            rkey = (str(recipient.get("channel") or "").strip().lower(), str(recipient.get("target") or "").strip())
+            if rkey in seen_targets:
+                deliveries.append({
+                    "target": recipient.get("target"),
+                    "channel": recipient.get("channel"),
+                    "status": "skipped",
+                    "reason": "duplicate_recipient",
+                })
+                continue
+            seen_targets.add(rkey)
             if not _recipient_allowed(recipient, role_name, job.get("allowedRoles") or []):
                 deliveries.append({
                     "target": recipient.get("target"),
@@ -2835,9 +2881,23 @@ def run_report_scheduler(
             "layout": job.get("layout") or {},
             "tenant": tenant_meta or None,
             "fingerprint": fingerprint,
+            "summary": {
+                "totalCostUSD": _safe_float(summary.get("totalCostUSD")),
+                "startDate": summary.get("startDate"),
+                "endDate": summary.get("endDate"),
+            },
         }
         history["reports"].append(history_item)
-        latest_by_job[job_id] = {"generatedAt": now_dt.isoformat(), "artifacts": artifact_paths, "fingerprint": fingerprint}
+        latest_by_job[job_id] = {
+            "generatedAt": now_dt.isoformat(),
+            "artifacts": artifact_paths,
+            "fingerprint": fingerprint,
+            "summary": {
+                "totalCostUSD": _safe_float(summary.get("totalCostUSD")),
+                "startDate": summary.get("startDate"),
+                "endDate": summary.get("endDate"),
+            },
+        }
 
         result["jobs"].append({"jobId": job_id, "status": "generated", "artifacts": artifact_paths, "deliveries": deliveries})
         result["generated"] += 1
@@ -3076,6 +3136,22 @@ def build_dashboard_html(
     attr_cloud_project_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProject", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
     attr_cloud_source_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudSource", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
     attr_cloud_env_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudEnvironment", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
+
+    extra_attr_sections_html = ""
+    if attribution.get("available") and isinstance(attribution.get("dimensions"), dict):
+        extra_keys = [k for k in sorted(attribution.get("dimensions", {}).keys()) if isinstance(k, str) and k.startswith("cloudMapped:")]
+        parts: List[str] = []
+        for key in extra_keys:
+            label = key.split(":", 1)[1]
+            rows_html = _render_attribution_rows(attribution.get("dimensions", {}).get(key, []))
+            parts.append(
+                f"<h4>Cloud Attribution by Mapped Dimension · {esc(label)}</h4>\n"
+                f"<table>\n"
+                f"  <thead><tr><th>#</th><th>{esc(label)}</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>\n"
+                f"  <tbody>{rows_html}</tbody>\n"
+                f"</table>"
+            )
+        extra_attr_sections_html = "\n".join(parts)
 
     rec_rows = "<tr><td colspan='6'>No recommendations</td></tr>"
     if recs.get("available") and isinstance(recs.get("recommendations"), list) and recs.get("recommendations"):
@@ -3467,6 +3543,7 @@ def build_dashboard_html(
     <thead><tr><th>#</th><th>Environment</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
     <tbody>{attr_cloud_env_rows}</tbody>
   </table>
+  {extra_attr_sections_html}
   <h4>Optimization Recommendations</h4>
   <table>
     <thead><tr><th>#</th><th>Priority</th><th>Recommendation</th><th>Rationale</th><th>Est. Savings</th><th>Actions</th></tr></thead>

@@ -35,7 +35,7 @@
     *   支援將 token 成本精確歸因到具體項目、部門、用戶、特定應用或業務線，實現精細化成本管理。
     *   自動提供可行的成本優化建議（如：建議替換為更經濟的模型、優化 prompt 結構、實施批量調用）。
     *   預留接口，支援與企業現有的 Cloud Cost Management 工具（如 AWS Cost Explorer、Google Cloud Billing）集成，提供統一的成本視圖。
-    *   目前已實作：call-level 成本歸因（project/department/user/application/business line）、規則式優化建議、Cloud Cost Management integration（AWS Cost Explorer / GCP Billing 匯入）與 Unified Cloud Cost View。
+    *   目前已實作：call-level 成本歸因（project/department/user/application/business line）、規則式優化建議、Cloud cost integration hooks placeholder。
 
 *   [x] 報表自動化生成與排程
     *   允許用戶根據業務需求，自定義報表內容（選擇圖表、數據表格、關鍵指標）、佈局和格式。
@@ -47,21 +47,15 @@
 ### Iteration-1 (MVP-3: 成本控制與智能優化)
 - [x] 實時成本控制策略：設置多層級預算限制，當成本達到閾值時，自動觸發降級、切換模型或停止調用。
   - 已實作：`realTimeCostControls` 引擎（多層 policy layers，支援 global forecast / actual total / anomaly count / dimension cost），可輸出動作建議 `degrade` / `switch_model` / `stop_calls`，並在 dashboard 顯示 layer 評估結果與觸發動作。
-- [x] Prompt 優化建議引擎：自動分析高消耗 prompt，提供優化建議（如壓縮、替換模型），並支持 A/B 測試。
-  - 已實作：高消耗 prompt family 排序、可配置壓縮/上下文重構建議、A/B 測試方案（流量切分與成功門檻可由 config 調整）。
+- [ ] Prompt 優化建議引擎：自動分析高消耗 prompt，提供優化建議（如壓縮、替換模型），並支持 A/B 測試。
 - [x] 多雲/多模型成本聚合：統一管理來自不同雲服務提供商和 LLM 模型的成本數據，提供統一視圖。
   - 已實作（首個 production-ready increment）：normalized multi-provider aggregation model（provider/model/day 統一聚合）+ dashboard 統一視圖（providers totals + cross-provider top models）+ summary JSON 輸出 `multiProviderAggregation`。
-- [x] 預算分配與使用權限管理：更精細地控制各部門/用戶的 LLM 資源預算分配，並設定使用權限。
-  - 已實作：dimension 預算配置（project/department/user/application/businessLine/model）、角色/使用者權限矩陣、call log 權限違規偵測（模型白名單與單次成本上限），並於 Dashboard 顯示 allocation/violation 視圖。
+- [ ] 預算分配與使用權限管理：更精細地控制各部門/用戶的 LLM 資源預算分配，並設定使用權限。
 
-### MVP-5：雲端整合與企業級成本視圖（本次完成）
-- [x] AWS Cost Explorer / GCP Billing 深度整合
-  - 已強化：`--cloud-cost-input` 支援 AWS CE `ResultsByTime`、GCP billing-like `daily`、normalized records，統一映射至 provider/service/project/currency/source。
-  - 已提供：Unified Cloud Cost View（LLM + Cloud Infra）在 summary JSON 與 dashboard 同步展示。
-- [x] 跨平台統一預算告警（LLM + Cloud）
-  - 新增：`unifiedBudgetAlerts` 規則引擎，支援 scope=`total|llm|cloud|provider|service` 與 thresholdUSD。
-  - 新增：summary `unifiedBudgetAlerts.events`、Dashboard「Cross-platform Unified Budget Alerts」區塊。
-  - 新增：Event Monitor dispatch 會併入 unified budget 事件，與既有 anomaly/cost-control/overage 一起通知。
-- [x] 報表分發與整合
-  - 已完成：Scheduler 分發（Slack/Discord webhook）與 role guardrail；分發結果落地於 report history。
-  - 已完成：Event Monitor 統一分發流程，支援 timeout/retry，並輸出 dispatch 結果供審計。
+### Iteration-2 (MVP-5: 雲端整合深化)
+- [x] 雲端成本標籤 (Tags) 深度對應
+  - 已實作：call-level tag extraction（tags/cloudTags/labels/awsTags/gcpLabels/azureTags）+ alias mapping（`cloudTagAliases`）+ dashboard 顯示 tag coverage / top tag values。
+- [x] Dashboard 歸因分析維度擴充
+  - 已實作：新增 cloudProvider/cloudService/region/environment/operation/resource/model/task/workflow/session + `tag.*` 動態歸因維度。
+- [x] 雲端成本自動化報表邏輯調優
+  - 已實作：scheduler job 預設 `skipIfUnchanged=true`，對 payload 做 digest，比對歷史版本後自動跳過未變更報表，降低重複輸出。

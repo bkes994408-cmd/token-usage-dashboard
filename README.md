@@ -15,20 +15,15 @@ Interactive local dashboard for CodexBar usage/cost data.
 
 - New: LLM 使用模式深入分析（prompt/completion 分布、高消耗 hotspot、模型效率、匿名關鍵詞）
 - New: 成本預測與異常消耗預警（7/30 天 forecast、z-score anomaly、可配置預警規則與通知通道）
-- New: 成本歸因與優化建議（project/department/user/application/business line attribution + 規則式節流建議）
-- New: Prompt 優化建議引擎（正式化輸出：engineVersion/spec、可配置高消耗 family 排序與 A/B success criteria）
-- New: Quota Policies（預算分配 + 角色/使用者權限矩陣 + 自動化超額處置彙總）
-- New: Dashboard Policy View（quota 摘要、allocation policy 狀態、auto-enforcement actions）
+- New: 成本歸因與優化建議（已擴充 cloud provider/region/workflow/session/operation/resource 維度 + cloud tags 深度對應）
+- New: Prompt 優化建議引擎（自動辨識高消耗 prompt family、提供壓縮/上下文重構/模型替換建議、內建 A/B 測試方案）
 - New: 報表自動化排程（daily/weekly/monthly/quarterly jobs）、JSON/CSV 自動產出、report history/download center（`report_history.json`）
+- New: 報表排程調優（`skipIfUnchanged=true` 預設啟用，內容未變更自動跳過，降低重複報表噪音）
 - New: 報表分發權限守門（recipient role guardrail，未授權收件者自動 block 並留下審計記錄）
 - New: 實時成本控制策略（multi-layer budget policy，可觸發 degrade / switch_model / stop_calls 動作）
 - New: 多雲/多模型成本聚合（`--aggregate-providers codex,claude`）：統一聚合 provider/model/day 成本並在 dashboard 顯示 Unified View
-- New: Notification Dispatch 系統（Slack/Discord Webhook）已整合於 Scheduler 與 Event Monitor；支援 timeout/retry 設定。
-- New: Cloud Cost Management 整合（AWS Cost Explorer / GCP Billing 匯入）與 Unified Cloud Cost View（LLM + Cloud Infra 成本統一視圖）。
-- New: 跨平台 Unified Budget Alerts（scope: total/llm/cloud/provider/service/tag），可在 Event Monitor 與 Dashboard 看到告警事件。
-- New: 雲端成本 Tags 映射（`--cloud-tag-mapping-config`，支援 mapping + rules/valueMap/aliases/default + match(exact/prefix/suffix/contains/regex) + transform(lower/upper/title)）與細粒度成本歸因（`--attribution-granularity detailed`），可自動擴充 cloudMapped:* 維度。
-- New: Dashboard 歸因分析擴充：詳細模式新增 endpoint/useCase，雲端新增 cloudRegion/cloudAccount 維度。
-- New: 報表排程調優：重複收件人去重、`minTotalCostChangePct` + `minTotalCostChangeUSD`（低變化量跳過產報）與 `forceRunAfterHours`（避免長期無報表），降低噪音與 webhook 壓力。
+- Note: notification 目前僅做 rule evaluation（在 summary/dashboard 顯示觸發結果與 channels），尚未實作主動 dispatch（email/Slack/Discord）。
+- Note: Cloud cost integration 目前提供 hooks placeholder（AWS Cost Explorer / GCP Billing），尚未串接實際 API。
 
 ## Quick start
 
@@ -64,10 +59,6 @@ python3 scripts/token_usage_dashboard.py \
   --alert-config docs/ALERT_CONFIG_EXAMPLE.json \
   --cost-control-config docs/COST_CONTROL_CONFIG_EXAMPLE.json \
   --budget-config docs/BUDGET_CONFIG_EXAMPLE.json \
-  --prompt-optimization-config docs/PROMPT_OPTIMIZATION_CONFIG_EXAMPLE.json \
-  --cloud-cost-input docs/CLOUD_COST_INPUT_EXAMPLE.json \
-  --cloud-tag-mapping-config docs/CLOUD_TAG_MAPPING_EXAMPLE.json \
-  --attribution-granularity detailed \
   --output /tmp/token_usage_dashboard.html \
   --summary-json /tmp/token_usage_summary.json \
   --custom-report-json /tmp/custom_report.json \
@@ -88,29 +79,8 @@ python3 scripts/token_usage_dashboard.py \
   --report-output-dir /tmp/report_center
 ```
 
-`/tmp/report_center/report_history.json` 會保存歷史版本與下載檔案路徑（JSON/CSV），並記錄每個收件 webhook 的 dispatch 結果（sent/failed/blocked）。
-Scheduler 支援 job 級別 `onlyOnChange`（內容未變則跳過產出）與 `history.maxReportsPerJob`（每個 job 保留最近 N 份）。
+`/tmp/report_center/report_history.json` 會保存歷史版本與下載檔案路徑（JSON/CSV）。
 可參考 `docs/REPORT_SCHEDULER_EXAMPLE.json`。
-
-### Event monitor + alert dispatch
-
-```bash
-python3 scripts/token_usage_dashboard.py \
-  --provider codex \
-  --input /tmp/cost.json \
-  --alert-config docs/ALERT_CONFIG_EXAMPLE.json \
-  --cost-control-config docs/COST_CONTROL_CONFIG_EXAMPLE.json \
-  --budget-config docs/BUDGET_CONFIG_EXAMPLE.json \
-  --run-event-monitor \
-  --event-output-json /tmp/event_monitor_result.json
-```
-
-Event monitor 會整合：
-- alert rules triggered
-- real-time cost control triggered actions
-- overage behaviors
-
-並將彙整告警透過 `notificationChannels` 的 webhook 發送（Slack/Discord）。
 
 ### Multi-tenant / organization mode
 
@@ -147,13 +117,6 @@ Tenant payload format should include per-org daily data, e.g.:
 See `docs/TENANT_CONFIG_EXAMPLE.json` for org/user/group/role/view config schema.
 
 Real-time cost control policy example: `docs/COST_CONTROL_CONFIG_EXAMPLE.json`.
-Prompt optimization engine config example: `docs/PROMPT_OPTIMIZATION_CONFIG_EXAMPLE.json`（含 `minFamilyCalls`/`minFamilyCostUSD`、可調整 ranking weights、A/B rollout stages 與 sample size）。
-Cloud cost input example (AWS/GCP normalized records): `docs/CLOUD_COST_INPUT_EXAMPLE.json`.
-
-`--cloud-cost-input` 支援三種資料形狀：
-- normalized records (`records` 或 list)
-- AWS Cost Explorer `ResultsByTime`
-- GCP billing-like `daily` rows
 
 Dashboard view management (create/update/delete/list/assign/unassign):
 

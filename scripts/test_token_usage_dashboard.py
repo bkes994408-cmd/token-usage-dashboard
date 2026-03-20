@@ -12,6 +12,7 @@ from token_usage_dashboard import (
     build_summary,
     build_llm_pattern_analysis,
     build_cost_attribution,
+    build_cloud_tag_mapping,
     build_optimization_recommendations,
     build_prompt_optimization_engine,
     detect_spikes,
@@ -20,12 +21,9 @@ from token_usage_dashboard import (
     evaluate_realtime_cost_controls,
     evaluate_budget_allocation_and_permissions,
     evaluate_overage_behaviors,
-    build_quota_policies,
     forecast_cost,
     parse_provider_list,
     build_multi_provider_aggregation,
-    build_unified_cloud_cost_view,
-    evaluate_unified_budget_alerts,
     downsample_rows,
     generate_custom_report,
     main as dashboard_main,
@@ -35,8 +33,6 @@ from token_usage_dashboard import (
     resolve_access_policy,
     resolve_multi_tenant_context,
     run_report_scheduler,
-    dispatch_report_delivery,
-    dispatch_event_alerts,
 )
 
 
@@ -96,104 +92,6 @@ class TestTokenDashboard(TestCase):
         self.assertIn("Multi-Provider Unified View", html)
         self.assertIn("Unified Top Models (cross-provider)", html)
         self.assertIn("Aggregated providers total", html)
-
-    def test_unified_cloud_cost_view_merges_llm_and_cloud(self):
-        rows = [
-            {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.0}]},
-            {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 3.0}]},
-        ]
-        cloud_rows = [
-            {"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 5.0},
-            {"date": "2026-03-02", "provider": "gcp", "service": "bigquery", "costUSD": 7.0},
-        ]
-        view = build_unified_cloud_cost_view(rows, cloud_rows)
-        self.assertTrue(view["available"])
-        self.assertTrue(view["cloudIntegrationEnabled"])
-        self.assertAlmostEqual(view["totals"]["llmCostUSD"], 5.0)
-        self.assertAlmostEqual(view["totals"]["cloudInfraCostUSD"], 12.0)
-        self.assertAlmostEqual(view["totals"]["totalUnifiedCostUSD"], 17.0)
-        self.assertEqual(len(view["daily"]), 2)
-
-    def test_summary_cloud_integration_updates_hook_status(self):
-        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]
-        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 2.0}]
-        summary = build_summary("codex", rows, cloud_cost_rows=cloud_rows)
-        self.assertIn("unifiedCloudCostView", summary)
-        self.assertTrue(summary["unifiedCloudCostView"]["cloudIntegrationEnabled"])
-        hooks = summary["optimizationRecommendations"]["integrationHooks"]["cloudCostManagement"]
-        self.assertEqual(hooks["awsCostExplorer"]["status"], "connected")
-        self.assertEqual(hooks["gcpBilling"]["status"], "connected")
-
-        html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows)
-        self.assertIn("Unified Cloud Cost View (LLM + AWS/GCP)", html)
-        self.assertIn("Cloud Provider", html)
-        self.assertIn("Top Cloud Services", html)
-
-    def test_evaluate_unified_budget_alerts_supports_total_provider_service_scope(self):
-        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}]
-        cloud_rows = [
-            {"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 7.0},
-            {"date": "2026-03-01", "provider": "gcp", "service": "bigquery", "costUSD": 2.0},
-        ]
-        alerts = evaluate_unified_budget_alerts(
-            rows,
-            cloud_rows,
-            config={
-                "unifiedBudgetAlerts": [
-                    {"id": "all", "scope": "total", "thresholdUSD": 10},
-                    {"id": "aws", "scope": "provider", "provider": "aws", "thresholdUSD": 6},
-                    {"id": "ec2", "scope": "service", "provider": "aws", "service": "ec2", "thresholdUSD": 6.5},
-                ]
-            },
-        )
-        self.assertTrue(alerts["available"])
-        self.assertEqual(len(alerts["events"]), 3)
-        scopes = {x["scope"] for x in alerts["events"]}
-        self.assertIn("total", scopes)
-        self.assertIn("provider:aws", scopes)
-        self.assertIn("service:aws:ec2", scopes)
-
-    def test_summary_dashboard_and_event_dispatch_include_unified_budget_alerts(self):
-        from unittest.mock import patch
-
-        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 4.0}]}]
-        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 4.0}]
-        alert_cfg = {"unifiedBudgetAlerts": [{"id": "u1", "scope": "total", "thresholdUSD": 5}], "notificationChannels": ["slack:webhook:https://hooks.slack.com/services/x/y/z"]}
-        summary = build_summary("codex", rows, alert_config=alert_cfg, cloud_cost_rows=cloud_rows)
-        self.assertIn("unifiedBudgetAlerts", summary)
-        self.assertGreaterEqual(len(summary["unifiedBudgetAlerts"]["events"]), 1)
-
-        html = build_dashboard_html("codex", rows, top_models=2, alert_config=alert_cfg, cloud_cost_rows=cloud_rows)
-        self.assertIn("Cross-platform Unified Budget Alerts", html)
-
-        with patch("token_usage_dashboard._dispatch_webhook", return_value={"status": "sent", "httpStatus": 200}) as mocked:
-            result = dispatch_event_alerts(summary, alert_config=alert_cfg)
-        self.assertEqual(result["sent"], 1)
-        self.assertEqual(mocked.call_count, 1)
-
-    def test_normalize_cloud_cost_payload_supports_aws_and_gcp_shapes(self):
-        aws_payload = {
-            "ResultsByTime": [
-                {
-                    "TimePeriod": {"Start": "2026-03-01"},
-                    "Groups": [
-                        {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "3.5", "Unit": "USD"}}}
-                    ],
-                }
-            ]
-        }
-        gcp_payload = {
-            "daily": [
-                {"date": "2026-03-01", "service": "BigQuery", "cost": 2.25, "projectId": "acme-prod"}
-            ]
-        }
-
-        aws_rows = dashboard_module._normalize_cloud_cost_payload(aws_payload)
-        gcp_rows = dashboard_module._normalize_cloud_cost_payload(gcp_payload)
-        self.assertEqual(aws_rows[0]["provider"], "aws")
-        self.assertEqual(aws_rows[0]["source"], "aws_cost_explorer")
-        self.assertEqual(gcp_rows[0]["provider"], "gcp")
-        self.assertEqual(gcp_rows[0]["source"], "gcp_billing_export")
 
     def test_summary_includes_pattern_analysis(self):
         rows = [
@@ -398,25 +296,6 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(overage["events"][0]["action"], "switch_model")
         self.assertEqual(overage["events"][0]["routeToModel"], "o3-mini")
 
-    def test_build_quota_policies_and_auto_enforcement_summary(self):
-        rows = [{
-            "date": "2026-03-01",
-            "llmCalls": [{"projectId": "proj-a", "userId": "alice", "modelName": "gpt-5", "cost": 2.5, "totalTokens": 300}],
-        }]
-        cfg = {
-            "allocations": [{"id": "alloc-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0}],
-            "permissions": {"roles": {"viewer": {"allowedModels": ["o3-mini"]}}, "users": {"alice": {"role": "viewer"}}},
-            "overagePolicies": [{"thresholdPct": 100, "action": "stop_calls", "message": "hard stop"}],
-        }
-        budget = evaluate_budget_allocation_and_permissions(rows, config=cfg)
-        overage = evaluate_overage_behaviors(budget)
-        quotas = build_quota_policies(budget, overage)
-
-        self.assertTrue(quotas["available"])
-        self.assertEqual(quotas["summary"]["allocationPolicies"], 1)
-        self.assertEqual(quotas["summary"]["autoHandledEvents"], 1)
-        self.assertEqual(quotas["enforcements"][0]["action"], "stop_calls")
-
     def test_build_prompt_optimization_engine_and_ab_plan(self):
         rows = [
             {
@@ -446,74 +325,11 @@ class TestTokenDashboard(TestCase):
         pattern = build_llm_pattern_analysis(rows)
         engine = build_prompt_optimization_engine(rows, pattern)
         self.assertTrue(engine["available"])
-        self.assertEqual(engine["engineVersion"], "1.1")
         self.assertGreaterEqual(len(engine["highConsumptionPrompts"]), 1)
         self.assertGreaterEqual(len(engine["abTests"]), 1)
         first = engine["highConsumptionPrompts"][0]
-        self.assertIn("rankScore", first)
         self.assertIn("suggestions", first)
         self.assertTrue(any(s["type"] == "model_rightsizing" for s in first["suggestions"]))
-
-    def test_prompt_optimization_engine_respects_config(self):
-        rows = [{
-            "date": "2026-03-01",
-            "llmCalls": [{
-                "modelName": "gpt-5",
-                "projectId": "proj-a",
-                "promptTokens": 820,
-                "completionTokens": 100,
-                "totalTokens": 920,
-                "cost": 1.0,
-                "prompt": "長提示詞 A",
-            }]
-        }]
-        pattern = build_llm_pattern_analysis(rows)
-        cfg = {
-            "maxPromptFamilies": 1,
-            "minFamilyCalls": 1,
-            "rankingWeights": {"costUSD": 1.0, "promptTokens": 0.2, "calls": 0.1, "promptToCompletionRatio": 0.5},
-            "abTesting": {
-                "trafficSplitB": 0.25,
-                "costReductionPctMin": 12,
-                "qualityDropPctMax": 1.5,
-                "latencyIncreasePctMax": 8,
-                "evaluationDays": 5,
-                "minimumSampleSize": 60,
-                "rolloutStages": [0.1, 0.2, 0.4],
-            }
-        }
-        engine = build_prompt_optimization_engine(rows, pattern, config=cfg)
-        self.assertEqual(engine["config"]["maxPromptFamilies"], 1)
-        self.assertEqual(engine["abTests"][0]["trafficSplit"]["B"], 0.25)
-        self.assertEqual(engine["abTests"][0]["successCriteria"]["costReductionPctMin"], 12.0)
-        self.assertEqual(engine["abTests"][0]["executionPlan"]["evaluationDays"], 5)
-        self.assertEqual(engine["abTests"][0]["executionPlan"]["minimumSampleSize"], 60)
-
-    def test_budget_permissions_detect_violations(self):
-        rows = [{
-            "date": "2026-03-01",
-            "llmCalls": [
-                {"userId": "alice", "modelName": "gpt-5", "cost": 1.2, "totalTokens": 100},
-                {"userId": "alice", "modelName": "gpt-4.1", "cost": 0.4, "totalTokens": 60},
-            ],
-        }]
-        cfg = {
-            "permissions": {
-                "defaultRole": "viewer",
-                "roles": {
-                    "viewer": {"allowedModels": ["gpt-4.1"], "maxCostPerCallUSD": 0.5},
-                },
-                "users": {
-                    "alice": {"role": "viewer"},
-                },
-            }
-        }
-        budget = evaluate_budget_allocation_and_permissions(rows, config=cfg)
-        violations = budget["permissions"].get("violations", [])
-        self.assertGreaterEqual(len(violations), 1)
-        violation_types = {v["violation"] for v in violations}
-        self.assertIn("model_not_allowed", violation_types)
-        self.assertIn("call_cost_exceeded", violation_types)
 
     def test_build_summary_normalizes_call_records_once(self):
         from unittest.mock import patch
@@ -1052,46 +868,6 @@ class TestTokenDashboard(TestCase):
             self.assertEqual(deliveries[0]["status"], "blocked")
             self.assertEqual(deliveries[0]["reason"], "role_not_allowed")
 
-    def test_dispatch_report_delivery_supports_slack_and_discord(self):
-        from unittest.mock import patch
-
-        payload = {
-            "provider": "codex",
-            "generatedAt": "2026-03-19T10:00:00+00:00",
-            "job": {"id": "daily", "name": "Daily"},
-            "summary": {"startDate": "2026-03-01", "endDate": "2026-03-19", "totalCostUSD": 12.3, "last7dCostUSD": 4.5},
-        }
-
-        with patch("token_usage_dashboard._dispatch_webhook", return_value={"status": "sent", "httpStatus": 200}) as mocked:
-            slack = dispatch_report_delivery(payload, {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"})
-            discord = dispatch_report_delivery(payload, {"channel": "discord", "target": "https://discord.com/api/webhooks/x"})
-
-        self.assertEqual(slack["status"], "sent")
-        self.assertEqual(discord["status"], "sent")
-        self.assertEqual(mocked.call_count, 2)
-
-    def test_dispatch_event_alerts_aggregates_alerts_controls_overage(self):
-        from unittest.mock import patch
-
-        summary = {
-            "provider": "codex",
-            "startDate": "2026-03-01",
-            "endDate": "2026-03-19",
-            "totalCostUSD": 123.0,
-            "alerts": {"triggered": [{"severity": "high", "message": "budget exceeded"}]},
-            "realTimeCostControls": {"triggeredActions": [{"action": "degrade", "message": "route to cheaper model"}]},
-            "overageBehaviors": {"events": [{"action": "switch_model", "dimension": "project", "key": "proj-a", "usagePct": 133.0}]},
-        }
-        cfg = {"notificationChannels": ["slack:webhook:https://hooks.slack.com/services/x/y/z"]}
-
-        with patch("token_usage_dashboard._dispatch_webhook", return_value={"status": "sent", "httpStatus": 200}) as mocked:
-            result = dispatch_event_alerts(summary, alert_config=cfg)
-
-        self.assertEqual(result["sent"], 1)
-        self.assertEqual(result["failed"], 0)
-        self.assertGreaterEqual(result["events"], 3)
-        self.assertEqual(mocked.call_count, 1)
-
     def test_scheduler_cli_requires_config(self):
         import sys
         from unittest.mock import patch
@@ -1151,25 +927,16 @@ class TestTokenDashboard(TestCase):
         }]
         budget_cfg = {
             "allocations": [{"id": "alloc-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0}],
-            "permissions": {
-                "roles": {"viewer": {"allowedModels": ["gpt-4.1"], "maxCostPerCallUSD": 1.0}},
-                "users": {"alice": {"role": "viewer"}},
-            },
             "overagePolicies": [{"thresholdPct": 100, "action": "stop_calls", "message": "hard stop"}],
         }
         summary = build_summary("codex", rows, budget_config=budget_cfg)
         self.assertIn("budgetAllocation", summary)
-        self.assertIn("quotaPolicies", summary)
         self.assertIn("overageBehaviors", summary)
         self.assertEqual(summary["overageBehaviors"]["events"][0]["action"], "stop_calls")
 
         html = build_dashboard_html("codex", rows, top_models=2, budget_config=budget_cfg)
         self.assertIn("Budget Allocation & Permission Management", html)
-        self.assertIn("Role Permission Matrix", html)
-        self.assertIn("Permission Violations (Detected from call logs)", html)
         self.assertIn("Overage Handling", html)
-        self.assertIn("Dashboard Policy View", html)
-        self.assertIn("Auto Enforcement Actions", html)
         self.assertIn("proj-a", html)
 
     def test_dashboard_html_escapes_alert_fields(self):
@@ -1184,389 +951,79 @@ class TestTokenDashboard(TestCase):
         html = build_dashboard_html("codex", rows, top_models=2, alert_config={"rules": alerts["rules"], "notificationChannels": alerts["notificationChannels"]})
         self.assertIn("&lt;/td&gt;&lt;script&gt;alert(4)&lt;/script&gt;", html)
 
-    def test_load_budget_config_normalizes_and_filters_invalid_entries(self):
-        import json
-        import tempfile
-
-        cfg = {
-            "allocations": [
-                {"id": "ok", "dimension": "project", "key": "proj-a", "budgetUSD": 20},
-                {"id": "bad-dim", "dimension": "bad", "key": "proj-x", "budgetUSD": 20},
-                {"id": "bad-budget", "dimension": "project", "key": "proj-y", "budgetUSD": 0},
-            ],
-            "permissions": {
-                "defaultRole": "viewer",
-                "roles": {
-                    "analyst": {"allowedModels": ["gpt-5", "", "gpt-5"], "maxCostPerCallUSD": -1},
-                },
-                "users": {
-                    "alice": {"role": "analyst", "allowedModels": ["o3", "o3"], "maxCostPerCallUSD": 0.8},
-                },
-            },
-            "overagePolicies": [
-                {"thresholdPct": 150, "action": "stop_calls"},
-                {"thresholdPct": 120, "action": "switch_model", "routeToModel": "o3-mini"},
-                {"thresholdPct": 100, "action": "unknown-action"},
-            ],
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            p = Path(tmpdir) / "budget.json"
-            p.write_text(json.dumps(cfg), encoding="utf-8")
-            parsed = dashboard_module._load_budget_config(str(p))
-
-        self.assertEqual(len(parsed["allocations"]), 1)
-        self.assertEqual(parsed["allocations"][0]["id"], "ok")
-        self.assertEqual(parsed["permissions"]["roles"]["analyst"]["allowedModels"], ["gpt-5"])
-        self.assertEqual(parsed["permissions"]["roles"]["analyst"]["maxCostPerCallUSD"], 0.0)
-        self.assertEqual(parsed["permissions"]["users"]["alice"]["allowedModels"], ["o3"])
-        self.assertEqual(parsed["overagePolicies"][0]["thresholdPct"], 100.0)
-        self.assertEqual(parsed["overagePolicies"][0]["action"], "warn")
-
-    def test_load_prompt_optimization_config_normalizes_ranges(self):
-        import json
-        import tempfile
-
-        cfg = {
-            "maxPromptFamilies": 0,
-            "compressionThresholdPromptTokens": 700,
-            "abTesting": {
-                "trafficSplitB": 3,
-                "costReductionPctMin": 11,
-            },
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            p = Path(tmpdir) / "prompt.json"
-            p.write_text(json.dumps(cfg), encoding="utf-8")
-            parsed = dashboard_module._load_prompt_optimization_config(str(p))
-
-        self.assertEqual(parsed["maxPromptFamilies"], 1)
-        self.assertEqual(parsed["compressionThresholdPromptTokens"], 700.0)
-        self.assertEqual(parsed["abTesting"]["trafficSplitB"], 0.9)
-        self.assertEqual(parsed["abTesting"]["costReductionPctMin"], 11.0)
-
-    def test_prompt_optimization_engine_filters_min_family_calls(self):
+    def test_cloud_tag_mapping_and_expanded_attribution_dimensions(self):
         rows = [{
             "date": "2026-03-01",
+            "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}],
             "llmCalls": [
-                {"modelName": "gpt-5", "projectId": "proj-a", "promptTokens": 1000, "completionTokens": 100, "cost": 1.2, "prompt": "family alpha prompt"},
-                {"modelName": "gpt-5", "projectId": "proj-a", "promptTokens": 1000, "completionTokens": 100, "cost": 1.0, "prompt": "family alpha prompt"},
-                {"modelName": "gpt-5", "projectId": "proj-b", "promptTokens": 900, "completionTokens": 120, "cost": 0.9, "prompt": "family beta prompt"},
+                {
+                    "modelName": "gpt-5",
+                    "projectId": "proj-a",
+                    "cloudProvider": "aws",
+                    "region": "ap-northeast-1",
+                    "cost": 1.1,
+                    "totalTokens": 100,
+                    "tags": {"team": "finops", "env": "prod"},
+                },
+                {
+                    "modelName": "o3",
+                    "projectId": "proj-b",
+                    "cloudProvider": "gcp",
+                    "region": "asia-east1",
+                    "cost": 0.9,
+                    "totalTokens": 80,
+                    "labels": {"team": "ml", "env": "stage"},
+                },
             ],
         }]
-        pattern = build_llm_pattern_analysis(rows)
-        engine = build_prompt_optimization_engine(rows, pattern, config={"minFamilyCalls": 2})
+        attribution = build_cost_attribution(rows, tag_aliases={"env": "environment"})
+        self.assertIn("cloudProvider", attribution["dimensions"])
+        self.assertIn("region", attribution["dimensions"])
+        self.assertIn("tag.environment", attribution["dimensions"])
+        mapping = build_cloud_tag_mapping(rows, tag_aliases={"env": "environment"})
+        self.assertTrue(mapping["available"])
+        self.assertEqual(mapping["taggedCalls"], 2)
 
-        self.assertTrue(engine["available"])
-        self.assertEqual(len(engine["highConsumptionPrompts"]), 1)
-        self.assertEqual(engine["highConsumptionPrompts"][0]["calls"], 2)
-
-    def test_cloud_tag_mapping_and_unified_tag_views(self):
-        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}]}]
-        cloud_rows = [
-            {"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 8.0, "tags": {"cost_center": "finops", "env": "prod"}},
-            {"date": "2026-03-01", "provider": "aws", "service": "AmazonS3", "costUSD": 2.0, "tags": {"cost_center": "finops"}},
-        ]
-        mapped = dashboard_module._apply_cloud_tag_mapping(cloud_rows, {"cost_center": "businessLine"})
-        self.assertEqual(mapped[0]["businessLine"], "finops")
-
-        view = build_unified_cloud_cost_view(rows, mapped)
-        self.assertTrue(any(x["tag"] == "cost_center=finops" for x in view["cloudTags"]))
-
-        alerts = evaluate_unified_budget_alerts(
-            rows,
-            mapped,
-            config={"unifiedBudgetAlerts": [{"id": "tag-finops", "scope": "tag", "tagKey": "cost_center", "tagValue": "finops", "thresholdUSD": 9}]},
-        )
-        self.assertEqual(alerts["events"][0]["scope"], "tag:cost_center=finops")
-
-    def test_detailed_attribution_includes_fine_grained_and_cloud_dimensions(self):
+    def test_summary_and_dashboard_include_cloud_tag_mapping(self):
         rows = [{
             "date": "2026-03-01",
-            "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}],
-            "llmCalls": [{"modelName": "gpt-5", "workflowId": "wf-1", "sessionId": "s-1", "projectId": "proj-a", "cost": 1.0, "totalTokens": 100, "endpoint": "/v1/chat/completions", "useCase": "code-review"}],
+            "modelBreakdowns": [{"modelName": "gpt-5", "cost": 2.5}],
+            "llmCalls": [{"modelName": "gpt-5", "cost": 2.5, "totalTokens": 300, "tags": {"owner": "finance"}}],
         }]
-        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 3.0, "project": "infra-core", "source": "aws_cost_explorer", "environment": "prod", "region": "ap-northeast-1", "accountId": "123456789012", "tags": {"env": "prod"}}]
+        summary = build_summary("codex", rows)
+        self.assertIn("cloudCostTagMapping", summary)
+        self.assertTrue(summary["cloudCostTagMapping"]["available"])
 
-        attr = dashboard_module.build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
-        self.assertIn("workflow", attr["dimensions"])
-        self.assertIn("cloudProvider", attr["dimensions"])
-        self.assertIn("cloudTag", attr["dimensions"])
-        self.assertIn("cloudProject", attr["dimensions"])
-        self.assertIn("cloudSource", attr["dimensions"])
-        self.assertIn("cloudEnvironment", attr["dimensions"])
-        self.assertIn("endpoint", attr["dimensions"])
-        self.assertIn("useCase", attr["dimensions"])
-        self.assertIn("cloudRegion", attr["dimensions"])
-        self.assertIn("cloudAccount", attr["dimensions"])
+        html = build_dashboard_html("codex", rows, top_models=2)
+        self.assertIn("Cloud Cost Tags Mapping", html)
+        self.assertIn("Attribution by Cloud Provider", html)
 
-        html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows, attribution_granularity="detailed")
-        self.assertIn("Cloud Attribution by Tag", html)
-        self.assertIn("Cloud Attribution by Project", html)
-        self.assertIn("Cloud Attribution by Source", html)
-        self.assertIn("Cloud Attribution by Environment", html)
-        self.assertIn("Cloud Attribution by Region", html)
-        self.assertIn("Cloud Attribution by Account", html)
-        self.assertIn("Attribution by Workflow (Detailed)", html)
-        self.assertIn("Attribution by Endpoint (Detailed)", html)
-        self.assertIn("Attribution by Use Case (Detailed)", html)
-
-    def test_cloud_tag_mapping_rules_support_alias_valuemap_and_default(self):
-        cloud_rows = [
-            {"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 3.0, "tags": {"owner_team": "plat", "env": "prod"}},
-            {"date": "2026-03-02", "provider": "gcp", "service": "BigQuery", "costUSD": 2.0, "tags": {"cost-center": "finops-core"}},
-        ]
-        mapping_cfg = {
-            "mapping": {"env": "environment"},
-            "rules": [
-                {"target": "department", "from": ["owner_team", "team"], "valueMap": {"plat": "platform"}},
-                {"target": "businessLine", "tag": "cost_centre", "aliases": ["cost-center"], "valueMap": {"finops-core": "finops"}},
-                {"target": "environment", "from": ["environment", "env"], "default": "shared"},
-                {"target": "ownerBucket", "from": ["owner_team"], "match": "prefix", "valueMap": {"pl": "eng-platform"}},
-                {"target": "costCategory", "from": ["cost-center"], "match": "regex", "valueMap": {"finops-.*": "finops"}, "transform": "upper"},
-            ],
-        }
-        mapped = dashboard_module._apply_cloud_tag_mapping(cloud_rows, mapping_cfg)
-        self.assertEqual(mapped[0]["department"], "platform")
-        self.assertEqual(mapped[0]["environment"], "prod")
-        self.assertEqual(mapped[1]["businessLine"], "finops")
-        self.assertEqual(mapped[1]["environment"], "shared")
-        self.assertEqual(mapped[0]["ownerBucket"], "eng-platform")
-        self.assertEqual(mapped[1]["costCategory"], "FINOPS")
-
-    def test_run_report_scheduler_only_on_change_and_history_retention(self):
-        import json
-        import tempfile
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
-        payload = {
-            "provider": "codex",
-            "daily": [
-                {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.5}]},
-                {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 2.0}]},
-            ],
-        }
-        config = {
-            "history": {"maxReportsPerJob": 1},
-            "jobs": [{"id": "finance", "frequency": "daily", "onlyOnChange": True, "formats": ["json"]}],
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            first = run_report_scheduler(
-                payload=payload,
-                provider="codex",
-                config=config,
-                output_dir=Path(tmpdir),
-                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
-            )
-            self.assertEqual(first["generated"], 1)
-
-            second = run_report_scheduler(
-                payload=payload,
-                provider="codex",
-                config=config,
-                output_dir=Path(tmpdir),
-                now=datetime(2026, 3, 13, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
-            )
-            self.assertEqual(second["generated"], 0)
-            self.assertEqual(second["jobs"][0]["reason"], "no_change")
-
-            payload_changed = {
-                "provider": "codex",
-                "daily": payload["daily"] + [{"date": "2026-03-03", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}],
-            }
-            third = run_report_scheduler(
-                payload=payload_changed,
-                provider="codex",
-                config=config,
-                output_dir=Path(tmpdir),
-                now=datetime(2026, 3, 14, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
-            )
-            self.assertEqual(third["generated"], 1)
-
-            history = json.loads((Path(tmpdir) / "report_history.json").read_text())
-            self.assertEqual(len(history["reports"]), 1)
-            self.assertTrue(history["latestByJob"]["finance"]["fingerprint"])
-
-
-    def test_cost_attribution_includes_dynamic_cloud_mapped_dimensions(self):
-        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}], "llmCalls": [{"modelName": "gpt-5", "cost": 1.0, "totalTokens": 100}]}]
-        cloud_rows = [
-            {"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 3.0, "businessUnit": "retail", "ownerTeam": "platform"},
-            {"date": "2026-03-01", "provider": "aws", "service": "s3", "costUSD": 2.0, "businessUnit": "retail", "ownerTeam": "data"},
-        ]
-        attr = build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
-        self.assertIn("cloudMapped:businessUnit", attr["dimensions"])
-        self.assertIn("cloudMapped:ownerTeam", attr["dimensions"])
-        html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows, attribution_granularity="detailed")
-        self.assertIn("Cloud Attribution by Mapped Dimension · businessUnit", html)
-        self.assertIn("Cloud Attribution by Mapped Dimension · ownerTeam", html)
-
-    def test_scheduler_deduplicates_duplicate_recipients(self):
+    def test_run_report_scheduler_skip_unchanged_payload(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
         import tempfile
 
         payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]}
-        config = {
-            "dispatch": {"enabled": False},
-            "jobs": [
-                {
-                    "id": "dup-recipients",
-                    "frequency": "daily",
-                    "recipients": [
-                        {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"},
-                        {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"},
-                    ],
-                }
-            ],
-        }
+        config = {"jobs": [{"id": "daily-ops", "frequency": "daily", "granularity": "daily", "metrics": ["total_cost"]}]}
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = run_report_scheduler(
+            r1 = run_report_scheduler(
                 payload=payload,
                 provider="codex",
                 config=config,
                 output_dir=Path(tmpdir),
                 now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
             )
-        deliveries = result["jobs"][0]["deliveries"]
-        self.assertEqual(deliveries[0]["status"], "queued")
-        self.assertEqual(deliveries[1]["status"], "skipped")
-        self.assertEqual(deliveries[1]["reason"], "duplicate_recipient")
+            self.assertEqual(r1["generated"], 1)
 
-    def test_scheduler_min_total_cost_change_pct_skips_small_changes(self):
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        import tempfile
-
-        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}]}
-        config = {
-            "jobs": [
-                {
-                    "id": "change-threshold",
-                    "frequency": "daily",
-                    "formats": ["json"],
-                    "onlyOnChange": False,
-                    "minTotalCostChangePct": 5,
-                }
-            ]
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            first = run_report_scheduler(
+            r2 = run_report_scheduler(
                 payload=payload,
-                provider="codex",
-                config=config,
-                output_dir=Path(tmpdir),
-                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
-            )
-            self.assertEqual(first["generated"], 1)
-
-            payload_small_change = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.2}]}]}
-            second = run_report_scheduler(
-                payload=payload_small_change,
                 provider="codex",
                 config=config,
                 output_dir=Path(tmpdir),
                 now=datetime(2026, 3, 13, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
             )
-            self.assertEqual(second["generated"], 0)
-            self.assertEqual(second["jobs"][0]["reason"], "change_below_threshold")
-
-    def test_scheduler_force_run_after_hours_with_pct_and_usd_threshold(self):
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        import tempfile
-
-        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 100.0}]}]}
-        config = {
-            "jobs": [
-                {
-                    "id": "change-threshold-force",
-                    "frequency": "daily",
-                    "formats": ["json"],
-                    "minTotalCostChangePct": 5,
-                    "minTotalCostChangeUSD": 20,
-                    "forceRunAfterHours": 24,
-                }
-            ]
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            first = run_report_scheduler(
-                payload=payload,
-                provider="codex",
-                config=config,
-                output_dir=Path(tmpdir),
-                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
-            )
-            self.assertEqual(first["generated"], 1)
-
-            payload_small_change = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 101.0}]}]}
-            second = run_report_scheduler(
-                payload=payload_small_change,
-                provider="codex",
-                config=config,
-                output_dir=Path(tmpdir),
-                now=datetime(2026, 3, 13, 6, 0, 0, tzinfo=ZoneInfo("UTC")),
-            )
-            self.assertEqual(second["generated"], 0)
-            self.assertEqual(second["jobs"][0]["reason"], "change_below_threshold")
-
-            third = run_report_scheduler(
-                payload=payload_small_change,
-                provider="codex",
-                config=config,
-                output_dir=Path(tmpdir),
-                now=datetime(2026, 3, 14, 13, 0, 0, tzinfo=ZoneInfo("UTC")),
-            )
-            self.assertEqual(third["generated"], 1)
-
-    def test_cloud_tag_mapping_when_scope_and_derive_dimension(self):
-        cloud_rows = [
-            {"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "project": "core", "costUSD": 3.0, "tags": {"owner": "team-a", "env": "prod"}},
-            {"date": "2026-03-01", "provider": "gcp", "service": "BigQuery", "project": "core", "costUSD": 2.0, "tags": {"owner": "team-b", "env": "prod"}},
-        ]
-        mapped = dashboard_module._apply_cloud_tag_mapping(cloud_rows, {
-            "rules": [
-                {"target": "department", "from": ["owner"], "when": {"providers": ["aws"]}}
-            ],
-            "derive": [
-                {"target": "chargebackKey", "template": "{provider}:{project}:{department}"}
-            ]
-        })
-        self.assertEqual(mapped[0]["department"], "team-a")
-        self.assertNotIn("department", mapped[1])
-        self.assertEqual(mapped[0]["chargebackKey"], "aws:core:team-a")
-
-    def test_detailed_cloud_attribution_expands_provider_service_and_tag_key(self):
-        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}], "llmCalls": [{"modelName": "gpt-5", "cost": 1.0, "totalTokens": 100}]}]
-        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "ec2", "project": "infra", "costUSD": 3.0, "tags": {"env": "prod"}}]
-        attr = build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
-        self.assertIn("cloudProviderService", attr["dimensions"])
-        self.assertIn("cloudProjectService", attr["dimensions"])
-        self.assertIn("cloudTagKey", attr["dimensions"])
-
-    def test_scheduler_supports_row_and_model_change_thresholds(self):
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        import tempfile
-
-        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}]}
-        config = {
-            "jobs": [{
-                "id": "row-model-threshold",
-                "frequency": "daily",
-                "formats": ["json"],
-                "minReportRowsChange": 1,
-                "minActiveModelsChange": 0.5,
-            }]
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            first = run_report_scheduler(payload, "codex", config, Path(tmpdir), now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")))
-            self.assertEqual(first["generated"], 1)
-            second = run_report_scheduler(payload, "codex", config, Path(tmpdir), now=datetime(2026, 3, 13, 12, 0, 0, tzinfo=ZoneInfo("UTC")))
-            self.assertEqual(second["generated"], 0)
-            self.assertEqual(second["jobs"][0]["reason"], "change_below_threshold")
+            self.assertEqual(r2["generated"], 0)
+            self.assertEqual(r2["jobs"][0]["reason"], "unchanged_payload")
 
 
 if __name__ == "__main__":

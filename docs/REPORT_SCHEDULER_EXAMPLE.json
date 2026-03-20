@@ -1,12 +1,4 @@
 {
-  "dispatch": {
-    "enabled": true,
-    "timeoutSeconds": 8,
-    "retries": 1
-  },
-  "history": {
-    "maxReportsPerJob": 20
-  },
   "jobs": [
     {
       "id": "finance-weekly",
@@ -17,12 +9,7 @@
       "metrics": ["total_cost", "active_models", "avg_cost_per_model"],
       "models": ["gpt-5", "o3"],
       "formats": ["json", "csv"],
-      "onlyOnChange": true,
-      "minTotalCostChangePct": 3,
-      "minTotalCostChangeUSD": 20,
-      "minReportRowsChange": 1,
-      "minActiveModelsChange": 0.5,
-      "forceRunAfterHours": 48,
+      "skipIfUnchanged": true,
       "allowedRoles": ["admin", "analyst"],
       "layout": {
         "title": "Finance Weekly",
@@ -30,12 +17,13 @@
       },
       "recipients": [
         {
-          "channel": "slack",
-          "target": "https://hooks.slack.com/services/xxx/yyy/zzz"
+          "channel": "email",
+          "target": "finance@example.com"
         },
         {
-          "channel": "discord",
-          "target": "https://discord.com/api/webhooks/..."
+          "channel": "slack",
+          "target": "#finops",
+          "allowedRoles": ["admin"]
         }
       ]
     }

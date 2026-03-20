@@ -1,0 +1,8 @@
+{
+  "mapping": {
+    "cost_center": "businessLine",
+    "team": "department",
+    "app": "application",
+    "project": "project"
+  }
+}

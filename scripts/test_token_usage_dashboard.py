@@ -20,10 +20,12 @@ from token_usage_dashboard import (
     evaluate_realtime_cost_controls,
     evaluate_budget_allocation_and_permissions,
     evaluate_overage_behaviors,
+    build_quota_policies,
     forecast_cost,
     parse_provider_list,
     build_multi_provider_aggregation,
     build_unified_cloud_cost_view,
+    evaluate_unified_budget_alerts,
     downsample_rows,
     generate_custom_report,
     main as dashboard_main,
@@ -126,6 +128,48 @@ class TestTokenDashboard(TestCase):
         self.assertIn("Unified Cloud Cost View (LLM + AWS/GCP)", html)
         self.assertIn("Cloud Provider", html)
         self.assertIn("Top Cloud Services", html)
+
+    def test_evaluate_unified_budget_alerts_supports_total_provider_service_scope(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}]
+        cloud_rows = [
+            {"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 7.0},
+            {"date": "2026-03-01", "provider": "gcp", "service": "bigquery", "costUSD": 2.0},
+        ]
+        alerts = evaluate_unified_budget_alerts(
+            rows,
+            cloud_rows,
+            config={
+                "unifiedBudgetAlerts": [
+                    {"id": "all", "scope": "total", "thresholdUSD": 10},
+                    {"id": "aws", "scope": "provider", "provider": "aws", "thresholdUSD": 6},
+                    {"id": "ec2", "scope": "service", "provider": "aws", "service": "ec2", "thresholdUSD": 6.5},
+                ]
+            },
+        )
+        self.assertTrue(alerts["available"])
+        self.assertEqual(len(alerts["events"]), 3)
+        scopes = {x["scope"] for x in alerts["events"]}
+        self.assertIn("total", scopes)
+        self.assertIn("provider:aws", scopes)
+        self.assertIn("service:aws:ec2", scopes)
+
+    def test_summary_dashboard_and_event_dispatch_include_unified_budget_alerts(self):
+        from unittest.mock import patch
+
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 4.0}]}]
+        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 4.0}]
+        alert_cfg = {"unifiedBudgetAlerts": [{"id": "u1", "scope": "total", "thresholdUSD": 5}], "notificationChannels": ["slack:webhook:https://hooks.slack.com/services/x/y/z"]}
+        summary = build_summary("codex", rows, alert_config=alert_cfg, cloud_cost_rows=cloud_rows)
+        self.assertIn("unifiedBudgetAlerts", summary)
+        self.assertGreaterEqual(len(summary["unifiedBudgetAlerts"]["events"]), 1)
+
+        html = build_dashboard_html("codex", rows, top_models=2, alert_config=alert_cfg, cloud_cost_rows=cloud_rows)
+        self.assertIn("Cross-platform Unified Budget Alerts", html)
+
+        with patch("token_usage_dashboard._dispatch_webhook", return_value={"status": "sent", "httpStatus": 200}) as mocked:
+            result = dispatch_event_alerts(summary, alert_config=alert_cfg)
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(mocked.call_count, 1)
 
     def test_normalize_cloud_cost_payload_supports_aws_and_gcp_shapes(self):
         aws_payload = {
@@ -354,6 +398,25 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(overage["events"][0]["action"], "switch_model")
         self.assertEqual(overage["events"][0]["routeToModel"], "o3-mini")
 
+    def test_build_quota_policies_and_auto_enforcement_summary(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [{"projectId": "proj-a", "userId": "alice", "modelName": "gpt-5", "cost": 2.5, "totalTokens": 300}],
+        }]
+        cfg = {
+            "allocations": [{"id": "alloc-a", "dimension": "project", "key": "proj-a", "budgetUSD": 2.0}],
+            "permissions": {"roles": {"viewer": {"allowedModels": ["o3-mini"]}}, "users": {"alice": {"role": "viewer"}}},
+            "overagePolicies": [{"thresholdPct": 100, "action": "stop_calls", "message": "hard stop"}],
+        }
+        budget = evaluate_budget_allocation_and_permissions(rows, config=cfg)
+        overage = evaluate_overage_behaviors(budget)
+        quotas = build_quota_policies(budget, overage)
+
+        self.assertTrue(quotas["available"])
+        self.assertEqual(quotas["summary"]["allocationPolicies"], 1)
+        self.assertEqual(quotas["summary"]["autoHandledEvents"], 1)
+        self.assertEqual(quotas["enforcements"][0]["action"], "stop_calls")
+
     def test_build_prompt_optimization_engine_and_ab_plan(self):
         rows = [
             {
@@ -383,6 +446,7 @@ class TestTokenDashboard(TestCase):
         pattern = build_llm_pattern_analysis(rows)
         engine = build_prompt_optimization_engine(rows, pattern)
         self.assertTrue(engine["available"])
+        self.assertEqual(engine["engineVersion"], "1.0")
         self.assertGreaterEqual(len(engine["highConsumptionPrompts"]), 1)
         self.assertGreaterEqual(len(engine["abTests"]), 1)
         first = engine["highConsumptionPrompts"][0]
@@ -1087,6 +1151,7 @@ class TestTokenDashboard(TestCase):
         }
         summary = build_summary("codex", rows, budget_config=budget_cfg)
         self.assertIn("budgetAllocation", summary)
+        self.assertIn("quotaPolicies", summary)
         self.assertIn("overageBehaviors", summary)
         self.assertEqual(summary["overageBehaviors"]["events"][0]["action"], "stop_calls")
 
@@ -1095,6 +1160,8 @@ class TestTokenDashboard(TestCase):
         self.assertIn("Role Permission Matrix", html)
         self.assertIn("Permission Violations (Detected from call logs)", html)
         self.assertIn("Overage Handling", html)
+        self.assertIn("Dashboard Policy View", html)
+        self.assertIn("Auto Enforcement Actions", html)
         self.assertIn("proj-a", html)
 
     def test_dashboard_html_escapes_alert_fields(self):
@@ -1169,6 +1236,43 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(parsed["compressionThresholdPromptTokens"], 700.0)
         self.assertEqual(parsed["abTesting"]["trafficSplitB"], 0.9)
         self.assertEqual(parsed["abTesting"]["costReductionPctMin"], 11.0)
+
+    def test_cloud_tag_mapping_and_unified_tag_views(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}]}]
+        cloud_rows = [
+            {"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 8.0, "tags": {"cost_center": "finops", "env": "prod"}},
+            {"date": "2026-03-01", "provider": "aws", "service": "AmazonS3", "costUSD": 2.0, "tags": {"cost_center": "finops"}},
+        ]
+        mapped = dashboard_module._apply_cloud_tag_mapping(cloud_rows, {"cost_center": "businessLine"})
+        self.assertEqual(mapped[0]["businessLine"], "finops")
+
+        view = build_unified_cloud_cost_view(rows, mapped)
+        self.assertTrue(any(x["tag"] == "cost_center=finops" for x in view["cloudTags"]))
+
+        alerts = evaluate_unified_budget_alerts(
+            rows,
+            mapped,
+            config={"unifiedBudgetAlerts": [{"id": "tag-finops", "scope": "tag", "tagKey": "cost_center", "tagValue": "finops", "thresholdUSD": 9}]},
+        )
+        self.assertEqual(alerts["events"][0]["scope"], "tag:cost_center=finops")
+
+    def test_detailed_attribution_includes_fine_grained_and_cloud_dimensions(self):
+        rows = [{
+            "date": "2026-03-01",
+            "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}],
+            "llmCalls": [{"modelName": "gpt-5", "workflowId": "wf-1", "sessionId": "s-1", "projectId": "proj-a", "cost": 1.0, "totalTokens": 100}],
+        }]
+        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 3.0, "tags": {"env": "prod"}}]
+
+        attr = dashboard_module.build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
+        self.assertIn("workflow", attr["dimensions"])
+        self.assertIn("cloudProvider", attr["dimensions"])
+        self.assertIn("cloudTag", attr["dimensions"])
+
+        html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows, attribution_granularity="detailed")
+        self.assertIn("Cloud Attribution by Tag", html)
+        self.assertIn("Attribution by Workflow (Detailed)", html)
+
 
 
 if __name__ == "__main__":

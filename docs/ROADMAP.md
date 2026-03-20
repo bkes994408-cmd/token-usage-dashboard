@@ -53,3 +53,15 @@
   - 已實作（首個 production-ready increment）：normalized multi-provider aggregation model（provider/model/day 統一聚合）+ dashboard 統一視圖（providers totals + cross-provider top models）+ summary JSON 輸出 `multiProviderAggregation`。
 - [x] 預算分配與使用權限管理：更精細地控制各部門/用戶的 LLM 資源預算分配，並設定使用權限。
   - 已實作：dimension 預算配置（project/department/user/application/businessLine/model）、角色/使用者權限矩陣、call log 權限違規偵測（模型白名單與單次成本上限），並於 Dashboard 顯示 allocation/violation 視圖。
+
+### MVP-5：雲端整合與企業級成本視圖（本次完成）
+- [x] AWS Cost Explorer / GCP Billing 深度整合
+  - 已強化：`--cloud-cost-input` 支援 AWS CE `ResultsByTime`、GCP billing-like `daily`、normalized records，統一映射至 provider/service/project/currency/source。
+  - 已提供：Unified Cloud Cost View（LLM + Cloud Infra）在 summary JSON 與 dashboard 同步展示。
+- [x] 跨平台統一預算告警（LLM + Cloud）
+  - 新增：`unifiedBudgetAlerts` 規則引擎，支援 scope=`total|llm|cloud|provider|service` 與 thresholdUSD。
+  - 新增：summary `unifiedBudgetAlerts.events`、Dashboard「Cross-platform Unified Budget Alerts」區塊。
+  - 新增：Event Monitor dispatch 會併入 unified budget 事件，與既有 anomaly/cost-control/overage 一起通知。
+- [x] 報表分發與整合
+  - 已完成：Scheduler 分發（Slack/Discord webhook）與 role guardrail；分發結果落地於 report history。
+  - 已完成：Event Monitor 統一分發流程，支援 timeout/retry，並輸出 dispatch 結果供審計。

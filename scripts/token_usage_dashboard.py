@@ -6,6 +6,7 @@ Generate a local HTML dashboard for CodexBar model usage/cost data.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import re
@@ -283,22 +284,89 @@ def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda x: (x["date"], x["provider"], x["service"], x["project"]))
 
 
-def _apply_cloud_tag_mapping(rows: List[Dict[str, Any]], mapping: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+def _normalize_cloud_tag_mapping_rules(mapping: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not mapping:
+        return []
+
+    # Backward-compatible: {"cost_center": "businessLine"}
+    if all(isinstance(v, str) for v in mapping.values()):
+        return [
+            {
+                "from": [str(k).strip().lower()],
+                "target": str(v).strip(),
+            }
+            for k, v in mapping.items()
+            if str(k).strip() and str(v).strip()
+        ]
+
+    base = mapping.get("mapping") if isinstance(mapping.get("mapping"), dict) else {}
+    explicit_rules = mapping.get("rules") if isinstance(mapping.get("rules"), list) else []
+    out: List[Dict[str, Any]] = []
+
+    for k, v in base.items():
+        kk = str(k or "").strip().lower()
+        vv = str(v or "").strip()
+        if kk and vv:
+            out.append({"from": [kk], "target": vv})
+
+    for r in explicit_rules:
+        if not isinstance(r, dict):
+            continue
+        target = str(r.get("target") or "").strip()
+        if not target:
+            continue
+        sources_raw = r.get("from") if isinstance(r.get("from"), list) else []
+        if not sources_raw and r.get("tag"):
+            sources_raw = [r.get("tag")]
+        aliases_raw = r.get("aliases") if isinstance(r.get("aliases"), list) else []
+        sources = [str(x).strip().lower() for x in [*sources_raw, *aliases_raw] if str(x).strip()]
+        if not sources:
+            continue
+        value_map_raw = r.get("valueMap") if isinstance(r.get("valueMap"), dict) else {}
+        value_map = {
+            str(k).strip().lower(): str(v).strip()
+            for k, v in value_map_raw.items()
+            if str(k).strip() and str(v).strip()
+        }
+        out.append({
+            "from": sources,
+            "target": target,
+            "default": str(r.get("default") or "").strip() or None,
+            "valueMap": value_map,
+        })
+    return out
+
+
+def _apply_cloud_tag_mapping(rows: List[Dict[str, Any]], mapping: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    rules = _normalize_cloud_tag_mapping_rules(mapping)
+    if not rules:
         return rows
     out: List[Dict[str, Any]] = []
     for row in rows:
         tags = _normalize_cloud_tags(row.get("tags"))
         mapped = dict(row)
         mapped["tags"] = tags
-        for tag_key, target in mapping.items():
-            if tag_key in tags and tags[tag_key]:
-                mapped[target] = tags[tag_key]
+        for rule in rules:
+            target = str(rule.get("target") or "").strip()
+            if not target:
+                continue
+            value: Optional[str] = None
+            for src in rule.get("from") or []:
+                if src in tags and tags[src]:
+                    value = tags[src]
+                    break
+            if value is None:
+                value = rule.get("default")
+            if not value:
+                continue
+            value_map = rule.get("valueMap") if isinstance(rule.get("valueMap"), dict) else {}
+            transformed = value_map.get(str(value).strip().lower()) if value_map else None
+            mapped[target] = transformed if transformed else value
         out.append(mapped)
     return out
 
 
-def load_cloud_cost_rows(path: Optional[str], tag_mapping: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+def load_cloud_cost_rows(path: Optional[str], tag_mapping: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     if not path:
         return []
     raw = Path(path).read_text(encoding="utf-8")
@@ -343,21 +411,17 @@ def _normalize_cloud_tags(raw_tags: Any) -> Dict[str, str]:
     return out
 
 
-def _load_cloud_tag_mapping_config(path: Optional[str]) -> Dict[str, str]:
+def _load_cloud_tag_mapping_config(path: Optional[str]) -> Dict[str, Any]:
     if not path:
         return {}
     raw = Path(path).read_text(encoding='utf-8')
     parsed = json.loads(raw)
-    mapping = parsed.get('mapping') if isinstance(parsed, dict) else parsed
-    if not isinstance(mapping, dict):
-        raise RuntimeError('Cloud tag mapping config must be a JSON object or include {"mapping": {...}}.')
-    out: Dict[str, str] = {}
-    for k, v in mapping.items():
-        kk = str(k or '').strip().lower()
-        vv = str(v or '').strip()
-        if kk and vv:
-            out[kk] = vv
-    return out
+    if not isinstance(parsed, dict):
+        raise RuntimeError('Cloud tag mapping config must be a JSON object.')
+    rules = _normalize_cloud_tag_mapping_rules(parsed)
+    if not rules:
+        raise RuntimeError('Cloud tag mapping config must include valid mapping rules.')
+    return parsed
 
 def parse_date(value: str) -> Optional[date]:
     try:
@@ -712,9 +776,26 @@ def build_cost_attribution(
 
     cloud = cloud_rows or []
     if cloud:
+        cloud_total = sum(_safe_float(x.get("costUSD")) for x in cloud)
+
+        def _rank_cloud(agg: Dict[str, Dict[str, float]]) -> List[Dict[str, Any]]:
+            return [
+                {
+                    "key": k,
+                    "costUSD": v["costUSD"],
+                    "totalTokens": 0.0,
+                    "count": int(v["count"]),
+                    "sharePct": (v["costUSD"] / cloud_total * 100.0) if cloud_total > 0 else 0.0,
+                }
+                for k, v in sorted(agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+            ]
+
         cloud_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
         cloud_service_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
         cloud_tag_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        cloud_project_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        cloud_source_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        cloud_env_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
         for r in cloud:
             cost = _safe_float(r.get("costUSD"))
             p = str(r.get("provider") or "unknown").lower()
@@ -724,24 +805,29 @@ def build_cost_attribution(
             key = f"{p}:{s}"
             cloud_service_agg[key]["costUSD"] += cost
             cloud_service_agg[key]["count"] += 1
+            cproj = str(r.get("project") or "unknown")
+            cloud_project_agg[cproj]["costUSD"] += cost
+            cloud_project_agg[cproj]["count"] += 1
+            csrc = str(r.get("source") or "unknown")
+            cloud_source_agg[csrc]["costUSD"] += cost
+            cloud_source_agg[csrc]["count"] += 1
+            if r.get("environment"):
+                env = str(r.get("environment"))
+                cloud_env_agg[env]["costUSD"] += cost
+                cloud_env_agg[env]["count"] += 1
             tags = _normalize_cloud_tags(r.get("tags"))
             for tk, tv in tags.items():
                 tkey = f"{tk}={tv}"
                 cloud_tag_agg[tkey]["costUSD"] += cost
                 cloud_tag_agg[tkey]["count"] += 1
 
-        dimensions["cloudProvider"] = [
-            {"key": k, "costUSD": v["costUSD"], "count": int(v["count"])}
-            for k, v in sorted(cloud_agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
-        ]
-        dimensions["cloudService"] = [
-            {"key": k, "costUSD": v["costUSD"], "count": int(v["count"])}
-            for k, v in sorted(cloud_service_agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
-        ]
-        dimensions["cloudTag"] = [
-            {"key": k, "costUSD": v["costUSD"], "count": int(v["count"])}
-            for k, v in sorted(cloud_tag_agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
-        ]
+        dimensions["cloudProvider"] = _rank_cloud(cloud_agg)
+        dimensions["cloudService"] = _rank_cloud(cloud_service_agg)
+        dimensions["cloudTag"] = _rank_cloud(cloud_tag_agg)
+        dimensions["cloudProject"] = _rank_cloud(cloud_project_agg)
+        dimensions["cloudSource"] = _rank_cloud(cloud_source_agg)
+        if cloud_env_agg:
+            dimensions["cloudEnvironment"] = _rank_cloud(cloud_env_agg)
 
     return {
         "available": True,
@@ -2516,6 +2602,7 @@ def _normalize_report_jobs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "allowedRoles": [str(x).strip() for x in (job.get("allowedRoles") or []) if str(x).strip()],
             "recipients": recipients,
             "formats": [str(x).strip().lower() for x in (job.get("formats") or ["json"]) if str(x).strip()],
+            "onlyOnChange": bool(job.get("onlyOnChange", False)),
         })
     return out
 
@@ -2584,6 +2671,23 @@ def _export_report_csv(rows: List[Dict[str, Any]], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _report_payload_fingerprint(report_payload: Dict[str, Any]) -> str:
+    compact = {
+        "job": report_payload.get("job"),
+        "provider": report_payload.get("provider"),
+        "role": report_payload.get("role"),
+        "tenant": report_payload.get("tenant"),
+        "summary": {
+            "totalCostUSD": ((report_payload.get("summary") or {}).get("totalCostUSD") if isinstance(report_payload.get("summary"), dict) else None),
+            "startDate": ((report_payload.get("summary") or {}).get("startDate") if isinstance(report_payload.get("summary"), dict) else None),
+            "endDate": ((report_payload.get("summary") or {}).get("endDate") if isinstance(report_payload.get("summary"), dict) else None),
+        },
+        "reportRows": report_payload.get("reportRows") or [],
+    }
+    raw = json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _recipient_allowed(recipient: Dict[str, Any], role_name: str, job_allowed_roles: List[str]) -> bool:
     allowed_roles = [str(x).strip() for x in recipient.get("allowedRoles", []) if str(x).strip()] if isinstance(recipient.get("allowedRoles"), list) else []
     effective_allowed = allowed_roles or job_allowed_roles
@@ -2610,6 +2714,8 @@ def run_report_scheduler(
     dispatch_enabled = bool(dispatch_cfg.get("enabled", True))
     dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
     dispatch_retries = _safe_int(dispatch_cfg.get("retries"), default=0, minimum=0)
+    history_cfg = config.get("history") if isinstance(config.get("history"), dict) else {}
+    max_reports_per_job = _safe_int(history_cfg.get("maxReportsPerJob"), default=0, minimum=0)
 
     result = {"now": now_dt.isoformat(), "jobs": [], "generated": 0, "skipped": 0, "sent": 0, "failed": 0}
 
@@ -2669,6 +2775,14 @@ def run_report_scheduler(
             "reportRows": report_rows,
         }
 
+        fingerprint = _report_payload_fingerprint(report_payload)
+        previous = latest_by_job.get(job_id) if isinstance(latest_by_job.get(job_id), dict) else {}
+        only_on_change = bool(job.get("onlyOnChange", False))
+        if only_on_change and previous.get("fingerprint") == fingerprint:
+            result["jobs"].append({"jobId": job_id, "status": "skipped", "reason": "no_change"})
+            result["skipped"] += 1
+            continue
+
         formats = job.get("formats") if isinstance(job.get("formats"), list) else ["json"]
         if "json" in formats:
             json_path = job_dir / f"{base}.json"
@@ -2720,14 +2834,31 @@ def run_report_scheduler(
             "deliveries": deliveries,
             "layout": job.get("layout") or {},
             "tenant": tenant_meta or None,
+            "fingerprint": fingerprint,
         }
         history["reports"].append(history_item)
-        latest_by_job[job_id] = {"generatedAt": now_dt.isoformat(), "artifacts": artifact_paths}
+        latest_by_job[job_id] = {"generatedAt": now_dt.isoformat(), "artifacts": artifact_paths, "fingerprint": fingerprint}
 
         result["jobs"].append({"jobId": job_id, "status": "generated", "artifacts": artifact_paths, "deliveries": deliveries})
         result["generated"] += 1
 
     history["latestByJob"] = latest_by_job
+    if max_reports_per_job > 0:
+        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        passthrough: List[Dict[str, Any]] = []
+        for item in history.get("reports", []):
+            if not isinstance(item, dict):
+                continue
+            jid = str(item.get("jobId") or "").strip()
+            if not jid:
+                passthrough.append(item)
+                continue
+            grouped[jid].append(item)
+        pruned: List[Dict[str, Any]] = list(passthrough)
+        for _, items in grouped.items():
+            ranked = sorted(items, key=lambda x: str(x.get("generatedAt") or ""), reverse=True)
+            pruned.extend(ranked[:max_reports_per_job])
+        history["reports"] = sorted(pruned, key=lambda x: str(x.get("generatedAt") or ""))
     _write_report_history(output_dir, history)
     return result
 
@@ -2942,6 +3073,9 @@ def build_dashboard_html(
     attr_cloud_provider_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProvider", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
     attr_cloud_service_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudService", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
     attr_cloud_tag_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudTag", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
+    attr_cloud_project_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProject", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
+    attr_cloud_source_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudSource", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
+    attr_cloud_env_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudEnvironment", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
 
     rec_rows = "<tr><td colspan='6'>No recommendations</td></tr>"
     if recs.get("available") and isinstance(recs.get("recommendations"), list) and recs.get("recommendations"):
@@ -3317,6 +3451,21 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Tag</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
     <tbody>{attr_cloud_tag_rows}</tbody>
+  </table>
+  <h4>Cloud Attribution by Project</h4>
+  <table>
+    <thead><tr><th>#</th><th>Project</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_cloud_project_rows}</tbody>
+  </table>
+  <h4>Cloud Attribution by Source</h4>
+  <table>
+    <thead><tr><th>#</th><th>Source</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_cloud_source_rows}</tbody>
+  </table>
+  <h4>Cloud Attribution by Environment</h4>
+  <table>
+    <thead><tr><th>#</th><th>Environment</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <tbody>{attr_cloud_env_rows}</tbody>
   </table>
   <h4>Optimization Recommendations</h4>
   <table>

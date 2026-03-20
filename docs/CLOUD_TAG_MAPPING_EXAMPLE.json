@@ -3,6 +3,27 @@
     "cost_center": "businessLine",
     "team": "department",
     "app": "application",
-    "project": "project"
-  }
+    "project": "project",
+    "env": "environment"
+  },
+  "rules": [
+    {
+      "target": "department",
+      "from": ["owner_team", "team"],
+      "valueMap": {
+        "plat": "platform",
+        "finops-core": "finops"
+      }
+    },
+    {
+      "target": "businessLine",
+      "tag": "cost_centre",
+      "aliases": ["cost-center", "costcenter"]
+    },
+    {
+      "target": "environment",
+      "from": ["environment", "env"],
+      "default": "shared"
+    }
+  ]
 }

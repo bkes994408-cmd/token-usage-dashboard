@@ -4,6 +4,9 @@
     "timeoutSeconds": 8,
     "retries": 1
   },
+  "history": {
+    "maxReportsPerJob": 20
+  },
   "jobs": [
     {
       "id": "finance-weekly",
@@ -14,6 +17,7 @@
       "metrics": ["total_cost", "active_models", "avg_cost_per_model"],
       "models": ["gpt-5", "o3"],
       "formats": ["json", "csv"],
+      "onlyOnChange": true,
       "allowedRoles": ["admin", "analyst"],
       "layout": {
         "title": "Finance Weekly",

@@ -12,9 +12,6 @@ import json
 import re
 import subprocess
 import sys
-import time
-import urllib.error
-import urllib.request
 import webbrowser
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -151,401 +148,6 @@ def load_payload_bundle(input_path: Optional[str], providers: List[str]) -> Dict
     return {p: normalize_provider_payload(parsed, p) for p in providers}
 
 
-def _normalize_cloud_cost_payload(parsed: Any) -> List[Dict[str, Any]]:
-    """Normalize cloud-cost records from simple normalized JSON / AWS CE / GCP billing-like payloads.
-
-    Normalized output item:
-    {
-      "date": "YYYY-MM-DD",
-      "provider": "aws|gcp|...",
-      "service": "ec2|bigquery|...",
-      "project": "optional project/account",
-      "costUSD": 12.34,
-      "currency": "USD",
-      "source": "aws_cost_explorer|gcp_billing_export|normalized"
-    }
-    """
-    out: List[Dict[str, Any]] = []
-
-    def push(
-        d: Any,
-        provider: Any,
-        service: Any,
-        cost: Any,
-        *,
-        project: Any = None,
-        currency: Any = "USD",
-        source: str = "normalized",
-        tags: Any = None,
-    ) -> None:
-        ds = str(d or "").strip()
-        if not parse_date(ds):
-            return
-        c = _safe_float(cost, default=-1.0)
-        if c < 0:
-            return
-        out.append(
-            {
-                "date": ds,
-                "provider": str(provider or "unknown").lower(),
-                "service": str(service or "all"),
-                "project": str(project or ""),
-                "costUSD": c,
-                "currency": str(currency or "USD"),
-                "source": source,
-                "tags": _normalize_cloud_tags(tags),
-            }
-        )
-
-    # Format A: already normalized list
-    if isinstance(parsed, list):
-        for row in parsed:
-            if not isinstance(row, dict):
-                continue
-            push(
-                row.get("date"),
-                row.get("provider"),
-                row.get("service"),
-                row.get("costUSD") if row.get("costUSD") is not None else row.get("cost"),
-                project=row.get("project"),
-                currency=row.get("currency", "USD"),
-                source=str(row.get("source") or "normalized"),
-                tags=row.get("tags") or row.get("labels"),
-            )
-        return sorted(out, key=lambda x: (x["date"], x["provider"], x["service"], x["project"]))
-
-    if not isinstance(parsed, dict):
-        return []
-
-    # Format B: wrapper with records
-    if isinstance(parsed.get("records"), list):
-        return _normalize_cloud_cost_payload(parsed.get("records"))
-
-    # Format C: AWS Cost Explorer-like payload
-    if isinstance(parsed.get("ResultsByTime"), list):
-        for bucket in parsed.get("ResultsByTime", []):
-            if not isinstance(bucket, dict):
-                continue
-            d = (bucket.get("TimePeriod") or {}).get("Start") if isinstance(bucket.get("TimePeriod"), dict) else bucket.get("date")
-            groups = bucket.get("Groups") if isinstance(bucket.get("Groups"), list) else []
-            if groups:
-                for g in groups:
-                    if not isinstance(g, dict):
-                        continue
-                    keys = g.get("Keys") if isinstance(g.get("Keys"), list) else []
-                    service = str(keys[0]) if keys else "all"
-                    tag_items = []
-                    for raw_key in keys[1:]:
-                        txt = str(raw_key)
-                        if '$' in txt:
-                            tk, tv = txt.split('$', 1)
-                            tag_items.append(f"{tk}={tv}")
-                        elif '=' in txt or ':' in txt:
-                            tag_items.append(txt)
-                    metrics = g.get("Metrics") if isinstance(g.get("Metrics"), dict) else {}
-                    amount_node = (metrics.get("UnblendedCost") if isinstance(metrics.get("UnblendedCost"), dict) else {})
-                    push(
-                        d,
-                        "aws",
-                        service,
-                        amount_node.get("Amount"),
-                        currency=amount_node.get("Unit") or "USD",
-                        source="aws_cost_explorer",
-                        tags=tag_items,
-                    )
-            else:
-                total = bucket.get("Total") if isinstance(bucket.get("Total"), dict) else {}
-                amount_node = total.get("UnblendedCost") if isinstance(total.get("UnblendedCost"), dict) else {}
-                push(
-                    d,
-                    "aws",
-                    "all",
-                    amount_node.get("Amount"),
-                    currency=amount_node.get("Unit") or "USD",
-                    source="aws_cost_explorer",
-                )
-
-    # Format D: GCP billing export-like daily rows
-    daily = parsed.get("daily") if isinstance(parsed.get("daily"), list) else []
-    for row in daily:
-        if not isinstance(row, dict):
-            continue
-        push(
-            row.get("date"),
-            row.get("provider") or "gcp",
-            row.get("service") or row.get("serviceName") or row.get("sku") or "all",
-            row.get("costUSD") if row.get("costUSD") is not None else row.get("cost"),
-            project=row.get("project") or row.get("projectId"),
-            currency=row.get("currency") or "USD",
-            source=str(row.get("source") or "gcp_billing_export"),
-            tags=row.get("tags") or row.get("labels"),
-        )
-
-    return sorted(out, key=lambda x: (x["date"], x["provider"], x["service"], x["project"]))
-
-
-def _normalize_cloud_tag_mapping_rules(mapping: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not mapping:
-        return []
-
-    # Backward-compatible: {"cost_center": "businessLine"}
-    if all(isinstance(v, str) for v in mapping.values()):
-        return [
-            {
-                "from": [str(k).strip().lower()],
-                "target": str(v).strip(),
-            }
-            for k, v in mapping.items()
-            if str(k).strip() and str(v).strip()
-        ]
-
-    base = mapping.get("mapping") if isinstance(mapping.get("mapping"), dict) else {}
-    explicit_rules = mapping.get("rules") if isinstance(mapping.get("rules"), list) else []
-    out: List[Dict[str, Any]] = []
-
-    for k, v in base.items():
-        kk = str(k or "").strip().lower()
-        vv = str(v or "").strip()
-        if kk and vv:
-            out.append({"from": [kk], "target": vv})
-
-    for r in explicit_rules:
-        if not isinstance(r, dict):
-            continue
-        target = str(r.get("target") or "").strip()
-        if not target:
-            continue
-        sources_raw = r.get("from") if isinstance(r.get("from"), list) else []
-        if not sources_raw and r.get("tag"):
-            sources_raw = [r.get("tag")]
-        aliases_raw = r.get("aliases") if isinstance(r.get("aliases"), list) else []
-        sources = [str(x).strip().lower() for x in [*sources_raw, *aliases_raw] if str(x).strip()]
-        if not sources:
-            continue
-        value_map_raw = r.get("valueMap") if isinstance(r.get("valueMap"), dict) else {}
-        value_map = {
-            str(k).strip().lower(): str(v).strip()
-            for k, v in value_map_raw.items()
-            if str(k).strip() and str(v).strip()
-        }
-        when_raw = r.get("when") if isinstance(r.get("when"), dict) else {}
-        when: Dict[str, Any] = {}
-        if when_raw:
-            providers = [str(x).strip().lower() for x in (when_raw.get("providers") or []) if str(x).strip()]
-            services = [str(x).strip() for x in (when_raw.get("services") or []) if str(x).strip()]
-            projects = [str(x).strip() for x in (when_raw.get("projects") or []) if str(x).strip()]
-            sources_scope = [str(x).strip() for x in (when_raw.get("sources") or []) if str(x).strip()]
-            if providers:
-                when["providers"] = providers
-            if services:
-                when["services"] = services
-            if projects:
-                when["projects"] = projects
-            if sources_scope:
-                when["sources"] = sources_scope
-
-        out.append({
-            "from": sources,
-            "target": target,
-            "default": str(r.get("default") or "").strip() or None,
-            "valueMap": value_map,
-            "match": str(r.get("match") or "exact").strip().lower() or "exact",
-            "transform": str(r.get("transform") or "").strip().lower() or None,
-            "when": when,
-        })
-    return out
-
-
-def _cloud_tag_match(raw: str, pattern: str, mode: str) -> bool:
-    v = str(raw or "")
-    p = str(pattern or "")
-    m = (mode or "exact").lower()
-    if m == "prefix":
-        return v.lower().startswith(p.lower())
-    if m == "suffix":
-        return v.lower().endswith(p.lower())
-    if m == "contains":
-        return p.lower() in v.lower()
-    if m == "regex":
-        try:
-            return re.search(p, v, flags=re.IGNORECASE) is not None
-        except re.error:
-            return False
-    return v.lower() == p.lower()
-
-
-def _transform_cloud_tag_value(value: str, mode: Optional[str]) -> str:
-    if not mode:
-        return value
-    m = str(mode).lower()
-    if m == "lower":
-        return value.lower()
-    if m == "upper":
-        return value.upper()
-    if m == "title":
-        return value.title()
-    return value
-
-
-def _cloud_rule_scope_match(row: Dict[str, Any], when: Optional[Dict[str, Any]]) -> bool:
-    if not isinstance(when, dict) or not when:
-        return True
-    provider = str(row.get("provider") or "").strip().lower()
-    service = str(row.get("service") or "").strip()
-    project = str(row.get("project") or "").strip()
-    source = str(row.get("source") or "").strip()
-
-    providers = when.get("providers") if isinstance(when.get("providers"), list) else []
-    services = when.get("services") if isinstance(when.get("services"), list) else []
-    projects = when.get("projects") if isinstance(when.get("projects"), list) else []
-    sources = when.get("sources") if isinstance(when.get("sources"), list) else []
-
-    if providers and provider not in {str(x).strip().lower() for x in providers}:
-        return False
-    if services and service not in {str(x).strip() for x in services}:
-        return False
-    if projects and project not in {str(x).strip() for x in projects}:
-        return False
-    if sources and source not in {str(x).strip() for x in sources}:
-        return False
-    return True
-
-
-def _apply_cloud_tag_mapping(rows: List[Dict[str, Any]], mapping: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    rules = _normalize_cloud_tag_mapping_rules(mapping)
-    derive_rules = mapping.get("derive") if isinstance(mapping, dict) and isinstance(mapping.get("derive"), list) else []
-    if not rules and not derive_rules:
-        return rows
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        tags = _normalize_cloud_tags(row.get("tags"))
-        mapped = dict(row)
-        mapped["tags"] = tags
-        for rule in rules:
-            if not _cloud_rule_scope_match(mapped, rule.get("when")):
-                continue
-            target = str(rule.get("target") or "").strip()
-            if not target:
-                continue
-            value: Optional[str] = None
-            for src in rule.get("from") or []:
-                if src in tags and tags[src]:
-                    value = tags[src]
-                    break
-            if value is None:
-                value = rule.get("default")
-            if not value:
-                continue
-            value = str(value).strip()
-            value_map = rule.get("valueMap") if isinstance(rule.get("valueMap"), dict) else {}
-            transformed: Optional[str] = None
-            if value_map:
-                lowered = value.lower()
-                transformed = value_map.get(lowered)
-                if transformed is None and "*" in value_map:
-                    transformed = value_map.get("*")
-                if transformed is None:
-                    match_mode = str(rule.get("match") or "exact").strip().lower() or "exact"
-                    for pattern, mapped_value in value_map.items():
-                        if pattern == "*":
-                            continue
-                        if _cloud_tag_match(value, str(pattern), match_mode):
-                            transformed = str(mapped_value)
-                            break
-            final_value = transformed if transformed else value
-            mapped[target] = _transform_cloud_tag_value(final_value, rule.get("transform"))
-
-        for d in derive_rules:
-            if not isinstance(d, dict):
-                continue
-            target = str(d.get("target") or "").strip()
-            template = str(d.get("template") or "").strip()
-            if not target or not template:
-                continue
-            try:
-                fmt_ctx = dict(mapped)
-                fmt_ctx["_tags"] = tags
-                rendered = template.format(**fmt_ctx)
-            except Exception:
-                continue
-            rendered = str(rendered).strip()
-            if rendered:
-                mapped[target] = rendered
-        out.append(mapped)
-    return out
-
-
-def _extract_cloud_mapped_dimensions(row: Dict[str, Any]) -> Dict[str, str]:
-    reserved = {"date", "provider", "service", "project", "costUSD", "currency", "source", "tags"}
-    out: Dict[str, str] = {}
-    for k, v in row.items():
-        key = str(k or "").strip()
-        if not key or key in reserved:
-            continue
-        if isinstance(v, (str, int, float)):
-            value = str(v).strip()
-            if value:
-                out[key] = value
-    return out
-
-
-def load_cloud_cost_rows(path: Optional[str], tag_mapping: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    if not path:
-        return []
-    raw = Path(path).read_text(encoding="utf-8")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse cloud cost JSON: {exc}")
-    rows = _normalize_cloud_cost_payload(parsed)
-    return _apply_cloud_tag_mapping(rows, tag_mapping)
-
-
-
-
-def _normalize_cloud_tags(raw_tags: Any) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    if isinstance(raw_tags, dict):
-        for k, v in raw_tags.items():
-            key = str(k or '').strip().lower()
-            if not key:
-                continue
-            val = str(v or '').strip()
-            if val:
-                out[key] = val
-    elif isinstance(raw_tags, list):
-        for item in raw_tags:
-            if isinstance(item, dict):
-                key = str(item.get('key') or item.get('name') or '').strip().lower()
-                val = str(item.get('value') or '').strip()
-                if key and val:
-                    out[key] = val
-            elif isinstance(item, str):
-                if '=' in item:
-                    k, v = item.split('=', 1)
-                elif ':' in item:
-                    k, v = item.split(':', 1)
-                else:
-                    continue
-                key = k.strip().lower()
-                val = v.strip()
-                if key and val:
-                    out[key] = val
-    return out
-
-
-def _load_cloud_tag_mapping_config(path: Optional[str]) -> Dict[str, Any]:
-    if not path:
-        return {}
-    raw = Path(path).read_text(encoding='utf-8')
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise RuntimeError('Cloud tag mapping config must be a JSON object.')
-    rules = _normalize_cloud_tag_mapping_rules(parsed)
-    if not rules:
-        raise RuntimeError('Cloud tag mapping config must include valid mapping rules.')
-    return parsed
-
 def parse_date(value: str) -> Optional[date]:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
@@ -673,6 +275,137 @@ def _safe_int(value: Any, default: int = 0, minimum: Optional[int] = None) -> in
     return out
 
 
+
+
+def _normalize_tag_key(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    return re.sub(r"[^a-z0-9_.:-]+", "_", raw)
+
+
+def _flatten_tags(value: Any, prefix: str = "") -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if isinstance(value, dict):
+        for k, v in value.items():
+            nk = _normalize_tag_key(k)
+            if not nk:
+                continue
+            full = f"{prefix}.{nk}" if prefix else nk
+            if isinstance(v, dict):
+                out.update(_flatten_tags(v, full))
+            elif isinstance(v, (list, tuple, set)):
+                vals = [str(x).strip() for x in v if str(x).strip()]
+                if vals:
+                    out[full] = "|".join(vals[:8])
+            elif v is None:
+                continue
+            else:
+                s = str(v).strip()
+                if s:
+                    out[full] = s
+    return out
+
+
+def _extract_call_tags(call: Dict[str, Any], row: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    raw_sources = [
+        call.get("tags"),
+        call.get("cloudTags"),
+        call.get("cloudCostTags"),
+        call.get("labels"),
+        call.get("awsTags"),
+        call.get("gcpLabels"),
+        call.get("azureTags"),
+    ]
+    if isinstance(row, dict):
+        raw_sources.extend([
+            row.get("tags"),
+            row.get("cloudTags"),
+            row.get("cloudCostTags"),
+            row.get("labels"),
+        ])
+    for src in raw_sources:
+        if isinstance(src, dict):
+            out.update(_flatten_tags(src))
+    return out
+
+
+def _apply_tag_aliases(tags: Dict[str, str], alias_map: Optional[Dict[str, str]]) -> Dict[str, str]:
+    if not tags:
+        return {}
+    normalized_aliases: Dict[str, str] = {}
+    if isinstance(alias_map, dict):
+        for k, v in alias_map.items():
+            nk = _normalize_tag_key(k)
+            nv = _normalize_tag_key(v)
+            if nk and nv:
+                normalized_aliases[nk] = nv
+
+    out: Dict[str, str] = {}
+    for k, v in tags.items():
+        nk = _normalize_tag_key(k)
+        if not nk:
+            continue
+        mapped = normalized_aliases.get(nk, nk)
+        if mapped.startswith("tags."):
+            mapped = mapped[5:]
+        out[mapped] = str(v)
+    return out
+
+
+def build_cloud_tag_mapping(
+    rows: List[Dict[str, Any]],
+    normalized_records: Optional[List[Dict[str, Any]]] = None,
+    tag_aliases: Optional[Dict[str, str]] = None,
+    top_n: int = 10,
+) -> Dict[str, Any]:
+    records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
+    if not records:
+        return {"available": False, "reason": "No call-level payload (llmCalls/apiCalls/requests/events)."}
+
+    tag_key_usage: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "totalTokens": 0.0, "calls": 0.0})
+    tag_value_usage: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"costUSD": 0.0, "totalTokens": 0.0, "calls": 0.0}))
+
+    tagged_calls = 0
+    for r in records:
+        tags = _apply_tag_aliases(r.get("tags") if isinstance(r.get("tags"), dict) else {}, tag_aliases)
+        if tags:
+            tagged_calls += 1
+        c = _safe_float(r.get("costUSD"))
+        t = _safe_float(r.get("totalTokens"))
+        for k, v in tags.items():
+            tag_key_usage[k]["costUSD"] += c
+            tag_key_usage[k]["totalTokens"] += t
+            tag_key_usage[k]["calls"] += 1.0
+            tag_value_usage[k][str(v)]["costUSD"] += c
+            tag_value_usage[k][str(v)]["totalTokens"] += t
+            tag_value_usage[k][str(v)]["calls"] += 1.0
+
+    ranked_keys = sorted(tag_key_usage.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+    by_tag = []
+    for k, agg in ranked_keys:
+        vals = sorted(tag_value_usage.get(k, {}).items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+        by_tag.append({
+            "tag": k,
+            "costUSD": agg["costUSD"],
+            "totalTokens": agg["totalTokens"],
+            "calls": int(agg["calls"]),
+            "values": [
+                {"value": vv, "costUSD": va["costUSD"], "totalTokens": va["totalTokens"], "calls": int(va["calls"])}
+                for vv, va in vals
+            ],
+        })
+
+    total_calls = len(records)
+    return {
+        "available": True,
+        "totalCalls": total_calls,
+        "taggedCalls": tagged_calls,
+        "tagCoveragePct": (tagged_calls / total_calls * 100.0) if total_calls > 0 else 0.0,
+        "tagKeyCount": len(tag_key_usage),
+        "byTag": by_tag,
+    }
 def _normalize_call_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build normalized per-call records from row-level payloads.
 
@@ -696,6 +429,7 @@ def _normalize_call_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 model = c.get("modelName") or c.get("model") or "unknown"
                 model_type = c.get("modelType") or str(model).split("-")[0]
                 task = c.get("useCase") or c.get("task") or c.get("scenario") or "unspecified"
+                tags = _extract_call_tags(c, row=row)
                 out.append(
                     {
                         "date": day,
@@ -706,11 +440,16 @@ def _normalize_call_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         "project": str(c.get("projectId") or c.get("project") or "unknown"),
                         "session": str(c.get("sessionId") or c.get("conversationId") or "unknown"),
                         "workflow": str(c.get("workflowId") or c.get("flowId") or task),
-                        "endpoint": str(c.get("endpoint") or c.get("apiEndpoint") or c.get("route") or "unknown"),
-                        "useCase": str(c.get("useCase") or c.get("task") or c.get("scenario") or "unknown"),
                         "department": str(c.get("department") or c.get("dept") or c.get("team") or "unknown"),
                         "application": str(c.get("application") or c.get("app") or c.get("service") or "unknown"),
                         "businessLine": str(c.get("businessLine") or c.get("bizLine") or c.get("costCenter") or "unknown"),
+                        "cloudProvider": str(c.get("cloudProvider") or c.get("provider") or row.get("cloudProvider") or row.get("provider") or "unknown"),
+                        "cloudService": str(c.get("cloudService") or c.get("serviceName") or row.get("cloudService") or "unknown"),
+                        "region": str(c.get("region") or row.get("region") or "unknown"),
+                        "environment": str(c.get("environment") or c.get("env") or row.get("environment") or "unknown"),
+                        "operation": str(c.get("operation") or c.get("operationName") or c.get("apiName") or "unknown"),
+                        "resource": str(c.get("resourceId") or c.get("resource") or c.get("cluster") or "unknown"),
+                        "tags": tags,
                         "promptTokens": prompt_tokens,
                         "completionTokens": completion_tokens,
                         "totalTokens": total_tokens,
@@ -849,8 +588,8 @@ def build_cost_attribution(
     rows: List[Dict[str, Any]],
     top_n: int = 8,
     normalized_records: Optional[List[Dict[str, Any]]] = None,
-    cloud_rows: Optional[List[Dict[str, Any]]] = None,
-    granularity: str = "standard",
+    extra_dimensions: Optional[List[str]] = None,
+    tag_aliases: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
     day_total = sum(day_total_cost(r) for r in rows)
@@ -861,9 +600,20 @@ def build_cost_attribution(
             "dimensions": {},
             "unallocatedCostUSD": day_total,
             "totalAttributedCostUSD": 0.0,
+            "supportedDimensions": [],
         }
 
     total_cost = sum(_safe_float(r.get("costUSD")) for r in records)
+
+    base_dimensions = [
+        "project", "user", "department", "application", "businessLine",
+        "model", "task", "workflow", "session",
+        "cloudProvider", "cloudService", "region", "environment", "operation", "resource",
+    ]
+    dims: List[str] = []
+    for d in base_dimensions + (extra_dimensions or []):
+        if d not in dims:
+            dims.append(d)
 
     def _aggregate(key: str) -> List[Dict[str, Any]]:
         agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "totalTokens": 0.0, "count": 0.0})
@@ -884,122 +634,40 @@ def build_cost_attribution(
             for k, v in ranked
         ]
 
-    dimensions = {
-        "project": _aggregate("project"),
-        "user": _aggregate("user"),
-        "department": _aggregate("department"),
-        "application": _aggregate("application"),
-        "businessLine": _aggregate("businessLine"),
-    }
+    dimensions = {d: _aggregate(d) for d in dims}
 
-    mode = (granularity or "standard").lower()
-    if mode in {"detailed", "fine", "fine_grained"}:
-        dimensions["model"] = _aggregate("model")
-        dimensions["task"] = _aggregate("task")
-        dimensions["workflow"] = _aggregate("workflow")
-        dimensions["session"] = _aggregate("session")
-        dimensions["endpoint"] = _aggregate("endpoint")
-        dimensions["useCase"] = _aggregate("useCase")
+    # Expand dimensions from cloud cost tags: tag.<key>
+    tag_agg: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"costUSD": 0.0, "totalTokens": 0.0, "count": 0.0}))
+    seen_tag_keys = set()
+    for r in records:
+        tags = _apply_tag_aliases(r.get("tags") if isinstance(r.get("tags"), dict) else {}, tag_aliases)
+        for tk, tv in tags.items():
+            seen_tag_keys.add(tk)
+            node = tag_agg[tk][str(tv)]
+            node["costUSD"] += _safe_float(r.get("costUSD"))
+            node["totalTokens"] += _safe_float(r.get("totalTokens"))
+            node["count"] += 1.0
 
-    cloud = cloud_rows or []
-    if cloud:
-        cloud_total = sum(_safe_float(x.get("costUSD")) for x in cloud)
-
-        def _rank_cloud(agg: Dict[str, Dict[str, float]]) -> List[Dict[str, Any]]:
-            return [
-                {
-                    "key": k,
-                    "costUSD": v["costUSD"],
-                    "totalTokens": 0.0,
-                    "count": int(v["count"]),
-                    "sharePct": (v["costUSD"] / cloud_total * 100.0) if cloud_total > 0 else 0.0,
-                }
-                for k, v in sorted(agg.items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
-            ]
-
-        cloud_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_service_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_tag_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_tag_key_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_project_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_source_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_provider_service_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_project_service_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_env_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_region_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        cloud_account_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
-        mapped_dimension_aggs: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"costUSD": 0.0, "count": 0.0}))
-        for r in cloud:
-            cost = _safe_float(r.get("costUSD"))
-            p = str(r.get("provider") or "unknown").lower()
-            s = str(r.get("service") or "all")
-            cloud_agg[p]["costUSD"] += cost
-            cloud_agg[p]["count"] += 1
-            key = f"{p}:{s}"
-            cloud_service_agg[key]["costUSD"] += cost
-            cloud_service_agg[key]["count"] += 1
-            cproj = str(r.get("project") or "unknown")
-            cloud_project_agg[cproj]["costUSD"] += cost
-            cloud_project_agg[cproj]["count"] += 1
-            csrc = str(r.get("source") or "unknown")
-            cloud_source_agg[csrc]["costUSD"] += cost
-            cloud_source_agg[csrc]["count"] += 1
-            ps = f"{p}:{s}"
-            cloud_provider_service_agg[ps]["costUSD"] += cost
-            cloud_provider_service_agg[ps]["count"] += 1
-            proj_service = f"{cproj}:{s}"
-            cloud_project_service_agg[proj_service]["costUSD"] += cost
-            cloud_project_service_agg[proj_service]["count"] += 1
-            if r.get("environment"):
-                env = str(r.get("environment"))
-                cloud_env_agg[env]["costUSD"] += cost
-                cloud_env_agg[env]["count"] += 1
-            if r.get("region"):
-                region = str(r.get("region"))
-                cloud_region_agg[region]["costUSD"] += cost
-                cloud_region_agg[region]["count"] += 1
-            account = r.get("accountId") or r.get("subscriptionId") or r.get("billingAccount")
-            if account:
-                acct = str(account)
-                cloud_account_agg[acct]["costUSD"] += cost
-                cloud_account_agg[acct]["count"] += 1
-            tags = _normalize_cloud_tags(r.get("tags"))
-            for tk, tv in tags.items():
-                tkey = f"{tk}={tv}"
-                cloud_tag_agg[tkey]["costUSD"] += cost
-                cloud_tag_agg[tkey]["count"] += 1
-                cloud_tag_key_agg[tk]["costUSD"] += cost
-                cloud_tag_key_agg[tk]["count"] += 1
-
-            mapped_dims = _extract_cloud_mapped_dimensions(r)
-            for mk, mv in mapped_dims.items():
-                mapped_dimension_aggs[mk][mv]["costUSD"] += cost
-                mapped_dimension_aggs[mk][mv]["count"] += 1
-
-        dimensions["cloudProvider"] = _rank_cloud(cloud_agg)
-        dimensions["cloudService"] = _rank_cloud(cloud_service_agg)
-        dimensions["cloudTag"] = _rank_cloud(cloud_tag_agg)
-        dimensions["cloudTagKey"] = _rank_cloud(cloud_tag_key_agg)
-        dimensions["cloudProject"] = _rank_cloud(cloud_project_agg)
-        dimensions["cloudSource"] = _rank_cloud(cloud_source_agg)
-        dimensions["cloudProviderService"] = _rank_cloud(cloud_provider_service_agg)
-        dimensions["cloudProjectService"] = _rank_cloud(cloud_project_service_agg)
-        if cloud_env_agg:
-            dimensions["cloudEnvironment"] = _rank_cloud(cloud_env_agg)
-        if cloud_region_agg:
-            dimensions["cloudRegion"] = _rank_cloud(cloud_region_agg)
-        if cloud_account_agg:
-            dimensions["cloudAccount"] = _rank_cloud(cloud_account_agg)
-        for mk in sorted(mapped_dimension_aggs.keys()):
-            dim_key = f"cloudMapped:{mk}"
-            dimensions[dim_key] = _rank_cloud(mapped_dimension_aggs[mk])
+    for tk in sorted(seen_tag_keys):
+        dim_key = f"tag.{tk}"
+        ranked = sorted(tag_agg[tk].items(), key=lambda kv: kv[1]["costUSD"], reverse=True)[:top_n]
+        dimensions[dim_key] = [
+            {
+                "key": k,
+                "costUSD": v["costUSD"],
+                "totalTokens": v["totalTokens"],
+                "count": int(v["count"]),
+                "sharePct": (v["costUSD"] / total_cost * 100.0) if total_cost > 0 else 0.0,
+            }
+            for k, v in ranked
+        ]
 
     return {
         "available": True,
-        "granularity": mode,
         "totalAttributedCostUSD": total_cost,
         "unallocatedCostUSD": max(0.0, day_total - total_cost),
         "dimensions": dimensions,
+        "supportedDimensions": sorted(dimensions.keys()),
     }
 
 
@@ -1010,82 +678,43 @@ def _prompt_template_signature(prompt: str) -> str:
     return " ".join(tokens[:24])
 
 
-def _prompt_suggestion_actions(
-    sample_prompt_tokens: float,
-    sample_completion_tokens: float,
-    *,
-    current_model: str,
-    candidate_model: Optional[str],
-    calls: int,
-    total_cost_usd: float,
-    config: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    cfg = config if isinstance(config, dict) else {}
-    compression_threshold = _safe_float(cfg.get("compressionThresholdPromptTokens"), default=700.0)
-    context_refactor_ratio = _safe_float(cfg.get("contextRefactorRatio"), default=1.5)
-    target_reduction_pct = _safe_float(cfg.get("targetPromptTokenReductionPct"), default=20.0)
-    expected_cost_reduction_pct = _safe_float(cfg.get("expectedCostReductionPct"), default=10.0)
-    ab_cfg = cfg.get("abTesting") if isinstance(cfg.get("abTesting"), dict) else {}
-    variant_b_ratio = _safe_float(ab_cfg.get("trafficSplitB"), default=0.2)
-    variant_b_ratio = min(0.9, max(0.05, variant_b_ratio))
-
-    savings_from_prompt = total_cost_usd * (target_reduction_pct / 100.0)
+def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_tokens: float) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
-    if sample_prompt_tokens >= compression_threshold:
+    if sample_prompt_tokens >= 700:
         actions.append(
             {
                 "type": "compression",
-                "priority": "high" if sample_prompt_tokens >= compression_threshold * 1.2 else "medium",
                 "title": "Compress long instructions and remove repeated context",
-                "expectedPromptTokenReductionPct": target_reduction_pct,
-                "estimatedMonthlySavingsUSD": round(savings_from_prompt, 4),
+                "expectedPromptTokenReductionPct": 20.0,
                 "actions": [
                     "Extract stable policy text into a reusable system preset.",
                     "Summarize long conversation history before sending to model.",
                 ],
             }
         )
-    if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * context_refactor_ratio:
+    if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * 1.5:
         actions.append(
             {
                 "type": "context_refactor",
-                "priority": "high" if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * (context_refactor_ratio + 0.4) else "medium",
                 "title": "Move verbose context into retrieval/cache",
-                "expectedPromptTokenReductionPct": max(8.0, target_reduction_pct * 0.75),
-                "estimatedMonthlySavingsUSD": round(total_cost_usd * max(8.0, target_reduction_pct * 0.75) / 100.0, 4),
+                "expectedPromptTokenReductionPct": 15.0,
                 "actions": [
                     "Replace full inline docs with retrieval IDs or snippets.",
                     "Use semantic cache for repeated context blocks.",
                 ],
             }
         )
-
-    model_action = {
-        "type": "model_rightsizing",
-        "priority": "medium",
-        "title": "A/B test lower-cost model on this prompt family",
-        "expectedCostReductionPct": expected_cost_reduction_pct,
-        "actions": [
-            f"Route {int(variant_b_ratio * 100)}% traffic to candidate model and track quality score.",
-            "Promote candidate only if quality drop <= 2%.",
-        ],
-    }
-    if candidate_model and candidate_model != current_model:
-        model_action["candidateModel"] = candidate_model
-    actions.append(model_action)
-
-    if calls >= 30 and sample_prompt_tokens >= max(1.0, compression_threshold * 0.7):
-        actions.append(
-            {
-                "type": "template_standardization",
-                "priority": "medium",
-                "title": "Standardize this prompt family with versioned templates",
-                "actions": [
-                    "Define canonical template sections (goal, constraints, output schema).",
-                    "Add lint checks for prompt max tokens and required fields.",
-                ],
-            }
-        )
+    actions.append(
+        {
+            "type": "model_rightsizing",
+            "title": "A/B test lower-cost model on this prompt family",
+            "expectedCostReductionPct": 10.0,
+            "actions": [
+                "Route 20% traffic to candidate model and track quality score.",
+                "Promote candidate only if quality drop <= 2%.",
+            ],
+        }
+    )
     return actions
 
 
@@ -1095,51 +724,10 @@ def build_prompt_optimization_engine(
     *,
     normalized_records: Optional[List[Dict[str, Any]]] = None,
     max_prompt_families: int = 8,
-    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    cfg = config if isinstance(config, dict) else {}
-    family_limit = int(cfg.get("maxPromptFamilies") or max_prompt_families or 8)
-    family_limit = max(1, family_limit)
-    min_family_calls = max(1, int(_safe_float(cfg.get("minFamilyCalls"), default=1.0)))
-    min_family_cost = max(0.0, _safe_float(cfg.get("minFamilyCostUSD"), default=0.0))
-
-    ranking_weights = cfg.get("rankingWeights") if isinstance(cfg.get("rankingWeights"), dict) else {}
-    weight_cost = max(0.0, _safe_float(ranking_weights.get("costUSD"), default=1.0))
-    weight_prompt = max(0.0, _safe_float(ranking_weights.get("promptTokens"), default=0.35))
-    weight_calls = max(0.0, _safe_float(ranking_weights.get("calls"), default=0.2))
-    weight_ratio = max(0.0, _safe_float(ranking_weights.get("promptToCompletionRatio"), default=0.25))
-
-    ab_cfg = cfg.get("abTesting") if isinstance(cfg.get("abTesting"), dict) else {}
-    traffic_split_b = min(0.9, max(0.05, _safe_float(ab_cfg.get("trafficSplitB"), default=0.5)))
-    criteria = {
-        "costReductionPctMin": _safe_float(ab_cfg.get("costReductionPctMin"), default=10.0),
-        "qualityDropPctMax": _safe_float(ab_cfg.get("qualityDropPctMax"), default=2.0),
-        "latencyIncreasePctMax": _safe_float(ab_cfg.get("latencyIncreasePctMax"), default=10.0),
-    }
-    evaluation_days = max(1, int(_safe_float(ab_cfg.get("evaluationDays"), default=7.0)))
-    min_sample_size = max(20, int(_safe_float(ab_cfg.get("minimumSampleSize"), default=100.0)))
-    rollout_stages_raw = ab_cfg.get("rolloutStages") if isinstance(ab_cfg.get("rolloutStages"), list) else [0.1, 0.25, 0.5]
-    rollout_stages: List[float] = []
-    for item in rollout_stages_raw:
-        if isinstance(item, (int, float)):
-            v = min(1.0, max(0.01, float(item)))
-            rollout_stages.append(v)
-    if not rollout_stages:
-        rollout_stages = [0.1, 0.25, 0.5]
-
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
     if not records:
-        return {
-            "available": False,
-            "highConsumptionPrompts": [],
-            "abTests": [],
-            "config": {
-                "maxPromptFamilies": family_limit,
-                "minFamilyCalls": min_family_calls,
-                "minFamilyCostUSD": min_family_cost,
-                "abTesting": criteria,
-            },
-        }
+        return {"available": False, "highConsumptionPrompts": [], "abTests": []}
 
     families: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -1165,27 +753,11 @@ def build_prompt_optimization_engine(
         node["models"][str(r.get("model") or "unknown")] += 1
         node["projects"][str(r.get("project") or "unknown")] += 1
 
-    scored_families: List[Dict[str, Any]] = []
-    for item in families.values():
-        calls = int(item["calls"])
-        if calls < min_family_calls or _safe_float(item["totalCostUSD"]) < min_family_cost:
-            continue
-        avg_completion_tokens = _safe_float(item["totalCompletionTokens"]) / max(1, calls)
-        avg_prompt_tokens = _safe_float(item["totalPromptTokens"]) / max(1, calls)
-        ratio = (avg_prompt_tokens / avg_completion_tokens) if avg_completion_tokens > 0 else 0.0
-        item["_rankScore"] = (
-            weight_cost * _safe_float(item["totalCostUSD"])
-            + weight_prompt * _safe_float(item["totalPromptTokens"])
-            + weight_calls * calls
-            + weight_ratio * ratio
-        )
-        scored_families.append(item)
-
     ranked = sorted(
-        scored_families,
-        key=lambda x: (_safe_float(x.get("_rankScore")), x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
+        families.values(),
+        key=lambda x: (x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
         reverse=True,
-    )[:family_limit]
+    )[:max_prompt_families]
 
     by_model = pattern_analysis.get("dimensions", {}).get("byModel", []) if isinstance(pattern_analysis, dict) else []
     cheap_model = None
@@ -1205,19 +777,10 @@ def build_prompt_optimization_engine(
         avg_completion_tokens = item["totalCompletionTokens"] / max(1, calls)
         top_model = sorted(item["models"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["models"] else "unknown"
         top_project = sorted(item["projects"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["projects"] else "unknown"
-        suggestions = _prompt_suggestion_actions(
-            avg_prompt_tokens,
-            avg_completion_tokens,
-            current_model=top_model,
-            candidate_model=cheap_model,
-            calls=calls,
-            total_cost_usd=_safe_float(item["totalCostUSD"]),
-            config=cfg,
-        )
+        suggestions = _prompt_suggestion_actions(avg_prompt_tokens, avg_completion_tokens)
         prompt_families.append(
             {
                 "rank": idx,
-                "rankScore": _safe_float(item.get("_rankScore")),
                 "templateSignature": item["templateSignature"],
                 "samplePrompt": item["samplePrompt"],
                 "calls": calls,
@@ -1244,45 +807,22 @@ def build_prompt_optimization_engine(
                 "testId": f"prompt-ab-{idx:02d}",
                 "scope": item["templateSignature"],
                 "goal": "reduce_cost_with_quality_guardrail",
-                "trafficSplit": {"A": round(1.0 - traffic_split_b, 3), "B": round(traffic_split_b, 3)},
+                "trafficSplit": {"A": 0.5, "B": 0.5},
                 "variants": [
                     {"name": "A-control", "strategy": "status_quo", "model": top_model},
                     variant_b,
                 ],
-                "successCriteria": criteria,
-                "metrics": ["avgCostPerCallUSD", "qualityScore", "avgLatencyMs", "promptTokens"],
-                "executionPlan": {
-                    "evaluationDays": evaluation_days,
-                    "minimumSampleSize": min_sample_size,
-                    "rolloutStages": [round(x, 3) for x in rollout_stages],
+                "successCriteria": {
+                    "costReductionPctMin": 10.0,
+                    "qualityDropPctMax": 2.0,
+                    "latencyIncreasePctMax": 10.0,
                 },
+                "metrics": ["avgCostPerCallUSD", "qualityScore", "avgLatencyMs", "promptTokens"],
             }
         )
 
     return {
         "available": True,
-        "engineVersion": "1.1",
-        "spec": {
-            "recommendationTypes": ["compression", "context_refactor", "model_rightsizing", "template_standardization"],
-            "ranking": "weighted(costUSD,promptTokens,calls,promptToCompletionRatio)",
-        },
-        "config": {
-            "maxPromptFamilies": family_limit,
-            "minFamilyCalls": min_family_calls,
-            "minFamilyCostUSD": min_family_cost,
-            "rankingWeights": {
-                "costUSD": weight_cost,
-                "promptTokens": weight_prompt,
-                "calls": weight_calls,
-                "promptToCompletionRatio": weight_ratio,
-            },
-            "abTesting": {
-                **criteria,
-                "evaluationDays": evaluation_days,
-                "minimumSampleSize": min_sample_size,
-                "rolloutStages": [round(x, 3) for x in rollout_stages],
-            },
-        },
         "highConsumptionPrompts": prompt_families,
         "abTests": ab_tests,
     }
@@ -1294,18 +834,10 @@ def build_optimization_recommendations(
     attribution: Dict[str, Any],
     max_items: int = 6,
     normalized_records: Optional[List[Dict[str, Any]]] = None,
-    cloud_cost_view: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
-    cloud_enabled = bool(isinstance(cloud_cost_view, dict) and cloud_cost_view.get("cloudIntegrationEnabled"))
-    hooks = {
-        "cloudCostManagement": {
-            "awsCostExplorer": {"supported": True, "status": "connected" if cloud_enabled else "ready"},
-            "gcpBilling": {"supported": True, "status": "connected" if cloud_enabled else "ready"},
-        }
-    }
     if not records:
-        return {"available": False, "recommendations": [], "integrationHooks": hooks}
+        return {"available": False, "recommendations": []}
 
     recs: List[Dict[str, Any]] = []
 
@@ -1385,7 +917,12 @@ def build_optimization_recommendations(
     return {
         "available": True,
         "recommendations": recs[:max_items],
-        "integrationHooks": hooks,
+        "integrationHooks": {
+            "cloudCostManagement": {
+                "awsCostExplorer": {"supported": False, "status": "placeholder"},
+                "gcpBilling": {"supported": False, "status": "placeholder"},
+            }
+        },
     }
 
 
@@ -1419,84 +956,6 @@ def _load_cost_control_config(path: Optional[str]) -> Dict[str, Any]:
     return parsed
 
 
-def _normalize_budget_config(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    allowed_dimensions = {"project", "department", "user", "application", "businessLine", "model"}
-    allowed_actions = {"warn", "degrade", "switch_model", "stop_calls"}
-
-    allocations: List[Dict[str, Any]] = []
-    for idx, item in enumerate(parsed.get("allocations") if isinstance(parsed.get("allocations"), list) else [], start=1):
-        if not isinstance(item, dict):
-            continue
-        dimension = str(item.get("dimension") or "project")
-        if dimension not in allowed_dimensions:
-            continue
-        key = str(item.get("key") or "unknown")
-        budget = _safe_float(item.get("budgetUSD"), default=0.0)
-        if budget <= 0:
-            continue
-        allocations.append({
-            "id": str(item.get("id") or f"alloc-{idx}"),
-            "dimension": dimension,
-            "key": key,
-            "budgetUSD": budget,
-        })
-
-    permissions_in = parsed.get("permissions") if isinstance(parsed.get("permissions"), dict) else {}
-    default_role = str(permissions_in.get("defaultRole") or "viewer")
-
-    roles: Dict[str, Dict[str, Any]] = {}
-    for role, policy in (permissions_in.get("roles") if isinstance(permissions_in.get("roles"), dict) else {}).items():
-        if not isinstance(policy, dict):
-            continue
-        node: Dict[str, Any] = {}
-        allowed_models = policy.get("allowedModels") if isinstance(policy.get("allowedModels"), list) else None
-        if isinstance(allowed_models, list):
-            node["allowedModels"] = sorted({str(x) for x in allowed_models if str(x).strip()})
-        if isinstance(policy.get("maxCostPerCallUSD"), (int, float)):
-            node["maxCostPerCallUSD"] = max(0.0, float(policy.get("maxCostPerCallUSD")))
-        roles[str(role)] = node
-
-    users: Dict[str, Dict[str, Any]] = {}
-    for user, policy in (permissions_in.get("users") if isinstance(permissions_in.get("users"), dict) else {}).items():
-        if not isinstance(policy, dict):
-            continue
-        node: Dict[str, Any] = {}
-        if policy.get("role") is not None:
-            node["role"] = str(policy.get("role"))
-        allowed_models = policy.get("allowedModels") if isinstance(policy.get("allowedModels"), list) else None
-        if isinstance(allowed_models, list):
-            node["allowedModels"] = sorted({str(x) for x in allowed_models if str(x).strip()})
-        if isinstance(policy.get("maxCostPerCallUSD"), (int, float)):
-            node["maxCostPerCallUSD"] = max(0.0, float(policy.get("maxCostPerCallUSD")))
-        users[str(user)] = node
-
-    overage_policies: List[Dict[str, Any]] = []
-    for item in parsed.get("overagePolicies") if isinstance(parsed.get("overagePolicies"), list) else []:
-        if not isinstance(item, dict):
-            continue
-        threshold = max(0.0, _safe_float(item.get("thresholdPct"), default=100.0))
-        action = str(item.get("action") or "warn")
-        if action not in allowed_actions:
-            action = "warn"
-        overage_policies.append({
-            "thresholdPct": threshold,
-            "action": action,
-            "routeToModel": item.get("routeToModel"),
-            "message": str(item.get("message") or "").strip(),
-        })
-    overage_policies.sort(key=lambda x: _safe_float(x.get("thresholdPct")))
-
-    return {
-        "allocations": allocations,
-        "permissions": {
-            "defaultRole": default_role,
-            "roles": roles,
-            "users": users,
-        },
-        "overagePolicies": overage_policies,
-    }
-
-
 def _load_budget_config(path: Optional[str]) -> Dict[str, Any]:
     if not path:
         return {}
@@ -1504,63 +963,7 @@ def _load_budget_config(path: Optional[str]) -> Dict[str, Any]:
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("Budget config must be a JSON object.")
-    return _normalize_budget_config(parsed)
-
-
-def _normalize_prompt_optimization_config(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    if parsed.get("maxPromptFamilies") is not None:
-        out["maxPromptFamilies"] = max(1, int(_safe_float(parsed.get("maxPromptFamilies"), default=8.0)))
-    if parsed.get("minFamilyCalls") is not None:
-        out["minFamilyCalls"] = max(1, int(_safe_float(parsed.get("minFamilyCalls"), default=1.0)))
-    if isinstance(parsed.get("minFamilyCostUSD"), (int, float)):
-        out["minFamilyCostUSD"] = max(0.0, float(parsed.get("minFamilyCostUSD")))
-
-    for key in ("compressionThresholdPromptTokens", "contextRefactorRatio", "targetPromptTokenReductionPct", "expectedCostReductionPct"):
-        if isinstance(parsed.get(key), (int, float)):
-            out[key] = float(parsed.get(key))
-
-    rw_in = parsed.get("rankingWeights") if isinstance(parsed.get("rankingWeights"), dict) else {}
-    if rw_in:
-        rw_out: Dict[str, float] = {}
-        for key in ("costUSD", "promptTokens", "calls", "promptToCompletionRatio"):
-            if isinstance(rw_in.get(key), (int, float)):
-                rw_out[key] = max(0.0, float(rw_in.get(key)))
-        if rw_out:
-            out["rankingWeights"] = rw_out
-
-    ab_in = parsed.get("abTesting") if isinstance(parsed.get("abTesting"), dict) else {}
-    if ab_in:
-        ab_out: Dict[str, Any] = {}
-        if isinstance(ab_in.get("trafficSplitB"), (int, float)):
-            ab_out["trafficSplitB"] = min(0.9, max(0.05, float(ab_in.get("trafficSplitB"))))
-        for key in ("costReductionPctMin", "qualityDropPctMax", "latencyIncreasePctMax"):
-            if isinstance(ab_in.get(key), (int, float)):
-                ab_out[key] = float(ab_in.get(key))
-        if isinstance(ab_in.get("evaluationDays"), (int, float)):
-            ab_out["evaluationDays"] = max(1, int(_safe_float(ab_in.get("evaluationDays"), default=7.0)))
-        if isinstance(ab_in.get("minimumSampleSize"), (int, float)):
-            ab_out["minimumSampleSize"] = max(20, int(_safe_float(ab_in.get("minimumSampleSize"), default=100.0)))
-        if isinstance(ab_in.get("rolloutStages"), list):
-            stages: List[float] = []
-            for item in ab_in.get("rolloutStages", []):
-                if isinstance(item, (int, float)):
-                    stages.append(min(1.0, max(0.01, float(item))))
-            if stages:
-                ab_out["rolloutStages"] = stages
-        out["abTesting"] = ab_out
-
-    return out
-
-
-def _load_prompt_optimization_config(path: Optional[str]) -> Dict[str, Any]:
-    if not path:
-        return {}
-    raw = Path(path).read_text(encoding="utf-8")
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise RuntimeError("Prompt optimization config must be a JSON object.")
-    return _normalize_prompt_optimization_config(parsed)
+    return parsed
 
 
 def resolve_access_policy(role: Optional[str], user: Optional[str], rbac_config_path: Optional[str]) -> Tuple[str, Dict[str, Any]]:
@@ -1948,102 +1351,6 @@ def evaluate_alert_rules(
     }
 
 
-
-
-def evaluate_unified_budget_alerts(
-    rows: List[Dict[str, Any]],
-    cloud_rows: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    cfg = config if isinstance(config, dict) else {}
-    rules = cfg.get("unifiedBudgetAlerts") if isinstance(cfg.get("unifiedBudgetAlerts"), list) else []
-    cloud = cloud_rows or []
-
-    llm_total = sum(day_total_cost(r) for r in rows)
-    cloud_total = sum(_safe_float(r.get("costUSD")) for r in cloud)
-    unified_total = llm_total + cloud_total
-
-    provider_totals: Dict[str, float] = defaultdict(float)
-    service_totals: Dict[str, float] = defaultdict(float)
-    tag_totals: Dict[str, float] = defaultdict(float)
-    for r in cloud:
-        pvd = str(r.get("provider") or "unknown").lower()
-        svc = str(r.get("service") or "all")
-        c = _safe_float(r.get("costUSD"))
-        provider_totals[pvd] += c
-        service_totals[f"{pvd}:{svc}"] += c
-        for tk, tv in _normalize_cloud_tags(r.get("tags")).items():
-            tag_totals[f"{tk}={tv}"] += c
-
-    events: List[Dict[str, Any]] = []
-    for idx, rule in enumerate(rules, start=1):
-        if not isinstance(rule, dict):
-            continue
-        scope = str(rule.get("scope") or "total").lower()
-        threshold = _safe_float(rule.get("thresholdUSD"), default=0.0)
-        if threshold <= 0:
-            continue
-
-        value = 0.0
-        scope_label = scope
-        if scope == "total":
-            value = unified_total
-        elif scope == "llm":
-            value = llm_total
-        elif scope == "cloud":
-            value = cloud_total
-        elif scope == "provider":
-            provider = str(rule.get("provider") or "").lower()
-            value = _safe_float(provider_totals.get(provider, 0.0))
-            scope_label = f"provider:{provider or 'unknown'}"
-        elif scope == "service":
-            provider = str(rule.get("provider") or "").lower()
-            service = str(rule.get("service") or "all")
-            key = f"{provider}:{service}"
-            value = _safe_float(service_totals.get(key, 0.0))
-            scope_label = f"service:{key}"
-        elif scope == "tag":
-            tag_key = str(rule.get("tagKey") or "").strip().lower()
-            tag_val = str(rule.get("tagValue") or "").strip()
-            key = f"{tag_key}={tag_val}"
-            value = _safe_float(tag_totals.get(key, 0.0))
-            scope_label = f"tag:{key}"
-        else:
-            continue
-
-        if value >= threshold:
-            events.append({
-                "id": str(rule.get("id") or f"unified-budget-{idx}"),
-                "scope": scope_label,
-                "valueUSD": value,
-                "thresholdUSD": threshold,
-                "usagePct": (value / threshold * 100.0) if threshold > 0 else 0.0,
-                "severity": str(rule.get("severity") or ("high" if value >= threshold * 1.2 else "medium")),
-                "message": str(rule.get("message") or f"{scope_label} reached {value:.2f} USD ({value/threshold*100:.1f}% of budget)"),
-            })
-
-    events.sort(key=lambda x: (_safe_float(x.get("usagePct")), _safe_float(x.get("valueUSD"))), reverse=True)
-    by_severity: Dict[str, int] = defaultdict(int)
-    by_scope: Dict[str, int] = defaultdict(int)
-    for e in events:
-        by_severity[str(e.get("severity") or "unknown").lower()] += 1
-        by_scope[str(e.get("scope") or "unknown")] += 1
-
-    return {
-        "available": bool(rules),
-        "totals": {
-            "llmCostUSD": llm_total,
-            "cloudInfraCostUSD": cloud_total,
-            "totalUnifiedCostUSD": unified_total,
-        },
-        "rules": rules,
-        "summary": {
-            "triggered": len(events),
-            "bySeverity": dict(by_severity),
-            "byScope": dict(by_scope),
-        },
-        "events": events,
-    }
 def evaluate_realtime_cost_controls(
     rows: List[Dict[str, Any]],
     forecast_7d: Dict[str, Any],
@@ -2174,43 +1481,13 @@ def evaluate_budget_allocation_and_permissions(
 
     role_permissions = permission_cfg.get("roles") if isinstance(permission_cfg.get("roles"), dict) else {}
     user_permissions = permission_cfg.get("users") if isinstance(permission_cfg.get("users"), dict) else {}
-    default_role = str(permission_cfg.get("defaultRole") or "viewer")
-
-    violations: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for r in records:
-        user = str(r.get("user") or "unknown")
-        model = str(r.get("model") or "unknown")
-        cost = _safe_float(r.get("costUSD"))
-
-        raw_user_policy = user_permissions.get(user) if isinstance(user_permissions.get(user), dict) else {}
-        assigned_role = str(raw_user_policy.get("role") or default_role)
-        role_policy = role_permissions.get(assigned_role) if isinstance(role_permissions.get(assigned_role), dict) else {}
-
-        allowed_models = raw_user_policy.get("allowedModels") if isinstance(raw_user_policy.get("allowedModels"), list) else role_policy.get("allowedModels")
-        max_cost = raw_user_policy.get("maxCostPerCallUSD") if isinstance(raw_user_policy.get("maxCostPerCallUSD"), (int, float)) else role_policy.get("maxCostPerCallUSD")
-
-        if isinstance(allowed_models, list) and allowed_models and model not in {str(x) for x in allowed_models}:
-            key = (user, model, "model_not_allowed")
-            node = violations.setdefault(key, {"user": user, "role": assigned_role, "model": model, "violation": "model_not_allowed", "calls": 0, "costUSD": 0.0, "message": f"Model '{model}' not allowed for role '{assigned_role}'"})
-            node["calls"] += 1
-            node["costUSD"] += cost
-
-        if isinstance(max_cost, (int, float)) and cost > float(max_cost):
-            key = (user, model, "call_cost_exceeded")
-            node = violations.setdefault(key, {"user": user, "role": assigned_role, "model": model, "violation": "call_cost_exceeded", "calls": 0, "costUSD": 0.0, "message": f"Per-call cost {cost:.4f} > max {float(max_cost):.4f}"})
-            node["calls"] += 1
-            node["costUSD"] += cost
-
-    violation_list = sorted(violations.values(), key=lambda x: (x["costUSD"], x["calls"]), reverse=True)
 
     return {
         "available": bool(allocations or role_permissions or user_permissions or overage_cfg),
         "allocations": allocations,
         "permissions": {
-            "defaultRole": default_role,
             "roles": role_permissions,
             "users": user_permissions,
-            "violations": violation_list,
         },
         "overagePolicies": overage_cfg,
     }
@@ -2249,62 +1526,11 @@ def evaluate_overage_behaviors(
             "action": action,
             "message": str((matched or {}).get("message") or f"{alloc.get('dimension')}:{alloc.get('key')} exceeded budget at {usage_pct:.1f}%"),
             "routeToModel": (matched or {}).get("routeToModel"),
-            "autoHandled": action in {"degrade", "switch_model", "stop_calls"},
         })
 
     return {
         "available": True,
         "events": events,
-    }
-
-
-def build_quota_policies(
-    budget_eval: Dict[str, Any],
-    overage_eval: Dict[str, Any],
-) -> Dict[str, Any]:
-    allocations = budget_eval.get("allocations") if isinstance(budget_eval.get("allocations"), list) else []
-    permissions = budget_eval.get("permissions") if isinstance(budget_eval.get("permissions"), dict) else {}
-    overage_policies = budget_eval.get("overagePolicies") if isinstance(budget_eval.get("overagePolicies"), list) else []
-    overage_events = overage_eval.get("events") if isinstance(overage_eval.get("events"), list) else []
-
-    enforced = [x for x in overage_events if isinstance(x, dict) and bool(x.get("autoHandled"))]
-
-    allocation_policies: List[Dict[str, Any]] = []
-    for item in allocations:
-        if not isinstance(item, dict):
-            continue
-        allocation_policies.append({
-            "policyId": str(item.get("id") or ""),
-            "scope": f"{item.get('dimension')}:{item.get('key')}",
-            "budgetUSD": _safe_float(item.get("budgetUSD")),
-            "usedUSD": _safe_float(item.get("actualCostUSD")),
-            "remainingUSD": _safe_float(item.get("remainingUSD")),
-            "usagePct": _safe_float(item.get("usagePct")),
-            "status": str(item.get("status") or "unknown"),
-        })
-
-    default_role = str(permissions.get("defaultRole") or "viewer")
-    role_count = len(permissions.get("roles", {})) if isinstance(permissions.get("roles"), dict) else 0
-    user_override_count = len(permissions.get("users", {})) if isinstance(permissions.get("users"), dict) else 0
-    violation_count = len(permissions.get("violations", [])) if isinstance(permissions.get("violations"), list) else 0
-
-    return {
-        "available": bool(allocation_policies or overage_policies or role_count or user_override_count),
-        "summary": {
-            "allocationPolicies": len(allocation_policies),
-            "overagePolicies": len(overage_policies),
-            "autoHandledEvents": len(enforced),
-            "permissionViolations": violation_count,
-        },
-        "allocations": allocation_policies,
-        "permissions": {
-            "defaultRole": default_role,
-            "roleCount": role_count,
-            "userOverrideCount": user_override_count,
-            "violationCount": violation_count,
-        },
-        "overagePolicies": overage_policies,
-        "enforcements": enforced,
     }
 
 
@@ -2392,9 +1618,7 @@ def build_summary(
     alert_config: Optional[Dict[str, Any]] = None,
     cost_control_config: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
-    prompt_optimization_config: Optional[Dict[str, Any]] = None,
-    cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
-    attribution_granularity: str = "standard",
+    cloud_tag_aliases: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     totals = model_totals(rows)
     daily_costs = [day_total_cost(r) for r in rows]
@@ -2425,27 +1649,9 @@ def build_summary(
     spikes = detect_spikes(rows, lookback_days=spike_lookback_days, threshold_mult=spike_threshold_mult)
     normalized_records = _normalize_call_records(rows)
     pattern_analysis = build_llm_pattern_analysis(rows, normalized_records=normalized_records)
-    attribution = build_cost_attribution(
-        rows,
-        normalized_records=normalized_records,
-        cloud_rows=cloud_cost_rows,
-        granularity=attribution_granularity,
-    )
-    unified_cloud_cost = build_unified_cloud_cost_view(rows, cloud_rows=cloud_cost_rows)
-    unified_budget_alerts = evaluate_unified_budget_alerts(rows, cloud_rows=cloud_cost_rows, config=alert_config)
-    recommendations = build_optimization_recommendations(
-        rows,
-        pattern_analysis,
-        attribution,
-        normalized_records=normalized_records,
-        cloud_cost_view=unified_cloud_cost,
-    )
-    prompt_optimization_engine = build_prompt_optimization_engine(
-        rows,
-        pattern_analysis,
-        normalized_records=normalized_records,
-        config=prompt_optimization_config,
-    )
+    attribution = build_cost_attribution(rows, normalized_records=normalized_records, tag_aliases=cloud_tag_aliases)
+    recommendations = build_optimization_recommendations(rows, pattern_analysis, attribution, normalized_records=normalized_records)
+    prompt_optimization_engine = build_prompt_optimization_engine(rows, pattern_analysis, normalized_records=normalized_records)
     forecast7 = forecast_cost(rows, horizon_days=7, lookback_days=14)
     forecast30 = forecast_cost(rows, horizon_days=30, lookback_days=30)
     anomalies = detect_cost_anomalies(rows, lookback_days=spike_lookback_days)
@@ -2459,7 +1665,7 @@ def build_summary(
     )
     budget_eval = evaluate_budget_allocation_and_permissions(rows, config=budget_config, normalized_records=normalized_records)
     overage = evaluate_overage_behaviors(budget_eval)
-    quota_policies = build_quota_policies(budget_eval, overage)
+    cloud_tag_mapping = build_cloud_tag_mapping(rows, normalized_records=normalized_records, tag_aliases=cloud_tag_aliases)
 
     return {
         "provider": provider,
@@ -2485,72 +1691,10 @@ def build_summary(
         "llmPatternAnalysis": pattern_analysis,
         "costAttribution": attribution,
         "optimizationRecommendations": recommendations,
-        "unifiedCloudCostView": unified_cloud_cost,
-        "unifiedBudgetAlerts": unified_budget_alerts,
         "promptOptimizationEngine": prompt_optimization_engine,
         "budgetAllocation": budget_eval,
-        "quotaPolicies": quota_policies,
         "overageBehaviors": overage,
-    }
-
-
-def build_unified_cloud_cost_view(rows: List[Dict[str, Any]], cloud_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    cloud = cloud_rows or []
-    llm_daily: Dict[str, float] = defaultdict(float)
-    for r in rows:
-        d = str(r.get("date") or "")
-        if d:
-            llm_daily[d] += day_total_cost(r)
-
-    cloud_daily: Dict[str, float] = defaultdict(float)
-    cloud_provider_totals: Dict[str, float] = defaultdict(float)
-    cloud_service_totals: Dict[str, float] = defaultdict(float)
-    cloud_tag_totals: Dict[str, float] = defaultdict(float)
-    for r in cloud:
-        d = str(r.get("date") or "")
-        if not d:
-            continue
-        c = _safe_float(r.get("costUSD"))
-        p = str(r.get("provider") or "unknown").lower()
-        s = str(r.get("service") or "all")
-        cloud_daily[d] += c
-        cloud_provider_totals[p] += c
-        cloud_service_totals[f"{p}:{s}"] += c
-        for tk, tv in _normalize_cloud_tags(r.get("tags")).items():
-            cloud_tag_totals[f"{tk}={tv}"] += c
-
-    all_days = sorted(set(llm_daily.keys()) | set(cloud_daily.keys()))
-    daily = [
-        {
-            "date": d,
-            "llmCostUSD": llm_daily.get(d, 0.0),
-            "cloudInfraCostUSD": cloud_daily.get(d, 0.0),
-            "totalUnifiedCostUSD": llm_daily.get(d, 0.0) + cloud_daily.get(d, 0.0),
-        }
-        for d in all_days
-    ]
-
-    return {
-        "available": True,
-        "cloudIntegrationEnabled": bool(cloud),
-        "totals": {
-            "llmCostUSD": sum(llm_daily.values()),
-            "cloudInfraCostUSD": sum(cloud_daily.values()),
-            "totalUnifiedCostUSD": sum(llm_daily.values()) + sum(cloud_daily.values()),
-        },
-        "cloudProviders": [
-            {"provider": k, "totalCostUSD": v}
-            for k, v in sorted(cloud_provider_totals.items(), key=lambda kv: kv[1], reverse=True)
-        ],
-        "cloudServices": [
-            {"providerService": k, "totalCostUSD": v}
-            for k, v in sorted(cloud_service_totals.items(), key=lambda kv: kv[1], reverse=True)[:15]
-        ],
-        "cloudTags": [
-            {"tag": k, "totalCostUSD": v}
-            for k, v in sorted(cloud_tag_totals.items(), key=lambda kv: kv[1], reverse=True)[:20]
-        ],
-        "daily": daily,
+        "cloudCostTagMapping": cloud_tag_mapping,
     }
 
 
@@ -2679,183 +1823,6 @@ def generate_custom_report(
     return out
 
 
-def _build_notification_text(title: str, lines: List[str]) -> str:
-    body = "\n".join([x for x in lines if x])
-    return f"{title}\n{body}" if body else title
-
-
-def _dispatch_webhook(channel: str, webhook_url: str, text: str, timeout_seconds: float = 8.0) -> Dict[str, Any]:
-    if not isinstance(webhook_url, str) or not webhook_url.startswith(("https://", "http://")):
-        return {"status": "failed", "reason": "invalid_webhook_url", "channel": channel}
-
-    payload: Dict[str, Any]
-    ch = channel.lower()
-    if ch == "discord":
-        payload = {"content": text}
-    elif ch == "slack":
-        payload = {"text": text}
-    else:
-        payload = {"text": text}
-
-    req = urllib.request.Request(
-        webhook_url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            status = int(getattr(resp, "status", 200) or 200)
-        if 200 <= status < 300:
-            return {"status": "sent", "channel": channel, "httpStatus": status}
-        return {"status": "failed", "channel": channel, "httpStatus": status}
-    except urllib.error.HTTPError as exc:
-        return {"status": "failed", "channel": channel, "httpStatus": int(exc.code), "reason": str(exc)}
-    except Exception as exc:
-        return {"status": "failed", "channel": channel, "reason": str(exc)}
-
-
-def _parse_channel_target(channel: Optional[str], target: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    ch = (channel or "").strip().lower()
-    tg = (target or "").strip()
-
-    # 支援 alert config 既有格式: slack:webhook:https://..., discord:webhook:https://...
-    if not ch and tg:
-        parts = tg.split(":", 2)
-        if len(parts) == 3 and parts[1] == "webhook":
-            return parts[0].lower(), parts[2]
-
-    if ch in {"slack", "discord"}:
-        return ch, tg
-
-    if ch.startswith("slack:webhook:"):
-        return "slack", ch.split(":", 2)[2]
-    if ch.startswith("discord:webhook:"):
-        return "discord", ch.split(":", 2)[2]
-
-    if ch and tg.startswith(("http://", "https://")):
-        return ch, tg
-
-    return None, None
-
-
-def dispatch_report_delivery(
-    report_payload: Dict[str, Any],
-    recipient: Dict[str, Any],
-    timeout_seconds: float = 8.0,
-    retries: int = 0,
-) -> Dict[str, Any]:
-    channel, webhook_url = _parse_channel_target(recipient.get("channel"), recipient.get("target"))
-    if not channel or not webhook_url:
-        return {
-            "target": recipient.get("target"),
-            "channel": recipient.get("channel"),
-            "status": "blocked",
-            "reason": "unsupported_or_missing_webhook",
-        }
-
-    job = report_payload.get("job", {}) if isinstance(report_payload.get("job"), dict) else {}
-    summary = report_payload.get("summary", {}) if isinstance(report_payload.get("summary"), dict) else {}
-    text = _build_notification_text(
-        f"[token-usage-dashboard] Report Ready: {job.get('name') or job.get('id')}",
-        [
-            f"provider={report_payload.get('provider')}",
-            f"generatedAt={report_payload.get('generatedAt')}",
-            f"range={summary.get('startDate')} ~ {summary.get('endDate')}",
-            f"totalCostUSD={_safe_float(summary.get('totalCostUSD')):.2f}",
-            f"last7dCostUSD={_safe_float(summary.get('last7dCostUSD')):.2f}",
-        ],
-    )
-
-    last_result: Dict[str, Any] = {"status": "failed", "reason": "unknown"}
-    attempts = max(0, retries) + 1
-    for i in range(attempts):
-        last_result = _dispatch_webhook(channel, webhook_url, text, timeout_seconds=timeout_seconds)
-        if last_result.get("status") == "sent":
-            return {
-                "target": recipient.get("target"),
-                "channel": channel,
-                **last_result,
-                "attempt": i + 1,
-            }
-        if i < attempts - 1:
-            time.sleep(0.4 * (i + 1))
-
-    return {
-        "target": recipient.get("target"),
-        "channel": channel,
-        **last_result,
-        "attempt": attempts,
-    }
-
-
-def dispatch_event_alerts(
-    summary: Dict[str, Any],
-    alert_config: Optional[Dict[str, Any]] = None,
-    timeout_seconds: float = 8.0,
-    retries: int = 0,
-) -> Dict[str, Any]:
-    cfg = alert_config if isinstance(alert_config, dict) else {}
-    channels_raw = cfg.get("notificationChannels") if isinstance(cfg.get("notificationChannels"), list) else []
-    alerts = summary.get("alerts") if isinstance(summary.get("alerts"), dict) else {}
-    triggered = alerts.get("triggered") if isinstance(alerts.get("triggered"), list) else []
-    controls = summary.get("realTimeCostControls") if isinstance(summary.get("realTimeCostControls"), dict) else {}
-    control_actions = controls.get("triggeredActions") if isinstance(controls.get("triggeredActions"), list) else []
-    overage = summary.get("overageBehaviors") if isinstance(summary.get("overageBehaviors"), dict) else {}
-    overage_events = overage.get("events") if isinstance(overage.get("events"), list) else []
-    unified_budget = summary.get("unifiedBudgetAlerts") if isinstance(summary.get("unifiedBudgetAlerts"), dict) else {}
-    unified_budget_events = unified_budget.get("events") if isinstance(unified_budget.get("events"), list) else []
-
-    if not (triggered or control_actions or overage_events or unified_budget_events):
-        return {"sent": 0, "failed": 0, "events": 0, "results": [], "reason": "no_triggered_events"}
-
-    lines: List[str] = [
-        f"provider={summary.get('provider')}",
-        f"window={summary.get('startDate')} ~ {summary.get('endDate')}",
-        f"totalCostUSD={_safe_float(summary.get('totalCostUSD')):.2f}",
-    ]
-    for a in triggered[:5]:
-        lines.append(f"ALERT[{a.get('severity')}]: {a.get('message')}")
-    for a in control_actions[:5]:
-        lines.append(f"CONTROL[{a.get('action')}]: {a.get('message')}")
-    for a in overage_events[:5]:
-        lines.append(f"OVERAGE[{a.get('action')}]: {a.get('dimension')}:{a.get('key')} { _safe_float(a.get('usagePct')):.1f}%")
-    for a in unified_budget_events[:5]:
-        lines.append(f"UNIFIED_BUDGET[{a.get('severity')}]: {a.get('message')}")
-
-    text = _build_notification_text("[token-usage-dashboard] Event Monitor Alert", lines)
-
-    results: List[Dict[str, Any]] = []
-    for entry in channels_raw:
-        if not isinstance(entry, str):
-            continue
-        channel, webhook_url = _parse_channel_target(None, entry)
-        if not channel or not webhook_url:
-            results.append({"channel": entry, "status": "blocked", "reason": "unsupported_or_missing_webhook"})
-            continue
-
-        attempts = max(0, retries) + 1
-        last: Dict[str, Any] = {"status": "failed"}
-        for i in range(attempts):
-            last = _dispatch_webhook(channel, webhook_url, text, timeout_seconds=timeout_seconds)
-            if last.get("status") == "sent":
-                results.append({"channel": channel, **last, "attempt": i + 1})
-                break
-            if i < attempts - 1:
-                time.sleep(0.4 * (i + 1))
-        else:
-            results.append({"channel": channel, **last, "attempt": attempts})
-
-    sent = len([x for x in results if x.get("status") == "sent"])
-    failed = len(results) - sent
-    return {
-        "sent": sent,
-        "failed": failed,
-        "events": len(triggered) + len(control_actions) + len(overage_events) + len(unified_budget_events),
-        "results": results,
-    }
-
-
 def _safe_report_job_id(value: Any, fallback: str) -> str:
     raw = str(value or "").strip().lower()
     sanitized = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
@@ -2893,12 +1860,7 @@ def _normalize_report_jobs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "allowedRoles": [str(x).strip() for x in (job.get("allowedRoles") or []) if str(x).strip()],
             "recipients": recipients,
             "formats": [str(x).strip().lower() for x in (job.get("formats") or ["json"]) if str(x).strip()],
-            "onlyOnChange": bool(job.get("onlyOnChange", False)),
-            "minTotalCostChangePct": _safe_float(job.get("minTotalCostChangePct"), default=0.0),
-            "minTotalCostChangeUSD": _safe_float(job.get("minTotalCostChangeUSD"), default=0.0),
-            "minReportRowsChange": _safe_int(job.get("minReportRowsChange"), default=0, minimum=0),
-            "minActiveModelsChange": _safe_float(job.get("minActiveModelsChange"), default=0.0),
-            "forceRunAfterHours": _safe_float(job.get("forceRunAfterHours"), default=0.0),
+            "skipIfUnchanged": bool(job.get("skipIfUnchanged", True)),
         })
     return out
 
@@ -2967,29 +1929,25 @@ def _export_report_csv(rows: List[Dict[str, Any]], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _report_payload_fingerprint(report_payload: Dict[str, Any]) -> str:
-    compact = {
-        "job": report_payload.get("job"),
-        "provider": report_payload.get("provider"),
-        "role": report_payload.get("role"),
-        "tenant": report_payload.get("tenant"),
-        "summary": {
-            "totalCostUSD": ((report_payload.get("summary") or {}).get("totalCostUSD") if isinstance(report_payload.get("summary"), dict) else None),
-            "startDate": ((report_payload.get("summary") or {}).get("startDate") if isinstance(report_payload.get("summary"), dict) else None),
-            "endDate": ((report_payload.get("summary") or {}).get("endDate") if isinstance(report_payload.get("summary"), dict) else None),
-        },
-        "reportRows": report_payload.get("reportRows") or [],
-    }
-    raw = json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 def _recipient_allowed(recipient: Dict[str, Any], role_name: str, job_allowed_roles: List[str]) -> bool:
     allowed_roles = [str(x).strip() for x in recipient.get("allowedRoles", []) if str(x).strip()] if isinstance(recipient.get("allowedRoles"), list) else []
     effective_allowed = allowed_roles or job_allowed_roles
     if not effective_allowed:
         return True
     return role_name in effective_allowed
+
+
+def _report_payload_digest(report_payload: Dict[str, Any]) -> str:
+    stable = {
+        "job": report_payload.get("job"),
+        "provider": report_payload.get("provider"),
+        "role": report_payload.get("role"),
+        "tenant": report_payload.get("tenant"),
+        "summary": report_payload.get("summary"),
+        "reportRows": report_payload.get("reportRows"),
+    }
+    blob = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def run_report_scheduler(
@@ -3006,14 +1964,8 @@ def run_report_scheduler(
     jobs = _normalize_report_jobs(config)
     history = _load_report_history(output_dir)
     latest_by_job = history.get("latestByJob") if isinstance(history.get("latestByJob"), dict) else {}
-    dispatch_cfg = config.get("dispatch") if isinstance(config.get("dispatch"), dict) else {}
-    dispatch_enabled = bool(dispatch_cfg.get("enabled", True))
-    dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
-    dispatch_retries = _safe_int(dispatch_cfg.get("retries"), default=0, minimum=0)
-    history_cfg = config.get("history") if isinstance(config.get("history"), dict) else {}
-    max_reports_per_job = _safe_int(history_cfg.get("maxReportsPerJob"), default=0, minimum=0)
 
-    result = {"now": now_dt.isoformat(), "jobs": [], "generated": 0, "skipped": 0, "sent": 0, "failed": 0}
+    result = {"now": now_dt.isoformat(), "jobs": [], "generated": 0, "skipped": 0}
 
     for job in jobs:
         job_id = str(job["id"])
@@ -3070,64 +2022,12 @@ def run_report_scheduler(
             "summary": summary,
             "reportRows": report_rows,
         }
-
-        report_stats = {
-            "rowCount": len(report_rows),
-            "maxTotalCostUSD": max([_safe_float(x.get("totalCostUSD")) for x in report_rows], default=0.0),
-            "avgActiveModels": (sum(_safe_float(x.get("avgActiveModels")) for x in report_rows) / len(report_rows)) if report_rows else 0.0,
-        }
-
-        fingerprint = _report_payload_fingerprint(report_payload)
+        payload_digest = _report_payload_digest(report_payload)
         previous = latest_by_job.get(job_id) if isinstance(latest_by_job.get(job_id), dict) else {}
-        only_on_change = bool(job.get("onlyOnChange", False))
-        if only_on_change and previous.get("fingerprint") == fingerprint:
-            result["jobs"].append({"jobId": job_id, "status": "skipped", "reason": "no_change"})
+        if bool(job.get("skipIfUnchanged", True)) and isinstance(previous.get("payloadDigest"), str) and previous.get("payloadDigest") == payload_digest:
+            result["jobs"].append({"jobId": job_id, "status": "skipped", "reason": "unchanged_payload"})
             result["skipped"] += 1
             continue
-
-        min_change_pct = _safe_float(job.get("minTotalCostChangePct"), default=0.0)
-        min_change_usd = _safe_float(job.get("minTotalCostChangeUSD"), default=0.0)
-        min_rows_change = _safe_int(job.get("minReportRowsChange"), default=0, minimum=0)
-        min_active_models_change = _safe_float(job.get("minActiveModelsChange"), default=0.0)
-        force_run_hours = _safe_float(job.get("forceRunAfterHours"), default=0.0)
-        has_change_threshold = (min_change_pct > 0 or min_change_usd > 0 or min_rows_change > 0 or min_active_models_change > 0)
-        if has_change_threshold and isinstance(previous, dict) and isinstance(previous.get("summary"), dict):
-            prev_total = _safe_float(previous.get("summary", {}).get("totalCostUSD"), default=-1.0)
-            curr_total = _safe_float(report_payload.get("summary", {}).get("totalCostUSD"), default=-1.0)
-            prev_stats = previous.get("reportStats") if isinstance(previous.get("reportStats"), dict) else {}
-            delta_rows = abs(report_stats["rowCount"] - _safe_int(prev_stats.get("rowCount"), default=report_stats["rowCount"]))
-            delta_active_models = abs(report_stats["avgActiveModels"] - _safe_float(prev_stats.get("avgActiveModels"), default=report_stats["avgActiveModels"]))
-
-            if prev_total > 0 and curr_total >= 0:
-                delta_usd = abs(curr_total - prev_total)
-                delta_pct = abs((curr_total - prev_total) / prev_total * 100.0)
-                pct_ok = (min_change_pct <= 0) or (delta_pct >= min_change_pct)
-                usd_ok = (min_change_usd <= 0) or (delta_usd >= min_change_usd)
-                rows_ok = (min_rows_change <= 0) or (delta_rows >= min_rows_change)
-                model_ok = (min_active_models_change <= 0) or (delta_active_models >= min_active_models_change)
-                threshold_passed = pct_ok and usd_ok and rows_ok and model_ok
-                if not threshold_passed:
-                    last_generated = None
-                    if isinstance(previous.get("generatedAt"), str):
-                        try:
-                            last_generated = datetime.fromisoformat(str(previous.get("generatedAt")).replace("Z", "+00:00"))
-                        except Exception:
-                            last_generated = None
-                    if force_run_hours > 0 and isinstance(last_generated, datetime):
-                        if (now_dt - last_generated).total_seconds() >= force_run_hours * 3600:
-                            threshold_passed = True
-                if not threshold_passed:
-                    result["jobs"].append({
-                        "jobId": job_id,
-                        "status": "skipped",
-                        "reason": "change_below_threshold",
-                        "deltaPct": delta_pct,
-                        "deltaUSD": delta_usd,
-                        "deltaRows": delta_rows,
-                        "deltaActiveModels": delta_active_models,
-                    })
-                    result["skipped"] += 1
-                    continue
 
         formats = job.get("formats") if isinstance(job.get("formats"), list) else ["json"]
         if "json" in formats:
@@ -3140,20 +2040,9 @@ def run_report_scheduler(
             artifact_paths["csv"] = str(csv_path)
 
         deliveries = []
-        seen_targets = set()
         for recipient in job.get("recipients") or []:
             if not isinstance(recipient, dict):
                 continue
-            rkey = (str(recipient.get("channel") or "").strip().lower(), str(recipient.get("target") or "").strip())
-            if rkey in seen_targets:
-                deliveries.append({
-                    "target": recipient.get("target"),
-                    "channel": recipient.get("channel"),
-                    "status": "skipped",
-                    "reason": "duplicate_recipient",
-                })
-                continue
-            seen_targets.add(rkey)
             if not _recipient_allowed(recipient, role_name, job.get("allowedRoles") or []):
                 deliveries.append({
                     "target": recipient.get("target"),
@@ -3162,24 +2051,11 @@ def run_report_scheduler(
                     "reason": "role_not_allowed",
                 })
                 continue
-            if dispatch_enabled:
-                dispatch_result = dispatch_report_delivery(
-                    report_payload,
-                    recipient,
-                    timeout_seconds=dispatch_timeout,
-                    retries=dispatch_retries,
-                )
-                deliveries.append(dispatch_result)
-                if dispatch_result.get("status") == "sent":
-                    result["sent"] += 1
-                elif dispatch_result.get("status") != "blocked":
-                    result["failed"] += 1
-            else:
-                deliveries.append({
-                    "target": recipient.get("target"),
-                    "channel": recipient.get("channel"),
-                    "status": "queued",
-                })
+            deliveries.append({
+                "target": recipient.get("target"),
+                "channel": recipient.get("channel"),
+                "status": "queued",
+            })
 
         history_item = {
             "jobId": job_id,
@@ -3191,47 +2067,15 @@ def run_report_scheduler(
             "deliveries": deliveries,
             "layout": job.get("layout") or {},
             "tenant": tenant_meta or None,
-            "fingerprint": fingerprint,
-            "summary": {
-                "totalCostUSD": _safe_float(summary.get("totalCostUSD")),
-                "startDate": summary.get("startDate"),
-                "endDate": summary.get("endDate"),
-            },
-            "reportStats": report_stats,
+            "payloadDigest": payload_digest,
         }
         history["reports"].append(history_item)
-        latest_by_job[job_id] = {
-            "generatedAt": now_dt.isoformat(),
-            "artifacts": artifact_paths,
-            "fingerprint": fingerprint,
-            "summary": {
-                "totalCostUSD": _safe_float(summary.get("totalCostUSD")),
-                "startDate": summary.get("startDate"),
-                "endDate": summary.get("endDate"),
-            },
-            "reportStats": report_stats,
-        }
+        latest_by_job[job_id] = {"generatedAt": now_dt.isoformat(), "artifacts": artifact_paths, "payloadDigest": payload_digest}
 
         result["jobs"].append({"jobId": job_id, "status": "generated", "artifacts": artifact_paths, "deliveries": deliveries})
         result["generated"] += 1
 
     history["latestByJob"] = latest_by_job
-    if max_reports_per_job > 0:
-        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        passthrough: List[Dict[str, Any]] = []
-        for item in history.get("reports", []):
-            if not isinstance(item, dict):
-                continue
-            jid = str(item.get("jobId") or "").strip()
-            if not jid:
-                passthrough.append(item)
-                continue
-            grouped[jid].append(item)
-        pruned: List[Dict[str, Any]] = list(passthrough)
-        for _, items in grouped.items():
-            ranked = sorted(items, key=lambda x: str(x.get("generatedAt") or ""), reverse=True)
-            pruned.extend(ranked[:max_reports_per_job])
-        history["reports"] = sorted(pruned, key=lambda x: str(x.get("generatedAt") or ""))
     _write_report_history(output_dir, history)
     return result
 
@@ -3250,9 +2094,7 @@ def build_dashboard_html(
     cost_control_config: Optional[Dict[str, Any]] = None,
     multi_provider_agg: Optional[Dict[str, Any]] = None,
     budget_config: Optional[Dict[str, Any]] = None,
-    prompt_optimization_config: Optional[Dict[str, Any]] = None,
-    cloud_cost_rows: Optional[List[Dict[str, Any]]] = None,
-    attribution_granularity: str = "standard",
+    cloud_tag_aliases: Optional[Dict[str, str]] = None,
 ) -> str:
     policy = policy or DEFAULT_ROLE_POLICIES["admin"]
     totals = model_totals(rows)
@@ -3278,9 +2120,7 @@ def build_dashboard_html(
         alert_config=alert_config,
         cost_control_config=cost_control_config,
         budget_config=budget_config,
-        prompt_optimization_config=prompt_optimization_config,
-        cloud_cost_rows=cloud_cost_rows,
-        attribution_granularity=attribution_granularity,
+        cloud_tag_aliases=cloud_tag_aliases,
     )
     spike_count = len(summary.get("spikes", []))
 
@@ -3394,38 +2234,6 @@ def build_dashboard_html(
 
     attribution = summary.get("costAttribution") if isinstance(summary.get("costAttribution"), dict) else {"available": False}
     recs = summary.get("optimizationRecommendations") if isinstance(summary.get("optimizationRecommendations"), dict) else {"available": False}
-    unified_cloud_view = summary.get("unifiedCloudCostView") if isinstance(summary.get("unifiedCloudCostView"), dict) else {"available": False}
-    unified_budget_alerts = summary.get("unifiedBudgetAlerts") if isinstance(summary.get("unifiedBudgetAlerts"), dict) else {"available": False}
-
-    cloud_provider_rows = "<tr><td colspan='3'>No cloud provider cost data</td></tr>"
-    if isinstance(unified_cloud_view.get("cloudProviders"), list) and unified_cloud_view.get("cloudProviders"):
-        cloud_provider_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(x.get('provider'))}</td><td>{usd(float(x.get('totalCostUSD', 0.0)))}</td></tr>"
-            for i, x in enumerate(unified_cloud_view.get("cloudProviders", [])[:8])
-        ])
-
-    cloud_service_rows = "<tr><td colspan='3'>No cloud service cost data</td></tr>"
-    if isinstance(unified_cloud_view.get("cloudServices"), list) and unified_cloud_view.get("cloudServices"):
-        cloud_service_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(x.get('providerService'))}</td><td>{usd(float(x.get('totalCostUSD', 0.0)))}</td></tr>"
-            for i, x in enumerate(unified_cloud_view.get("cloudServices", [])[:10])
-        ])
-
-    cloud_tag_rows = "<tr><td colspan='3'>No cloud tag cost data</td></tr>"
-    if isinstance(unified_cloud_view.get("cloudTags"), list) and unified_cloud_view.get("cloudTags"):
-        cloud_tag_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(x.get('tag'))}</td><td>{usd(float(x.get('totalCostUSD', 0.0)))}</td></tr>"
-            for i, x in enumerate(unified_cloud_view.get("cloudTags", [])[:10])
-        ])
-
-    unified_totals = unified_cloud_view.get("totals") if isinstance(unified_cloud_view.get("totals"), dict) else {}
-
-    unified_budget_rows = "<tr><td colspan='7'>No unified budget alert triggered</td></tr>"
-    if unified_budget_alerts.get("available") and isinstance(unified_budget_alerts.get("events"), list) and unified_budget_alerts.get("events"):
-        unified_budget_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(x.get('id'))}</td><td>{esc(x.get('scope'))}</td><td>{usd(float(x.get('valueUSD', 0.0)))}</td><td>{usd(float(x.get('thresholdUSD', 0.0)))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{esc(x.get('message'))}</td></tr>"
-            for i, x in enumerate(unified_budget_alerts.get("events", [])[:12])
-        ])
 
     def _render_attribution_rows(items: List[Dict[str, Any]]) -> str:
         if not items:
@@ -3440,38 +2248,16 @@ def build_dashboard_html(
     attr_user_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("user", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
     attr_app_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("application", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
     attr_business_line_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("businessLine", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+    attr_cloud_provider_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProvider", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
+    attr_region_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("region", [])) if attribution.get("available") else "<tr><td colspan='6'>No call-level attribution data</td></tr>"
 
-    attr_model_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("model", [])) if attribution.get("available") else "<tr><td colspan='6'>No detailed attribution data</td></tr>"
-    attr_workflow_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("workflow", [])) if attribution.get("available") else "<tr><td colspan='6'>No detailed attribution data</td></tr>"
-    attr_endpoint_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("endpoint", [])) if attribution.get("available") else "<tr><td colspan='6'>No detailed attribution data</td></tr>"
-    attr_use_case_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("useCase", [])) if attribution.get("available") else "<tr><td colspan='6'>No detailed attribution data</td></tr>"
-    attr_cloud_provider_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProvider", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_service_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudService", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_tag_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudTag", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_tag_key_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudTagKey", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_project_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProject", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_source_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudSource", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_provider_service_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProviderService", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_project_service_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProjectService", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_env_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudEnvironment", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_region_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudRegion", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-    attr_cloud_account_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudAccount", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
-
-    extra_attr_sections_html = ""
-    if attribution.get("available") and isinstance(attribution.get("dimensions"), dict):
-        extra_keys = [k for k in sorted(attribution.get("dimensions", {}).keys()) if isinstance(k, str) and k.startswith("cloudMapped:")]
-        parts: List[str] = []
-        for key in extra_keys:
-            label = key.split(":", 1)[1]
-            rows_html = _render_attribution_rows(attribution.get("dimensions", {}).get(key, []))
-            parts.append(
-                f"<h4>Cloud Attribution by Mapped Dimension · {esc(label)}</h4>\n"
-                f"<table>\n"
-                f"  <thead><tr><th>#</th><th>{esc(label)}</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>\n"
-                f"  <tbody>{rows_html}</tbody>\n"
-                f"</table>"
-            )
-        extra_attr_sections_html = "\n".join(parts)
+    cloud_tag_mapping = summary.get("cloudCostTagMapping") if isinstance(summary.get("cloudCostTagMapping"), dict) else {"available": False}
+    cloud_tag_rows = "<tr><td colspan='5'>No cloud tag mapping data</td></tr>"
+    if cloud_tag_mapping.get("available") and isinstance(cloud_tag_mapping.get("byTag"), list) and cloud_tag_mapping.get("byTag"):
+        cloud_tag_rows = "\n".join([
+            f"<tr><td>{i+1}</td><td>{esc(x.get('tag'))}</td><td>{usd(float(x.get('costUSD', 0.0)))}</td><td>{int(x.get('calls', 0))}</td><td>{esc(', '.join([f"{v.get('value')}:{usd(float(v.get('costUSD', 0.0)))}" for v in (x.get('values') or [])[:3]]))}</td></tr>"
+            for i, x in enumerate(cloud_tag_mapping.get("byTag", [])[:10])
+        ])
 
     rec_rows = "<tr><td colspan='6'>No recommendations</td></tr>"
     if recs.get("available") and isinstance(recs.get("recommendations"), list) and recs.get("recommendations"):
@@ -3503,50 +2289,12 @@ def build_dashboard_html(
             for i, x in enumerate(budget_eval.get("allocations", [])[:12])
         ])
 
-    perms = budget_eval.get("permissions") if isinstance(budget_eval.get("permissions"), dict) else {}
-    role_rows = "<tr><td colspan='4'>No role permissions configured</td></tr>"
-    if isinstance(perms.get("roles"), dict) and perms.get("roles"):
-        role_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(role)}</td><td>{esc(', '.join([str(m) for m in cfg.get('allowedModels', [])]) if isinstance(cfg.get('allowedModels'), list) and cfg.get('allowedModels') else 'all')}</td><td>{esc(str(cfg.get('maxCostPerCallUSD')) if cfg.get('maxCostPerCallUSD') is not None else '—')}</td></tr>"
-            for i, (role, cfg) in enumerate(sorted([(k, v) for k, v in perms.get("roles", {}).items() if isinstance(v, dict)], key=lambda x: x[0])[:20])
-        ])
-
-    user_perm_rows = "<tr><td colspan='5'>No user permission overrides configured</td></tr>"
-    if isinstance(perms.get("users"), dict) and perms.get("users"):
-        user_perm_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(user_name)}</td><td>{esc(str(cfg.get('role') or perms.get('defaultRole') or 'viewer'))}</td><td>{esc(', '.join([str(m) for m in cfg.get('allowedModels', [])]) if isinstance(cfg.get('allowedModels'), list) and cfg.get('allowedModels') else 'inherit')}</td><td>{esc(str(cfg.get('maxCostPerCallUSD')) if cfg.get('maxCostPerCallUSD') is not None else 'inherit')}</td></tr>"
-            for i, (user_name, cfg) in enumerate(sorted([(k, v) for k, v in perms.get("users", {}).items() if isinstance(v, dict)], key=lambda x: x[0])[:20])
-        ])
-
-    permission_violation_rows = "<tr><td colspan='7'>No permission violations detected</td></tr>"
-    if isinstance(perms.get("violations"), list) and perms.get("violations"):
-        permission_violation_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(v.get('user'))}</td><td>{esc(v.get('role'))}</td><td>{esc(v.get('model'))}</td><td>{esc(v.get('violation'))}</td><td>{int(v.get('calls', 0))}</td><td>{usd(float(v.get('costUSD', 0.0)))}</td></tr>"
-            for i, v in enumerate(perms.get("violations", [])[:20])
-        ])
-
     overage = summary.get("overageBehaviors") if isinstance(summary.get("overageBehaviors"), dict) else {"available": False}
     overage_rows = "<tr><td colspan='7'>No overage events</td></tr>"
     if overage.get("available") and isinstance(overage.get("events"), list) and overage.get("events"):
         overage_rows = "\n".join([
             f"<tr><td>{i+1}</td><td>{esc(x.get('dimension'))}</td><td>{esc(x.get('key'))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{esc(x.get('action'))}</td><td>{esc(x.get('routeToModel') or '—')}</td><td>{esc(x.get('message'))}</td></tr>"
             for i, x in enumerate(overage.get("events", [])[:12])
-        ])
-
-    quota_policies = summary.get("quotaPolicies") if isinstance(summary.get("quotaPolicies"), dict) else {"available": False}
-    quota_summary = quota_policies.get("summary") if isinstance(quota_policies.get("summary"), dict) else {}
-    quota_alloc_rows = "<tr><td colspan='7'>No quota allocation policy</td></tr>"
-    if quota_policies.get("available") and isinstance(quota_policies.get("allocations"), list) and quota_policies.get("allocations"):
-        quota_alloc_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(x.get('policyId'))}</td><td>{esc(x.get('scope'))}</td><td>{usd(float(x.get('budgetUSD', 0.0)))}</td><td>{usd(float(x.get('usedUSD', 0.0)))}</td><td>{_safe_float(x.get('usagePct', 0.0)):.1f}%</td><td>{esc(x.get('status'))}</td></tr>"
-            for i, x in enumerate(quota_policies.get("allocations", [])[:12])
-        ])
-
-    quota_enforcement_rows = "<tr><td colspan='6'>No auto-enforcement events</td></tr>"
-    if quota_policies.get("available") and isinstance(quota_policies.get("enforcements"), list) and quota_policies.get("enforcements"):
-        quota_enforcement_rows = "\n".join([
-            f"<tr><td>{i+1}</td><td>{esc(x.get('allocationId'))}</td><td>{esc(x.get('dimension'))}:{esc(x.get('key'))}</td><td>{esc(x.get('action'))}</td><td>{esc(x.get('routeToModel') or '—')}</td><td>{esc(x.get('message'))}</td></tr>"
-            for i, x in enumerate(quota_policies.get("enforcements", [])[:12])
         ])
 
     spike_by_date: Dict[str, Dict[str, float]] = {}
@@ -3659,30 +2407,6 @@ def build_dashboard_html(
   <table>
     <thead><tr><th>#</th><th>Model</th><th>Total Cost</th></tr></thead>
     <tbody>{multi_provider_models_rows}</tbody>
-  </table>
-
-  <h3>Unified Cloud Cost View (LLM + AWS/GCP)</h3>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Cloud integration: {esc('enabled' if unified_cloud_view.get('cloudIntegrationEnabled') else 'disabled')} · LLM {usd(float(unified_totals.get('llmCostUSD', 0.0)))} + Cloud Infra {usd(float(unified_totals.get('cloudInfraCostUSD', 0.0)))} = Unified {usd(float(unified_totals.get('totalUnifiedCostUSD', 0.0)))}</div>
-  <table>
-    <thead><tr><th>#</th><th>Cloud Provider</th><th>Total Cost</th></tr></thead>
-    <tbody>{cloud_provider_rows}</tbody>
-  </table>
-  <h4>Top Cloud Services</h4>
-  <table>
-    <thead><tr><th>#</th><th>Provider:Service</th><th>Total Cost</th></tr></thead>
-    <tbody>{cloud_service_rows}</tbody>
-  </table>
-  <h4>Top Cloud Cost Tags</h4>
-  <table>
-    <thead><tr><th>#</th><th>Tag</th><th>Total Cost</th></tr></thead>
-    <tbody>{cloud_tag_rows}</tbody>
-  </table>
-
-  <h3>Cross-platform Unified Budget Alerts</h3>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Single ruleset across LLM + cloud infrastructure spend (AWS/GCP/provider/service scope). Triggered: {int((unified_budget_alerts.get('summary') or {}).get('triggered', 0))} · bySeverity={esc(str((unified_budget_alerts.get('summary') or {}).get('bySeverity', {})))}.</div>
-  <table>
-    <thead><tr><th>#</th><th>Rule</th><th>Scope</th><th>Actual</th><th>Threshold</th><th>Usage</th><th>Message</th></tr></thead>
-    <tbody>{unified_budget_rows}</tbody>
   </table>
 
   <h3>Model Breakdown</h3>
@@ -3823,82 +2547,22 @@ def build_dashboard_html(
     <thead><tr><th>#</th><th>Business Line</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
     <tbody>{attr_business_line_rows}</tbody>
   </table>
-  <h4>Attribution by Model (Detailed)</h4>
+  <h4>Attribution by Cloud Provider</h4>
   <table>
-    <thead><tr><th>#</th><th>Model</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_model_rows}</tbody>
-  </table>
-  <h4>Attribution by Workflow (Detailed)</h4>
-  <table>
-    <thead><tr><th>#</th><th>Workflow</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_workflow_rows}</tbody>
-  </table>
-  <h4>Attribution by Endpoint (Detailed)</h4>
-  <table>
-    <thead><tr><th>#</th><th>Endpoint</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_endpoint_rows}</tbody>
-  </table>
-  <h4>Attribution by Use Case (Detailed)</h4>
-  <table>
-    <thead><tr><th>#</th><th>Use Case</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_use_case_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Provider</h4>
-  <table>
-    <thead><tr><th>#</th><th>Provider</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
+    <thead><tr><th>#</th><th>Cloud Provider</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
     <tbody>{attr_cloud_provider_rows}</tbody>
   </table>
-  <h4>Cloud Attribution by Service</h4>
-  <table>
-    <thead><tr><th>#</th><th>Provider:Service</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_service_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Tag</h4>
-  <table>
-    <thead><tr><th>#</th><th>Tag</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_tag_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Tag Key</h4>
-  <table>
-    <thead><tr><th>#</th><th>Tag Key</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_tag_key_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Provider:Service</h4>
-  <table>
-    <thead><tr><th>#</th><th>Provider:Service</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_provider_service_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Project:Service</h4>
-  <table>
-    <thead><tr><th>#</th><th>Project:Service</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_project_service_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Project</h4>
-  <table>
-    <thead><tr><th>#</th><th>Project</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_project_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Source</h4>
-  <table>
-    <thead><tr><th>#</th><th>Source</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_source_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Environment</h4>
-  <table>
-    <thead><tr><th>#</th><th>Environment</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_env_rows}</tbody>
-  </table>
-  <h4>Cloud Attribution by Region</h4>
+  <h4>Attribution by Region</h4>
   <table>
     <thead><tr><th>#</th><th>Region</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_region_rows}</tbody>
+    <tbody>{attr_region_rows}</tbody>
   </table>
-  <h4>Cloud Attribution by Account</h4>
+  <h4>Cloud Cost Tags Mapping</h4>
+  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Tag coverage: {float(cloud_tag_mapping.get('tagCoveragePct', 0.0)):.1f}% · Tagged calls: {int(cloud_tag_mapping.get('taggedCalls', 0))}/{int(cloud_tag_mapping.get('totalCalls', 0))}</div>
   <table>
-    <thead><tr><th>#</th><th>Account</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
-    <tbody>{attr_cloud_account_rows}</tbody>
+    <thead><tr><th>#</th><th>Tag Key</th><th>Cost</th><th>Calls</th><th>Top Values</th></tr></thead>
+    <tbody>{cloud_tag_rows}</tbody>
   </table>
-  {extra_attr_sections_html}
   <h4>Optimization Recommendations</h4>
   <table>
     <thead><tr><th>#</th><th>Priority</th><th>Recommendation</th><th>Rationale</th><th>Est. Savings</th><th>Actions</th></tr></thead>
@@ -3921,38 +2585,11 @@ def build_dashboard_html(
     <thead><tr><th>#</th><th>Dimension</th><th>Key</th><th>Budget</th><th>Actual</th><th>Usage</th><th>Remaining</th><th>Status</th></tr></thead>
     <tbody>{budget_alloc_rows}</tbody>
   </table>
-  <h4>Role Permission Matrix</h4>
-  <table>
-    <thead><tr><th>#</th><th>Role</th><th>Allowed Models</th><th>Max Cost / Call (USD)</th></tr></thead>
-    <tbody>{role_rows}</tbody>
-  </table>
-  <h4>User Permission Overrides</h4>
-  <table>
-    <thead><tr><th>#</th><th>User</th><th>Role</th><th>Allowed Models</th><th>Max Cost / Call (USD)</th></tr></thead>
-    <tbody>{user_perm_rows}</tbody>
-  </table>
-  <h4>Permission Violations (Detected from call logs)</h4>
-  <table>
-    <thead><tr><th>#</th><th>User</th><th>Role</th><th>Model</th><th>Violation</th><th>Calls</th><th>Cost</th></tr></thead>
-    <tbody>{permission_violation_rows}</tbody>
-  </table>
 
   <h3>Overage Handling</h3>
   <table>
     <thead><tr><th>#</th><th>Dimension</th><th>Key</th><th>Usage</th><th>Action</th><th>Route To Model</th><th>Message</th></tr></thead>
     <tbody>{overage_rows}</tbody>
-  </table>
-
-  <h3>Dashboard Policy View</h3>
-  <div style="font-size:12px;color:#6b7280;margin:-6px 0 8px;">Quota policies={int(quota_summary.get('allocationPolicies', 0))} · Overage policies={int(quota_summary.get('overagePolicies', 0))} · Auto-enforced={int(quota_summary.get('autoHandledEvents', 0))} · Permission violations={int(quota_summary.get('permissionViolations', 0))}</div>
-  <table>
-    <thead><tr><th>#</th><th>Policy ID</th><th>Scope</th><th>Budget</th><th>Used</th><th>Usage</th><th>Status</th></tr></thead>
-    <tbody>{quota_alloc_rows}</tbody>
-  </table>
-  <h4>Auto Enforcement Actions</h4>
-  <table>
-    <thead><tr><th>#</th><th>Allocation</th><th>Scope</th><th>Action</th><th>Route To Model</th><th>Message</th></tr></thead>
-    <tbody>{quota_enforcement_rows}</tbody>
   </table>
 
   <h3 id="selectedDayTitle">Selected Day Model Breakdown</h3>
@@ -4650,10 +3287,6 @@ def main() -> int:
     parser.add_argument("--alert-config", help="Path to alert rules/notification channels JSON")
     parser.add_argument("--cost-control-config", help="Path to real-time cost control policy JSON")
     parser.add_argument("--budget-config", help="Path to budget allocation / permission / overage policy JSON")
-    parser.add_argument("--prompt-optimization-config", help="Path to prompt optimization engine JSON config")
-    parser.add_argument("--cloud-cost-input", help="Path to cloud cost JSON (normalized records / AWS Cost Explorer / GCP billing export)")
-    parser.add_argument("--cloud-tag-mapping-config", help="Path to cloud tag mapping JSON ({tagName: targetDimension})")
-    parser.add_argument("--attribution-granularity", choices=["standard", "detailed"], default="standard", help="Cost attribution granularity")
     parser.add_argument("--role", help="RBAC role used for data access (supports custom roles)")
     parser.add_argument("--user", help="Username for role mapping (used with --rbac-config / --tenant-config)")
     parser.add_argument("--rbac-config", help="Path to RBAC JSON config with users/roles/policies")
@@ -4674,8 +3307,6 @@ def main() -> int:
     parser.add_argument("--run-report-scheduler", action="store_true", help="Run report automation jobs and update report history center")
     parser.add_argument("--report-output-dir", default="report_center", help="Directory for generated scheduled reports/history")
     parser.add_argument("--scheduler-now", help="Override scheduler time (ISO8601, UTC recommended)")
-    parser.add_argument("--run-event-monitor", action="store_true", help="Evaluate alerts/cost-controls/overage and dispatch webhook notifications")
-    parser.add_argument("--event-output-json", help="Write event monitor result JSON to this path")
     parser.add_argument("--open", action="store_true", help="Open dashboard in default browser")
     args = parser.parse_args()
 
@@ -4781,19 +3412,7 @@ def main() -> int:
     except Exception as exc:
         eprint(f"Failed to load budget config: {exc}")
         return 11
-
-    try:
-        prompt_optimization_config = _load_prompt_optimization_config(args.prompt_optimization_config)
-    except Exception as exc:
-        eprint(f"Failed to load prompt optimization config: {exc}")
-        return 12
-
-    try:
-        cloud_tag_mapping = _load_cloud_tag_mapping_config(args.cloud_tag_mapping_config)
-        cloud_cost_rows = load_cloud_cost_rows(args.cloud_cost_input, tag_mapping=cloud_tag_mapping)
-    except Exception as exc:
-        eprint(f"Failed to load cloud cost input: {exc}")
-        return 13
+    cloud_tag_aliases = budget_config.get("cloudTagAliases") if isinstance(budget_config, dict) and isinstance(budget_config.get("cloudTagAliases"), dict) else None
 
     multi_provider_agg: Optional[Dict[str, Any]] = None
     if aggregate_providers:
@@ -4804,48 +3423,6 @@ def main() -> int:
                 continue
             agg_rows[p] = filter_days(parse_daily(provider_payload), args.days)
         multi_provider_agg = build_multi_provider_aggregation(agg_rows)
-
-    if args.run_event_monitor:
-        summary = build_summary(
-            args.provider,
-            rows,
-            spike_lookback_days=args.spike_lookback_days,
-            spike_threshold_mult=args.spike_threshold_mult,
-            alert_config=alert_config,
-            cost_control_config=cost_control_config,
-            budget_config=budget_config,
-            prompt_optimization_config=prompt_optimization_config,
-            cloud_cost_rows=cloud_cost_rows,
-            attribution_granularity=args.attribution_granularity,
-        )
-        dispatch_cfg = alert_config.get("dispatch") if isinstance(alert_config.get("dispatch"), dict) else {}
-        dispatch_timeout = max(1.0, _safe_float(dispatch_cfg.get("timeoutSeconds"), default=8.0))
-        dispatch_retries = _safe_int(dispatch_cfg.get("retries"), default=0, minimum=0)
-        event_result = dispatch_event_alerts(
-            summary,
-            alert_config=alert_config,
-            timeout_seconds=dispatch_timeout,
-            retries=dispatch_retries,
-        )
-        payload_out = {
-            "provider": args.provider,
-            "generatedAt": datetime.now(ZoneInfo("UTC")).isoformat(),
-            "summary": {
-                "startDate": summary.get("startDate"),
-                "endDate": summary.get("endDate"),
-                "totalCostUSD": summary.get("totalCostUSD"),
-            },
-            "alerts": summary.get("alerts"),
-            "realTimeCostControls": summary.get("realTimeCostControls"),
-            "overageBehaviors": summary.get("overageBehaviors"),
-            "unifiedBudgetAlerts": summary.get("unifiedBudgetAlerts"),
-            "dispatch": event_result,
-        }
-        if args.event_output_json:
-            Path(args.event_output_json).write_text(json.dumps(payload_out, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(json.dumps(payload_out, ensure_ascii=False, indent=2))
-        return 0
-
 
     html = build_dashboard_html(
         args.provider,
@@ -4861,9 +3438,7 @@ def main() -> int:
         cost_control_config=cost_control_config,
         multi_provider_agg=multi_provider_agg,
         budget_config=budget_config,
-        prompt_optimization_config=prompt_optimization_config,
-        cloud_cost_rows=cloud_cost_rows,
-        attribution_granularity=args.attribution_granularity,
+        cloud_tag_aliases=cloud_tag_aliases,
     )
     out = Path(args.output)
     out.write_text(html, encoding="utf-8")
@@ -4877,9 +3452,7 @@ def main() -> int:
             alert_config=alert_config,
             cost_control_config=cost_control_config,
             budget_config=budget_config,
-            prompt_optimization_config=prompt_optimization_config,
-            cloud_cost_rows=cloud_cost_rows,
-            attribution_granularity=args.attribution_granularity,
+            cloud_tag_aliases=cloud_tag_aliases,
         )
         summary["role"] = role_name
         summary["policy"] = policy

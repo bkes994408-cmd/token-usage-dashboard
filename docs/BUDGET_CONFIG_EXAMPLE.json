@@ -22,6 +22,11 @@
       "alice": { "allowedModels": ["gpt-5"] }
     }
   },
+  "cloudTagAliases": {
+    "env": "environment",
+    "team": "department",
+    "cost_center": "businessLine"
+  },
   "overagePolicies": [
     {
       "thresholdPct": 100,

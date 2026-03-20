@@ -26,7 +26,7 @@ Interactive local dashboard for CodexBar usage/cost data.
 - New: Notification Dispatch 系統（Slack/Discord Webhook）已整合於 Scheduler 與 Event Monitor；支援 timeout/retry 設定。
 - New: Cloud Cost Management 整合（AWS Cost Explorer / GCP Billing 匯入）與 Unified Cloud Cost View（LLM + Cloud Infra 成本統一視圖）。
 - New: 跨平台 Unified Budget Alerts（scope: total/llm/cloud/provider/service/tag），可在 Event Monitor 與 Dashboard 看到告警事件。
-- New: 雲端成本 Tags 映射（`--cloud-tag-mapping-config`）與細粒度成本歸因（`--attribution-granularity detailed`）。
+- New: 雲端成本 Tags 映射（`--cloud-tag-mapping-config`，支援 mapping + rules/valueMap/aliases/default）與細粒度成本歸因（`--attribution-granularity detailed`）。
 
 ## Quick start
 
@@ -87,6 +87,7 @@ python3 scripts/token_usage_dashboard.py \
 ```
 
 `/tmp/report_center/report_history.json` 會保存歷史版本與下載檔案路徑（JSON/CSV），並記錄每個收件 webhook 的 dispatch 結果（sent/failed/blocked）。
+Scheduler 支援 job 級別 `onlyOnChange`（內容未變則跳過產出）與 `history.maxReportsPerJob`（每個 job 保留最近 N 份）。
 可參考 `docs/REPORT_SCHEDULER_EXAMPLE.json`。
 
 ### Event monitor + alert dispatch

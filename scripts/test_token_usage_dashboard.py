@@ -1262,16 +1262,96 @@ class TestTokenDashboard(TestCase):
             "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}],
             "llmCalls": [{"modelName": "gpt-5", "workflowId": "wf-1", "sessionId": "s-1", "projectId": "proj-a", "cost": 1.0, "totalTokens": 100}],
         }]
-        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 3.0, "tags": {"env": "prod"}}]
+        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 3.0, "project": "infra-core", "source": "aws_cost_explorer", "environment": "prod", "tags": {"env": "prod"}}]
 
         attr = dashboard_module.build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
         self.assertIn("workflow", attr["dimensions"])
         self.assertIn("cloudProvider", attr["dimensions"])
         self.assertIn("cloudTag", attr["dimensions"])
+        self.assertIn("cloudProject", attr["dimensions"])
+        self.assertIn("cloudSource", attr["dimensions"])
+        self.assertIn("cloudEnvironment", attr["dimensions"])
 
         html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows, attribution_granularity="detailed")
         self.assertIn("Cloud Attribution by Tag", html)
+        self.assertIn("Cloud Attribution by Project", html)
+        self.assertIn("Cloud Attribution by Source", html)
+        self.assertIn("Cloud Attribution by Environment", html)
         self.assertIn("Attribution by Workflow (Detailed)", html)
+
+    def test_cloud_tag_mapping_rules_support_alias_valuemap_and_default(self):
+        cloud_rows = [
+            {"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "costUSD": 3.0, "tags": {"owner_team": "plat", "env": "prod"}},
+            {"date": "2026-03-02", "provider": "gcp", "service": "BigQuery", "costUSD": 2.0, "tags": {"cost-center": "finops-core"}},
+        ]
+        mapping_cfg = {
+            "mapping": {"env": "environment"},
+            "rules": [
+                {"target": "department", "from": ["owner_team", "team"], "valueMap": {"plat": "platform"}},
+                {"target": "businessLine", "tag": "cost_centre", "aliases": ["cost-center"], "valueMap": {"finops-core": "finops"}},
+                {"target": "environment", "from": ["environment", "env"], "default": "shared"},
+            ],
+        }
+        mapped = dashboard_module._apply_cloud_tag_mapping(cloud_rows, mapping_cfg)
+        self.assertEqual(mapped[0]["department"], "platform")
+        self.assertEqual(mapped[0]["environment"], "prod")
+        self.assertEqual(mapped[1]["businessLine"], "finops")
+        self.assertEqual(mapped[1]["environment"], "shared")
+
+    def test_run_report_scheduler_only_on_change_and_history_retention(self):
+        import json
+        import tempfile
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        payload = {
+            "provider": "codex",
+            "daily": [
+                {"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.5}]},
+                {"date": "2026-03-02", "modelBreakdowns": [{"modelName": "o3", "cost": 2.0}]},
+            ],
+        }
+        config = {
+            "history": {"maxReportsPerJob": 1},
+            "jobs": [{"id": "finance", "frequency": "daily", "onlyOnChange": True, "formats": ["json"]}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(first["generated"], 1)
+
+            second = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 13, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(second["generated"], 0)
+            self.assertEqual(second["jobs"][0]["reason"], "no_change")
+
+            payload_changed = {
+                "provider": "codex",
+                "daily": payload["daily"] + [{"date": "2026-03-03", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}],
+            }
+            third = run_report_scheduler(
+                payload=payload_changed,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 14, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(third["generated"], 1)
+
+            history = json.loads((Path(tmpdir) / "report_history.json").read_text())
+            self.assertEqual(len(history["reports"]), 1)
+            self.assertTrue(history["latestByJob"]["finance"]["fingerprint"])
 
 
 

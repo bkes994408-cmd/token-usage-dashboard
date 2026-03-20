@@ -10,6 +10,7 @@
     {
       "target": "department",
       "from": ["owner_team", "team"],
+      "match": "prefix",
       "valueMap": {
         "plat": "platform",
         "finops-core": "finops"
@@ -18,7 +19,12 @@
     {
       "target": "businessLine",
       "tag": "cost_centre",
-      "aliases": ["cost-center", "costcenter"]
+      "aliases": ["cost-center", "costcenter"],
+      "match": "regex",
+      "valueMap": {
+        "finops-.*": "finops"
+      },
+      "transform": "upper"
     },
     {
       "target": "environment",

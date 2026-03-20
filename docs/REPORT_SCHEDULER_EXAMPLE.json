@@ -19,6 +19,8 @@
       "formats": ["json", "csv"],
       "onlyOnChange": true,
       "minTotalCostChangePct": 3,
+      "minTotalCostChangeUSD": 20,
+      "forceRunAfterHours": 48,
       "allowedRoles": ["admin", "analyst"],
       "layout": {
         "title": "Finance Weekly",

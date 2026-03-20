@@ -446,10 +446,11 @@ class TestTokenDashboard(TestCase):
         pattern = build_llm_pattern_analysis(rows)
         engine = build_prompt_optimization_engine(rows, pattern)
         self.assertTrue(engine["available"])
-        self.assertEqual(engine["engineVersion"], "1.0")
+        self.assertEqual(engine["engineVersion"], "1.1")
         self.assertGreaterEqual(len(engine["highConsumptionPrompts"]), 1)
         self.assertGreaterEqual(len(engine["abTests"]), 1)
         first = engine["highConsumptionPrompts"][0]
+        self.assertIn("rankScore", first)
         self.assertIn("suggestions", first)
         self.assertTrue(any(s["type"] == "model_rightsizing" for s in first["suggestions"]))
 
@@ -469,17 +470,24 @@ class TestTokenDashboard(TestCase):
         pattern = build_llm_pattern_analysis(rows)
         cfg = {
             "maxPromptFamilies": 1,
+            "minFamilyCalls": 1,
+            "rankingWeights": {"costUSD": 1.0, "promptTokens": 0.2, "calls": 0.1, "promptToCompletionRatio": 0.5},
             "abTesting": {
                 "trafficSplitB": 0.25,
                 "costReductionPctMin": 12,
                 "qualityDropPctMax": 1.5,
                 "latencyIncreasePctMax": 8,
+                "evaluationDays": 5,
+                "minimumSampleSize": 60,
+                "rolloutStages": [0.1, 0.2, 0.4],
             }
         }
         engine = build_prompt_optimization_engine(rows, pattern, config=cfg)
         self.assertEqual(engine["config"]["maxPromptFamilies"], 1)
         self.assertEqual(engine["abTests"][0]["trafficSplit"]["B"], 0.25)
         self.assertEqual(engine["abTests"][0]["successCriteria"]["costReductionPctMin"], 12.0)
+        self.assertEqual(engine["abTests"][0]["executionPlan"]["evaluationDays"], 5)
+        self.assertEqual(engine["abTests"][0]["executionPlan"]["minimumSampleSize"], 60)
 
     def test_budget_permissions_detect_violations(self):
         rows = [{
@@ -1237,6 +1245,22 @@ class TestTokenDashboard(TestCase):
         self.assertEqual(parsed["abTesting"]["trafficSplitB"], 0.9)
         self.assertEqual(parsed["abTesting"]["costReductionPctMin"], 11.0)
 
+    def test_prompt_optimization_engine_filters_min_family_calls(self):
+        rows = [{
+            "date": "2026-03-01",
+            "llmCalls": [
+                {"modelName": "gpt-5", "projectId": "proj-a", "promptTokens": 1000, "completionTokens": 100, "cost": 1.2, "prompt": "family alpha prompt"},
+                {"modelName": "gpt-5", "projectId": "proj-a", "promptTokens": 1000, "completionTokens": 100, "cost": 1.0, "prompt": "family alpha prompt"},
+                {"modelName": "gpt-5", "projectId": "proj-b", "promptTokens": 900, "completionTokens": 120, "cost": 0.9, "prompt": "family beta prompt"},
+            ],
+        }]
+        pattern = build_llm_pattern_analysis(rows)
+        engine = build_prompt_optimization_engine(rows, pattern, config={"minFamilyCalls": 2})
+
+        self.assertTrue(engine["available"])
+        self.assertEqual(len(engine["highConsumptionPrompts"]), 1)
+        self.assertEqual(engine["highConsumptionPrompts"][0]["calls"], 2)
+
     def test_cloud_tag_mapping_and_unified_tag_views(self):
         rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 3.0}]}]
         cloud_rows = [
@@ -1352,6 +1376,90 @@ class TestTokenDashboard(TestCase):
             history = json.loads((Path(tmpdir) / "report_history.json").read_text())
             self.assertEqual(len(history["reports"]), 1)
             self.assertTrue(history["latestByJob"]["finance"]["fingerprint"])
+
+
+    def test_cost_attribution_includes_dynamic_cloud_mapped_dimensions(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}], "llmCalls": [{"modelName": "gpt-5", "cost": 1.0, "totalTokens": 100}]}]
+        cloud_rows = [
+            {"date": "2026-03-01", "provider": "aws", "service": "ec2", "costUSD": 3.0, "businessUnit": "retail", "ownerTeam": "platform"},
+            {"date": "2026-03-01", "provider": "aws", "service": "s3", "costUSD": 2.0, "businessUnit": "retail", "ownerTeam": "data"},
+        ]
+        attr = build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
+        self.assertIn("cloudMapped:businessUnit", attr["dimensions"])
+        self.assertIn("cloudMapped:ownerTeam", attr["dimensions"])
+        html = build_dashboard_html("codex", rows, top_models=2, cloud_cost_rows=cloud_rows, attribution_granularity="detailed")
+        self.assertIn("Cloud Attribution by Mapped Dimension · businessUnit", html)
+        self.assertIn("Cloud Attribution by Mapped Dimension · ownerTeam", html)
+
+    def test_scheduler_deduplicates_duplicate_recipients(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import tempfile
+
+        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}]}]}
+        config = {
+            "dispatch": {"enabled": False},
+            "jobs": [
+                {
+                    "id": "dup-recipients",
+                    "frequency": "daily",
+                    "recipients": [
+                        {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"},
+                        {"channel": "slack", "target": "https://hooks.slack.com/services/x/y/z"},
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+        deliveries = result["jobs"][0]["deliveries"]
+        self.assertEqual(deliveries[0]["status"], "queued")
+        self.assertEqual(deliveries[1]["status"], "skipped")
+        self.assertEqual(deliveries[1]["reason"], "duplicate_recipient")
+
+    def test_scheduler_min_total_cost_change_pct_skips_small_changes(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import tempfile
+
+        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.0}]}]}
+        config = {
+            "jobs": [
+                {
+                    "id": "change-threshold",
+                    "frequency": "daily",
+                    "formats": ["json"],
+                    "onlyOnChange": False,
+                    "minTotalCostChangePct": 5,
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = run_report_scheduler(
+                payload=payload,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(first["generated"], 1)
+
+            payload_small_change = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 10.2}]}]}
+            second = run_report_scheduler(
+                payload=payload_small_change,
+                provider="codex",
+                config=config,
+                output_dir=Path(tmpdir),
+                now=datetime(2026, 3, 13, 12, 0, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            self.assertEqual(second["generated"], 0)
+            self.assertEqual(second["jobs"][0]["reason"], "change_below_threshold")
 
 
 

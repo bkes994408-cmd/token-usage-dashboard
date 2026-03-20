@@ -18,6 +18,7 @@
       "models": ["gpt-5", "o3"],
       "formats": ["json", "csv"],
       "onlyOnChange": true,
+      "minTotalCostChangePct": 3,
       "allowedRoles": ["admin", "analyst"],
       "layout": {
         "title": "Finance Weekly",

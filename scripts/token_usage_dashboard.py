@@ -366,6 +366,20 @@ def _apply_cloud_tag_mapping(rows: List[Dict[str, Any]], mapping: Optional[Dict[
     return out
 
 
+def _extract_cloud_mapped_dimensions(row: Dict[str, Any]) -> Dict[str, str]:
+    reserved = {"date", "provider", "service", "project", "costUSD", "currency", "source", "tags"}
+    out: Dict[str, str] = {}
+    for k, v in row.items():
+        key = str(k or "").strip()
+        if not key or key in reserved:
+            continue
+        if isinstance(v, (str, int, float)):
+            value = str(v).strip()
+            if value:
+                out[key] = value
+    return out
+
+
 def load_cloud_cost_rows(path: Optional[str], tag_mapping: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     if not path:
         return []
@@ -796,6 +810,7 @@ def build_cost_attribution(
         cloud_project_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
         cloud_source_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
         cloud_env_agg: Dict[str, Dict[str, float]] = defaultdict(lambda: {"costUSD": 0.0, "count": 0.0})
+        mapped_dimension_aggs: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"costUSD": 0.0, "count": 0.0}))
         for r in cloud:
             cost = _safe_float(r.get("costUSD"))
             p = str(r.get("provider") or "unknown").lower()
@@ -821,6 +836,11 @@ def build_cost_attribution(
                 cloud_tag_agg[tkey]["costUSD"] += cost
                 cloud_tag_agg[tkey]["count"] += 1
 
+            mapped_dims = _extract_cloud_mapped_dimensions(r)
+            for mk, mv in mapped_dims.items():
+                mapped_dimension_aggs[mk][mv]["costUSD"] += cost
+                mapped_dimension_aggs[mk][mv]["count"] += 1
+
         dimensions["cloudProvider"] = _rank_cloud(cloud_agg)
         dimensions["cloudService"] = _rank_cloud(cloud_service_agg)
         dimensions["cloudTag"] = _rank_cloud(cloud_tag_agg)
@@ -828,6 +848,9 @@ def build_cost_attribution(
         dimensions["cloudSource"] = _rank_cloud(cloud_source_agg)
         if cloud_env_agg:
             dimensions["cloudEnvironment"] = _rank_cloud(cloud_env_agg)
+        for mk in sorted(mapped_dimension_aggs.keys()):
+            dim_key = f"cloudMapped:{mk}"
+            dimensions[dim_key] = _rank_cloud(mapped_dimension_aggs[mk])
 
     return {
         "available": True,
@@ -845,7 +868,16 @@ def _prompt_template_signature(prompt: str) -> str:
     return " ".join(tokens[:24])
 
 
-def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_tokens: float, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def _prompt_suggestion_actions(
+    sample_prompt_tokens: float,
+    sample_completion_tokens: float,
+    *,
+    current_model: str,
+    candidate_model: Optional[str],
+    calls: int,
+    total_cost_usd: float,
+    config: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     cfg = config if isinstance(config, dict) else {}
     compression_threshold = _safe_float(cfg.get("compressionThresholdPromptTokens"), default=700.0)
     context_refactor_ratio = _safe_float(cfg.get("contextRefactorRatio"), default=1.5)
@@ -855,13 +887,16 @@ def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_to
     variant_b_ratio = _safe_float(ab_cfg.get("trafficSplitB"), default=0.2)
     variant_b_ratio = min(0.9, max(0.05, variant_b_ratio))
 
+    savings_from_prompt = total_cost_usd * (target_reduction_pct / 100.0)
     actions: List[Dict[str, Any]] = []
     if sample_prompt_tokens >= compression_threshold:
         actions.append(
             {
                 "type": "compression",
+                "priority": "high" if sample_prompt_tokens >= compression_threshold * 1.2 else "medium",
                 "title": "Compress long instructions and remove repeated context",
                 "expectedPromptTokenReductionPct": target_reduction_pct,
+                "estimatedMonthlySavingsUSD": round(savings_from_prompt, 4),
                 "actions": [
                     "Extract stable policy text into a reusable system preset.",
                     "Summarize long conversation history before sending to model.",
@@ -872,25 +907,43 @@ def _prompt_suggestion_actions(sample_prompt_tokens: float, sample_completion_to
         actions.append(
             {
                 "type": "context_refactor",
+                "priority": "high" if sample_prompt_tokens >= max(1.0, sample_completion_tokens) * (context_refactor_ratio + 0.4) else "medium",
                 "title": "Move verbose context into retrieval/cache",
                 "expectedPromptTokenReductionPct": max(8.0, target_reduction_pct * 0.75),
+                "estimatedMonthlySavingsUSD": round(total_cost_usd * max(8.0, target_reduction_pct * 0.75) / 100.0, 4),
                 "actions": [
                     "Replace full inline docs with retrieval IDs or snippets.",
                     "Use semantic cache for repeated context blocks.",
                 ],
             }
         )
-    actions.append(
-        {
-            "type": "model_rightsizing",
-            "title": "A/B test lower-cost model on this prompt family",
-            "expectedCostReductionPct": expected_cost_reduction_pct,
-            "actions": [
-                f"Route {int(variant_b_ratio * 100)}% traffic to candidate model and track quality score.",
-                "Promote candidate only if quality drop <= 2%.",
-            ],
-        }
-    )
+
+    model_action = {
+        "type": "model_rightsizing",
+        "priority": "medium",
+        "title": "A/B test lower-cost model on this prompt family",
+        "expectedCostReductionPct": expected_cost_reduction_pct,
+        "actions": [
+            f"Route {int(variant_b_ratio * 100)}% traffic to candidate model and track quality score.",
+            "Promote candidate only if quality drop <= 2%.",
+        ],
+    }
+    if candidate_model and candidate_model != current_model:
+        model_action["candidateModel"] = candidate_model
+    actions.append(model_action)
+
+    if calls >= 30 and sample_prompt_tokens >= max(1.0, compression_threshold * 0.7):
+        actions.append(
+            {
+                "type": "template_standardization",
+                "priority": "medium",
+                "title": "Standardize this prompt family with versioned templates",
+                "actions": [
+                    "Define canonical template sections (goal, constraints, output schema).",
+                    "Add lint checks for prompt max tokens and required fields.",
+                ],
+            }
+        )
     return actions
 
 
@@ -905,6 +958,15 @@ def build_prompt_optimization_engine(
     cfg = config if isinstance(config, dict) else {}
     family_limit = int(cfg.get("maxPromptFamilies") or max_prompt_families or 8)
     family_limit = max(1, family_limit)
+    min_family_calls = max(1, int(_safe_float(cfg.get("minFamilyCalls"), default=1.0)))
+    min_family_cost = max(0.0, _safe_float(cfg.get("minFamilyCostUSD"), default=0.0))
+
+    ranking_weights = cfg.get("rankingWeights") if isinstance(cfg.get("rankingWeights"), dict) else {}
+    weight_cost = max(0.0, _safe_float(ranking_weights.get("costUSD"), default=1.0))
+    weight_prompt = max(0.0, _safe_float(ranking_weights.get("promptTokens"), default=0.35))
+    weight_calls = max(0.0, _safe_float(ranking_weights.get("calls"), default=0.2))
+    weight_ratio = max(0.0, _safe_float(ranking_weights.get("promptToCompletionRatio"), default=0.25))
+
     ab_cfg = cfg.get("abTesting") if isinstance(cfg.get("abTesting"), dict) else {}
     traffic_split_b = min(0.9, max(0.05, _safe_float(ab_cfg.get("trafficSplitB"), default=0.5)))
     criteria = {
@@ -912,10 +974,30 @@ def build_prompt_optimization_engine(
         "qualityDropPctMax": _safe_float(ab_cfg.get("qualityDropPctMax"), default=2.0),
         "latencyIncreasePctMax": _safe_float(ab_cfg.get("latencyIncreasePctMax"), default=10.0),
     }
+    evaluation_days = max(1, int(_safe_float(ab_cfg.get("evaluationDays"), default=7.0)))
+    min_sample_size = max(20, int(_safe_float(ab_cfg.get("minimumSampleSize"), default=100.0)))
+    rollout_stages_raw = ab_cfg.get("rolloutStages") if isinstance(ab_cfg.get("rolloutStages"), list) else [0.1, 0.25, 0.5]
+    rollout_stages: List[float] = []
+    for item in rollout_stages_raw:
+        if isinstance(item, (int, float)):
+            v = min(1.0, max(0.01, float(item)))
+            rollout_stages.append(v)
+    if not rollout_stages:
+        rollout_stages = [0.1, 0.25, 0.5]
 
     records = normalized_records if normalized_records is not None else _normalize_call_records(rows)
     if not records:
-        return {"available": False, "highConsumptionPrompts": [], "abTests": [], "config": {"maxPromptFamilies": family_limit, "abTesting": criteria}}
+        return {
+            "available": False,
+            "highConsumptionPrompts": [],
+            "abTests": [],
+            "config": {
+                "maxPromptFamilies": family_limit,
+                "minFamilyCalls": min_family_calls,
+                "minFamilyCostUSD": min_family_cost,
+                "abTesting": criteria,
+            },
+        }
 
     families: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -941,9 +1023,25 @@ def build_prompt_optimization_engine(
         node["models"][str(r.get("model") or "unknown")] += 1
         node["projects"][str(r.get("project") or "unknown")] += 1
 
+    scored_families: List[Dict[str, Any]] = []
+    for item in families.values():
+        calls = int(item["calls"])
+        if calls < min_family_calls or _safe_float(item["totalCostUSD"]) < min_family_cost:
+            continue
+        avg_completion_tokens = _safe_float(item["totalCompletionTokens"]) / max(1, calls)
+        avg_prompt_tokens = _safe_float(item["totalPromptTokens"]) / max(1, calls)
+        ratio = (avg_prompt_tokens / avg_completion_tokens) if avg_completion_tokens > 0 else 0.0
+        item["_rankScore"] = (
+            weight_cost * _safe_float(item["totalCostUSD"])
+            + weight_prompt * _safe_float(item["totalPromptTokens"])
+            + weight_calls * calls
+            + weight_ratio * ratio
+        )
+        scored_families.append(item)
+
     ranked = sorted(
-        families.values(),
-        key=lambda x: (x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
+        scored_families,
+        key=lambda x: (_safe_float(x.get("_rankScore")), x["totalCostUSD"], x["totalPromptTokens"], x["calls"]),
         reverse=True,
     )[:family_limit]
 
@@ -965,10 +1063,19 @@ def build_prompt_optimization_engine(
         avg_completion_tokens = item["totalCompletionTokens"] / max(1, calls)
         top_model = sorted(item["models"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["models"] else "unknown"
         top_project = sorted(item["projects"].items(), key=lambda kv: kv[1], reverse=True)[0][0] if item["projects"] else "unknown"
-        suggestions = _prompt_suggestion_actions(avg_prompt_tokens, avg_completion_tokens, config=cfg)
+        suggestions = _prompt_suggestion_actions(
+            avg_prompt_tokens,
+            avg_completion_tokens,
+            current_model=top_model,
+            candidate_model=cheap_model,
+            calls=calls,
+            total_cost_usd=_safe_float(item["totalCostUSD"]),
+            config=cfg,
+        )
         prompt_families.append(
             {
                 "rank": idx,
+                "rankScore": _safe_float(item.get("_rankScore")),
                 "templateSignature": item["templateSignature"],
                 "samplePrompt": item["samplePrompt"],
                 "calls": calls,
@@ -1002,19 +1109,37 @@ def build_prompt_optimization_engine(
                 ],
                 "successCriteria": criteria,
                 "metrics": ["avgCostPerCallUSD", "qualityScore", "avgLatencyMs", "promptTokens"],
+                "executionPlan": {
+                    "evaluationDays": evaluation_days,
+                    "minimumSampleSize": min_sample_size,
+                    "rolloutStages": [round(x, 3) for x in rollout_stages],
+                },
             }
         )
 
     return {
         "available": True,
-        "engineVersion": "1.0",
+        "engineVersion": "1.1",
         "spec": {
-            "recommendationTypes": ["compression", "context_refactor", "model_rightsizing"],
-            "ranking": "totalCostUSD,totalPromptTokens,calls",
+            "recommendationTypes": ["compression", "context_refactor", "model_rightsizing", "template_standardization"],
+            "ranking": "weighted(costUSD,promptTokens,calls,promptToCompletionRatio)",
         },
         "config": {
             "maxPromptFamilies": family_limit,
-            "abTesting": criteria,
+            "minFamilyCalls": min_family_calls,
+            "minFamilyCostUSD": min_family_cost,
+            "rankingWeights": {
+                "costUSD": weight_cost,
+                "promptTokens": weight_prompt,
+                "calls": weight_calls,
+                "promptToCompletionRatio": weight_ratio,
+            },
+            "abTesting": {
+                **criteria,
+                "evaluationDays": evaluation_days,
+                "minimumSampleSize": min_sample_size,
+                "rolloutStages": [round(x, 3) for x in rollout_stages],
+            },
         },
         "highConsumptionPrompts": prompt_families,
         "abTests": ab_tests,
@@ -1244,10 +1369,23 @@ def _normalize_prompt_optimization_config(parsed: Dict[str, Any]) -> Dict[str, A
     out: Dict[str, Any] = {}
     if parsed.get("maxPromptFamilies") is not None:
         out["maxPromptFamilies"] = max(1, int(_safe_float(parsed.get("maxPromptFamilies"), default=8.0)))
+    if parsed.get("minFamilyCalls") is not None:
+        out["minFamilyCalls"] = max(1, int(_safe_float(parsed.get("minFamilyCalls"), default=1.0)))
+    if isinstance(parsed.get("minFamilyCostUSD"), (int, float)):
+        out["minFamilyCostUSD"] = max(0.0, float(parsed.get("minFamilyCostUSD")))
 
     for key in ("compressionThresholdPromptTokens", "contextRefactorRatio", "targetPromptTokenReductionPct", "expectedCostReductionPct"):
         if isinstance(parsed.get(key), (int, float)):
             out[key] = float(parsed.get(key))
+
+    rw_in = parsed.get("rankingWeights") if isinstance(parsed.get("rankingWeights"), dict) else {}
+    if rw_in:
+        rw_out: Dict[str, float] = {}
+        for key in ("costUSD", "promptTokens", "calls", "promptToCompletionRatio"):
+            if isinstance(rw_in.get(key), (int, float)):
+                rw_out[key] = max(0.0, float(rw_in.get(key)))
+        if rw_out:
+            out["rankingWeights"] = rw_out
 
     ab_in = parsed.get("abTesting") if isinstance(parsed.get("abTesting"), dict) else {}
     if ab_in:
@@ -1257,6 +1395,17 @@ def _normalize_prompt_optimization_config(parsed: Dict[str, Any]) -> Dict[str, A
         for key in ("costReductionPctMin", "qualityDropPctMax", "latencyIncreasePctMax"):
             if isinstance(ab_in.get(key), (int, float)):
                 ab_out[key] = float(ab_in.get(key))
+        if isinstance(ab_in.get("evaluationDays"), (int, float)):
+            ab_out["evaluationDays"] = max(1, int(_safe_float(ab_in.get("evaluationDays"), default=7.0)))
+        if isinstance(ab_in.get("minimumSampleSize"), (int, float)):
+            ab_out["minimumSampleSize"] = max(20, int(_safe_float(ab_in.get("minimumSampleSize"), default=100.0)))
+        if isinstance(ab_in.get("rolloutStages"), list):
+            stages: List[float] = []
+            for item in ab_in.get("rolloutStages", []):
+                if isinstance(item, (int, float)):
+                    stages.append(min(1.0, max(0.01, float(item))))
+            if stages:
+                ab_out["rolloutStages"] = stages
         out["abTesting"] = ab_out
 
     return out
@@ -2603,6 +2752,7 @@ def _normalize_report_jobs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "recipients": recipients,
             "formats": [str(x).strip().lower() for x in (job.get("formats") or ["json"]) if str(x).strip()],
             "onlyOnChange": bool(job.get("onlyOnChange", False)),
+            "minTotalCostChangePct": _safe_float(job.get("minTotalCostChangePct"), default=0.0),
         })
     return out
 
@@ -2783,6 +2933,17 @@ def run_report_scheduler(
             result["skipped"] += 1
             continue
 
+        min_change_pct = _safe_float(job.get("minTotalCostChangePct"), default=0.0)
+        if min_change_pct > 0 and isinstance(previous, dict) and isinstance(previous.get("summary"), dict):
+            prev_total = _safe_float(previous.get("summary", {}).get("totalCostUSD"), default=-1.0)
+            curr_total = _safe_float(report_payload.get("summary", {}).get("totalCostUSD"), default=-1.0)
+            if prev_total > 0 and curr_total >= 0:
+                delta_pct = abs((curr_total - prev_total) / prev_total * 100.0)
+                if delta_pct < min_change_pct:
+                    result["jobs"].append({"jobId": job_id, "status": "skipped", "reason": "change_below_threshold", "deltaPct": delta_pct})
+                    result["skipped"] += 1
+                    continue
+
         formats = job.get("formats") if isinstance(job.get("formats"), list) else ["json"]
         if "json" in formats:
             json_path = job_dir / f"{base}.json"
@@ -2794,9 +2955,20 @@ def run_report_scheduler(
             artifact_paths["csv"] = str(csv_path)
 
         deliveries = []
+        seen_targets = set()
         for recipient in job.get("recipients") or []:
             if not isinstance(recipient, dict):
                 continue
+            rkey = (str(recipient.get("channel") or "").strip().lower(), str(recipient.get("target") or "").strip())
+            if rkey in seen_targets:
+                deliveries.append({
+                    "target": recipient.get("target"),
+                    "channel": recipient.get("channel"),
+                    "status": "skipped",
+                    "reason": "duplicate_recipient",
+                })
+                continue
+            seen_targets.add(rkey)
             if not _recipient_allowed(recipient, role_name, job.get("allowedRoles") or []):
                 deliveries.append({
                     "target": recipient.get("target"),
@@ -2835,9 +3007,23 @@ def run_report_scheduler(
             "layout": job.get("layout") or {},
             "tenant": tenant_meta or None,
             "fingerprint": fingerprint,
+            "summary": {
+                "totalCostUSD": _safe_float(summary.get("totalCostUSD")),
+                "startDate": summary.get("startDate"),
+                "endDate": summary.get("endDate"),
+            },
         }
         history["reports"].append(history_item)
-        latest_by_job[job_id] = {"generatedAt": now_dt.isoformat(), "artifacts": artifact_paths, "fingerprint": fingerprint}
+        latest_by_job[job_id] = {
+            "generatedAt": now_dt.isoformat(),
+            "artifacts": artifact_paths,
+            "fingerprint": fingerprint,
+            "summary": {
+                "totalCostUSD": _safe_float(summary.get("totalCostUSD")),
+                "startDate": summary.get("startDate"),
+                "endDate": summary.get("endDate"),
+            },
+        }
 
         result["jobs"].append({"jobId": job_id, "status": "generated", "artifacts": artifact_paths, "deliveries": deliveries})
         result["generated"] += 1
@@ -3076,6 +3262,22 @@ def build_dashboard_html(
     attr_cloud_project_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudProject", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
     attr_cloud_source_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudSource", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
     attr_cloud_env_rows = _render_attribution_rows(attribution.get("dimensions", {}).get("cloudEnvironment", [])) if attribution.get("available") else "<tr><td colspan='6'>No cloud attribution data</td></tr>"
+
+    extra_attr_sections_html = ""
+    if attribution.get("available") and isinstance(attribution.get("dimensions"), dict):
+        extra_keys = [k for k in sorted(attribution.get("dimensions", {}).keys()) if isinstance(k, str) and k.startswith("cloudMapped:")]
+        parts: List[str] = []
+        for key in extra_keys:
+            label = key.split(":", 1)[1]
+            rows_html = _render_attribution_rows(attribution.get("dimensions", {}).get(key, []))
+            parts.append(
+                f"<h4>Cloud Attribution by Mapped Dimension · {esc(label)}</h4>\n"
+                f"<table>\n"
+                f"  <thead><tr><th>#</th><th>{esc(label)}</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>\n"
+                f"  <tbody>{rows_html}</tbody>\n"
+                f"</table>"
+            )
+        extra_attr_sections_html = "\n".join(parts)
 
     rec_rows = "<tr><td colspan='6'>No recommendations</td></tr>"
     if recs.get("available") and isinstance(recs.get("recommendations"), list) and recs.get("recommendations"):
@@ -3467,6 +3669,7 @@ def build_dashboard_html(
     <thead><tr><th>#</th><th>Environment</th><th>Cost</th><th>Tokens</th><th>Calls</th><th>Share</th></tr></thead>
     <tbody>{attr_cloud_env_rows}</tbody>
   </table>
+  {extra_attr_sections_html}
   <h4>Optimization Recommendations</h4>
   <table>
     <thead><tr><th>#</th><th>Priority</th><th>Recommendation</th><th>Rationale</th><th>Est. Savings</th><th>Actions</th></tr></thead>

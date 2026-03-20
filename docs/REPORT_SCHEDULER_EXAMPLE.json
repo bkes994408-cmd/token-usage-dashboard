@@ -20,6 +20,8 @@
       "onlyOnChange": true,
       "minTotalCostChangePct": 3,
       "minTotalCostChangeUSD": 20,
+      "minReportRowsChange": 1,
+      "minActiveModelsChange": 0.5,
       "forceRunAfterHours": 48,
       "allowedRoles": ["admin", "analyst"],
       "layout": {

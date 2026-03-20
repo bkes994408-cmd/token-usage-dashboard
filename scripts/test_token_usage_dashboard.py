@@ -1521,6 +1521,53 @@ class TestTokenDashboard(TestCase):
             )
             self.assertEqual(third["generated"], 1)
 
+    def test_cloud_tag_mapping_when_scope_and_derive_dimension(self):
+        cloud_rows = [
+            {"date": "2026-03-01", "provider": "aws", "service": "AmazonEC2", "project": "core", "costUSD": 3.0, "tags": {"owner": "team-a", "env": "prod"}},
+            {"date": "2026-03-01", "provider": "gcp", "service": "BigQuery", "project": "core", "costUSD": 2.0, "tags": {"owner": "team-b", "env": "prod"}},
+        ]
+        mapped = dashboard_module._apply_cloud_tag_mapping(cloud_rows, {
+            "rules": [
+                {"target": "department", "from": ["owner"], "when": {"providers": ["aws"]}}
+            ],
+            "derive": [
+                {"target": "chargebackKey", "template": "{provider}:{project}:{department}"}
+            ]
+        })
+        self.assertEqual(mapped[0]["department"], "team-a")
+        self.assertNotIn("department", mapped[1])
+        self.assertEqual(mapped[0]["chargebackKey"], "aws:core:team-a")
+
+    def test_detailed_cloud_attribution_expands_provider_service_and_tag_key(self):
+        rows = [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 1.0}], "llmCalls": [{"modelName": "gpt-5", "cost": 1.0, "totalTokens": 100}]}]
+        cloud_rows = [{"date": "2026-03-01", "provider": "aws", "service": "ec2", "project": "infra", "costUSD": 3.0, "tags": {"env": "prod"}}]
+        attr = build_cost_attribution(rows, cloud_rows=cloud_rows, granularity="detailed")
+        self.assertIn("cloudProviderService", attr["dimensions"])
+        self.assertIn("cloudProjectService", attr["dimensions"])
+        self.assertIn("cloudTagKey", attr["dimensions"])
+
+    def test_scheduler_supports_row_and_model_change_thresholds(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import tempfile
+
+        payload = {"provider": "codex", "daily": [{"date": "2026-03-01", "modelBreakdowns": [{"modelName": "gpt-5", "cost": 5.0}]}]}
+        config = {
+            "jobs": [{
+                "id": "row-model-threshold",
+                "frequency": "daily",
+                "formats": ["json"],
+                "minReportRowsChange": 1,
+                "minActiveModelsChange": 0.5,
+            }]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = run_report_scheduler(payload, "codex", config, Path(tmpdir), now=datetime(2026, 3, 12, 12, 0, 0, tzinfo=ZoneInfo("UTC")))
+            self.assertEqual(first["generated"], 1)
+            second = run_report_scheduler(payload, "codex", config, Path(tmpdir), now=datetime(2026, 3, 13, 12, 0, 0, tzinfo=ZoneInfo("UTC")))
+            self.assertEqual(second["generated"], 0)
+            self.assertEqual(second["jobs"][0]["reason"], "change_below_threshold")
+
 
 if __name__ == "__main__":
     main()

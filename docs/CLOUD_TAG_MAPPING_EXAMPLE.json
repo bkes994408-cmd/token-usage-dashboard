@@ -14,6 +14,9 @@
       "valueMap": {
         "plat": "platform",
         "finops-core": "finops"
+      },
+      "when": {
+        "providers": ["aws"]
       }
     },
     {
@@ -30,6 +33,12 @@
       "target": "environment",
       "from": ["environment", "env"],
       "default": "shared"
+    }
+  ],
+  "derive": [
+    {
+      "target": "chargebackKey",
+      "template": "{provider}:{project}:{businessLine}"
     }
   ]
 }
